@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+.rove/
+data/
+.agents/apex/
+*.log
+.DS_Store

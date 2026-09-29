@@ -1,0 +1,12 @@
+*
+!package.json
+!bun.lock
+!tsconfig.json
+!src/
+!src/**
+!public/
+!public/**
+!docker-entrypoint.sh
+!LICENSE
+!Dockerfile
+!.dockerignore

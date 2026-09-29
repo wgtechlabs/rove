@@ -1,0 +1,61 @@
+name: Build Flow
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+  workflow_dispatch:
+
+# Required by the reusable workflow; its CI jobs reduce this to contents: read.
+# Release checkout, tags and GitHub Releases use the built-in GITHUB_TOKEN.
+permissions:
+  actions: read
+  contents: write
+  packages: write
+  pull-requests: write
+  security-events: write
+
+jobs:
+  build-flow:
+    uses: wgtechlabs/build-flow-action/.github/workflows/app.yml@b46ac3e40de838b87e1da6b3e69382982d080916 # v0.2.1
+    secrets: inherit
+    with:
+      ci-profile: node
+      # Keep Node as the application runtime; install the pinned Bun toolchain.
+      ci-setup-command: npm install --global bun@1.3.10
+      ci-install-command: bun install --frozen-lockfile
+      ci-lint-command: |
+        bun run check
+        sh -n docker-entrypoint.sh
+      ci-typecheck-command: bun run typecheck
+      ci-test-command: bun run test
+      ci-build-command: bun run build
+      ci-docker-smoke-command: |
+        docker build -t rove:foundation .
+        node scripts/check-container.mjs
+
+      enable-gitleaks: true
+      # Private repository: Code Security is not enabled for SARIF uploads.
+      enable-codeql: false
+      container-upload-sarif: false
+
+      enable-package: false
+      enable-container: true
+      enable-release: true
+      main-branch: main
+      dev-branch: dev
+      publish-dev-artifacts: false
+      publish-pr-artifacts: false
+      publish-manual-artifacts: false
+
+      container-registry: docker-hub
+      # The container action prefixes the repository owner: wgtechlabs/rove.
+      container-image-name: rove
+      container-pr-comment-enabled: false
+      container-vulnerability-comment-enabled: false
+
+      release-initial-version: 0.1.0
+      release-commit-convention: clean-commit
+      release-version-file-paths: package.json
+      release-workspace-detection: false
