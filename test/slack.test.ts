@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { createHmac } from 'node:crypto';
+import { once } from 'node:events';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -8,8 +11,9 @@ import { type TestContext, test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createApplication } from '../src/app.js';
 import { HttpError } from '../src/auth.js';
-import { createSlack } from '../src/slack.js';
+import { createSlack, MAX_SLACK_BODY } from '../src/slack.js';
 
+const nativeFetch = globalThis.fetch;
 const secret = 'fake-slack-signing-secret';
 const token = 'xoxb-local-test-token';
 const origin = 'https://rove.example';
@@ -423,7 +427,7 @@ test('Slack approval shows immutable detailed previews in full and only offers d
       .join('')
       .includes(detail),
   );
-  f.approval('x'.repeat(36000));
+  f.approval('界'.repeat(16000));
   await f.slack.handle(signed(event('EHUGE', { ts: '1004.000001' })));
   await until(() => f.posts.length === 2);
   const huge = f.posts[1]?.blocks as {
@@ -767,5 +771,113 @@ test('application startup rolls back every opened database when a service fails 
       /Simulated initialization failure/,
     );
     assert.equal(open.size, 0, stage);
+  }
+});
+
+test('HTTP ingress admits signed large Slack interactions while preserving route-specific body limits', async (t) => {
+  const fetchHTTP = nativeFetch;
+  const f = await fixture(t);
+  const socket = createServer();
+  socket.listen(0, '127.0.0.1');
+  await once(socket, 'listening');
+  const address = socket.address();
+  assert.ok(address && typeof address !== 'string');
+  await new Promise<void>((resolve) => socket.close(() => resolve()));
+  const child = spawn(process.execPath, ['dist/src/server.js'], {
+    env: {
+      ...process.env,
+      PORT: String(address.port),
+      ROVE_URL: origin,
+      BETTER_AUTH_SECRET: f.config.authSecret,
+      ROVE_DATABASE_PATH: f.config.databasePath,
+      ROVE_SETUP_SECRET: 'local-http-test-setup-secret-at-least-32',
+    },
+    stdio: 'ignore',
+  });
+  const exited = once(child, 'exit');
+  const base = `http://127.0.0.1:${address.port}`;
+  try {
+    let healthy = false;
+    for (let n = 0; n < 100; n++) {
+      try {
+        healthy = (await fetchHTTP(`${base}/health`)).ok;
+      } catch {}
+      if (healthy) break;
+      await delay(25);
+    }
+    assert.ok(healthy, 'The actual HTTP server must start');
+    const text = 'Review this proposed change. '.repeat(650);
+    const request = signed(
+      {
+        type: 'block_actions',
+        team: { id: 'TTEAM' },
+        user: { id: 'UADMIN' },
+        channel: { id: 'CROOM' },
+        actions: [
+          {
+            action_id: 'rove_approve',
+            value: JSON.stringify({ job: 'unknown', approval: 'unknown' }),
+          },
+        ],
+        message: {
+          text,
+          blocks: [{ type: 'section', text: { type: 'plain_text', text } }],
+        },
+      },
+      true,
+    );
+    const raw = await request.text();
+    assert.ok(Buffer.byteLength(raw) > 32768);
+    assert.ok(Buffer.byteLength(raw) < MAX_SLACK_BODY);
+    const send = (path: string, body: string, headers: Headers) =>
+      fetchHTTP(base + path, { method: 'POST', headers, body });
+    assert.equal(
+      (await send('/api/slack/interactivity', raw, request.headers)).status,
+      200,
+    );
+    const bad = new Headers(request.headers);
+    bad.set('x-slack-signature', `v0=${'0'.repeat(64)}`);
+    assert.equal(
+      (await send('/api/slack/interactivity', raw, bad)).status,
+      401,
+    );
+    assert.equal(
+      (await send('/api/admin/settings', raw, request.headers)).status,
+      413,
+    );
+    assert.equal(
+      (
+        await send(
+          '//example.invalid/api/slack/interactivity',
+          raw,
+          request.headers,
+        )
+      ).status,
+      413,
+    );
+    assert.equal(
+      (
+        await send(
+          '/api/slack/interactivity',
+          'x'.repeat(MAX_SLACK_BODY + 1),
+          request.headers,
+        )
+      ).status,
+      413,
+    );
+    assert.equal(
+      (
+        await send(
+          '/api/slack/events',
+          'x'.repeat(MAX_SLACK_BODY + 1),
+          request.headers,
+        )
+      ).status,
+      413,
+    );
+  } finally {
+    child.kill('SIGTERM');
+    const [code] = await exited;
+    assert.equal(code, 0);
   }
 });

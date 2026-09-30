@@ -7,6 +7,7 @@ import { runInNewContext } from 'node:vm';
 // Exercise the real chat controller with a minimal DOM and a deferred reply.
 test('avatar follows reply lifecycle, retries and disposal, not general loading', async () => {
   const elements = new Map();
+  const created = [];
   const element = () => ({
     dataset: {},
     value: '',
@@ -29,12 +30,17 @@ test('avatar follows reply lifecycle, retries and disposal, not general loading'
   const avatar = element();
   const document = {
     querySelector: () => avatar,
-    createElement: element,
+    createElement: () => {
+      const node = element();
+      created.push(node);
+      return node;
+    },
   };
   let reply = Promise.withResolvers();
   const api = async (path) => {
     if (path === '/api/admin/settings') return { configured: true };
-    if (path.endsWith('/messages')) return reply.promise;
+    if (path.endsWith('/messages') || path.endsWith('/approval'))
+      return reply.promise;
     return { id: 'conversation', conversations: [], messages: [] };
   };
   const source = await readFile('public/chat.js', 'utf8');
@@ -70,6 +76,41 @@ test('avatar follows reply lifecycle, retries and disposal, not general loading'
   await setImmediate();
   assert.equal(avatar.dataset.expression, 'idle');
   assert.equal(find('#send-status').textContent, '');
+
+  find('#message').value = 'Propose an action';
+  reply = Promise.withResolvers();
+  submit();
+  await setImmediate();
+  reply.resolve({
+    id: 'conversation',
+    messages: [],
+    pending: {
+      id: 'approval',
+      status: 'waiting',
+      name: 'test_tool',
+      arguments: {},
+    },
+  });
+  await setImmediate();
+  const approve = created.findLast(
+    (node) => node.textContent === 'Approve this action',
+  );
+  assert.ok(approve);
+  reply = Promise.withResolvers();
+  approve.onclick();
+  await setImmediate();
+  assert.equal(avatar.dataset.expression, 'thinking');
+  reply.reject(new Error('Approval expired'));
+  await setImmediate();
+  assert.equal(avatar.dataset.expression, 'unsure');
+  assert.equal(find('#workspace-error').textContent, 'Approval expired');
+  reply = Promise.withResolvers();
+  approve.onclick();
+  await setImmediate();
+  assert.equal(avatar.dataset.expression, 'thinking');
+  reply.resolve({ id: 'conversation', messages: [] });
+  await setImmediate();
+  assert.equal(avatar.dataset.expression, 'idle');
 
   find('#message').value = 'Another message';
   reply = Promise.withResolvers();

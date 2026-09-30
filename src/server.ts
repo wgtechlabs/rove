@@ -1,6 +1,7 @@
 import { createServer } from 'node:http';
 import { createApplication, MAX_BODY } from './app.js';
 import { readConfig } from './config.js';
+import { MAX_SLACK_BODY } from './slack.js';
 
 const config = readConfig();
 const app = await createApplication(config);
@@ -9,11 +10,20 @@ if (!Number.isInteger(port) || port < 1 || port > 65535)
   throw new Error('PORT must be between 1 and 65535.');
 const server = createServer(async (incoming, outgoing) => {
   try {
+    // Never derive the public origin from untrusted Host or forwarded headers.
+    const url =
+      config.baseURL + (incoming.url?.startsWith('/') ? incoming.url : '/');
+    const path = new URL(url).pathname;
+    const maxBody =
+      incoming.method === 'POST' &&
+      ['/api/slack/events', '/api/slack/interactivity'].includes(path)
+        ? MAX_SLACK_BODY
+        : MAX_BODY;
     let size = 0;
     const chunks: Buffer[] = [];
     for await (const chunk of incoming) {
       size += chunk.length;
-      if (size > MAX_BODY) {
+      if (size > maxBody) {
         outgoing.writeHead(413, {
           Connection: 'close',
           'Content-Type': 'application/json',
@@ -28,9 +38,6 @@ const server = createServer(async (incoming, outgoing) => {
       if (value !== undefined)
         headers.set(name, Array.isArray(value) ? value.join(', ') : value);
     }
-    // Never derive the public origin from untrusted Host or forwarded headers.
-    const url =
-      config.baseURL + (incoming.url?.startsWith('/') ? incoming.url : '/');
     const response = await app.fetch(
       new Request(url, {
         method: incoming.method,
