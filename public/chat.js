@@ -78,6 +78,8 @@ export function mountChat(main, admin, api, expire, signout) {
         expire();
         return;
       }
+      if (avatar.dataset.expression === 'thinking')
+        avatar.dataset.expression = 'unsure';
       error.textContent =
         failure instanceof TypeError
           ? 'Rove could not be reached. Check your connection and try again.'

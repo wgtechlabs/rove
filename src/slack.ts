@@ -66,7 +66,7 @@ const empty: Settings = {
   teamId: '',
   botUserId: '',
 };
-const MAX_BODY = 262144;
+export const MAX_SLACK_BODY = 262144;
 const object = (value: unknown): Record<string, unknown> =>
   value && typeof value === 'object' && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -195,7 +195,7 @@ export function createSlack(config: Config, chat: Chat) {
       const part = await reader.read();
       if (part.done) break;
       bytes += part.value.length;
-      if (bytes > MAX_BODY) {
+      if (bytes > MAX_SLACK_BODY) {
         await reader.cancel();
         throw new Error('Slack response too large.');
       }
@@ -305,7 +305,7 @@ export function createSlack(config: Config, chat: Chat) {
     if (!state.signingSecret)
       throw new HttpError(503, 'Slack is not configured.');
     const raw = Buffer.from(await request.arrayBuffer());
-    if (raw.length > MAX_BODY)
+    if (raw.length > MAX_SLACK_BODY)
       throw new HttpError(413, 'The request is too large.');
     const stamp = request.headers.get('x-slack-request-timestamp') || '';
     const signature = request.headers.get('x-slack-signature') || '';
@@ -523,7 +523,11 @@ export function createSlack(config: Config, chat: Chat) {
     const approval = pending
       ? `Approval required for ${pending.name}.\n${pending.description || ''}\n${pending.detail ?? JSON.stringify(pending.arguments)}`
       : '';
-    const reviewable = approval.length <= 35000;
+    // Slack repeats message text in form-encoded interactions; reserve space for its envelope.
+    const reviewable =
+      approval.length <= 35000 &&
+      encodeURIComponent(JSON.stringify(approval)).length * 2 + 32768 <=
+        MAX_SLACK_BODY;
     const text =
       pending?.status === 'ready'
         ? 'Rove saved the tool outcome but could not finish its reply. Continue the reply without running the tool again.'
