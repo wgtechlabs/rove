@@ -42,8 +42,13 @@ interface Run {
 }
 export function createAgent(config: Config, tools: AgentTools) {
   const db = new DatabaseSync(config.databasePath);
-  db.exec(`PRAGMA busy_timeout=5000;
+  try {
+    db.exec(`PRAGMA busy_timeout=5000;
     CREATE TABLE IF NOT EXISTS rove_run(id TEXT PRIMARY KEY,conversation TEXT NOT NULL,scope TEXT NOT NULL,data TEXT NOT NULL);`);
+  } catch (error) {
+    db.close();
+    throw error;
+  }
   const read = (id: string): Run | undefined => {
     const row = db.prepare('SELECT data FROM rove_run WHERE id=?').get(id);
     return row ? JSON.parse(String(row.data)) : undefined;
@@ -66,13 +71,18 @@ export function createAgent(config: Config, tools: AgentTools) {
     save(run);
   }
   // A process exit after dispatch cannot prove whether an external action succeeded.
-  for (const row of db.prepare('SELECT data FROM rove_run').all()) {
-    const run: Run = JSON.parse(String(row.data));
-    if (run.status === 'executing')
-      toolResult(
-        run,
-        'Action outcome unknown after restart. Check the external system before proposing another action. This call will not be repeated.',
-      );
+  try {
+    for (const row of db.prepare('SELECT data FROM rove_run').all()) {
+      const run: Run = JSON.parse(String(row.data));
+      if (run.status === 'executing')
+        toolResult(
+          run,
+          'Action outcome unknown after restart. Check the external system before proposing another action. This call will not be repeated.',
+        );
+    }
+  } catch (error) {
+    db.close();
+    throw error;
   }
   function active(conversation: string, scope: string) {
     for (const row of db

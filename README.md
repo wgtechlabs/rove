@@ -192,7 +192,10 @@ mention Rove. An administrator must participate in the original conversation to
 approve tools: a non-admin's private DM cannot receive another person's approval.
 Use an allowed channel with an administrator for that work.
 
-Slack events are acknowledged into a durable queue and deduplicated. Rate-limited
+Slack events are acknowledged into a durable queue and deduplicated. Delivered
+queue payloads are cleared immediately; terminal job metadata and failed or
+uncertain deliveries expire after seven days. Older approval buttons expire with
+their origin record. Active work and conversation history are retained. Rate-limited
 responses retry from the saved reply. Unknown delivery outcomes are retained for
 manual checking instead of blindly posting duplicates. Run one replica.
 

@@ -27,12 +27,18 @@ export async function createApplication(
   publicPath = resolve('public'),
 ) {
   const identity = await createIdentity(config);
-  const extensions = createExtensions(config);
-  const aips = createAips(config, (skill) => {
-    extensions.adoptSkill(skill);
-  });
+  const cleanup: (() => void | Promise<void>)[] = [() => identity.close()];
+  let extensions: ReturnType<typeof createExtensions>;
+  let aips: ReturnType<typeof createAips>;
   let chat: ReturnType<typeof createChat>;
+  let slack: ReturnType<typeof createSlack>;
   try {
+    extensions = createExtensions(config);
+    cleanup.push(() => extensions.close());
+    aips = createAips(config, (skill) => {
+      extensions.adoptSkill(skill);
+    });
+    cleanup.push(() => aips.close());
     chat = createChat(config, {
       instructions(scope) {
         return [
@@ -62,14 +68,14 @@ export async function createApplication(
           : extensions.execute(name, args, revision, signal);
       },
     });
+    cleanup.push(() => chat.close());
+    slack = createSlack(config, chat);
+    cleanup.push(() => slack.close());
+    slack.start();
   } catch (error) {
-    aips.close();
-    extensions.close();
-    identity.close();
+    await Promise.allSettled(cleanup.reverse().map(async (close) => close()));
     throw error;
   }
-  const slack = createSlack(config, chat);
-  slack.start();
   const json = (body: unknown, status = 200) => Response.json(body, { status });
   async function route(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;

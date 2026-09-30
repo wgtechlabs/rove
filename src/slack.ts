@@ -77,7 +77,9 @@ const timestamp = (value: string) => /^\d{1,20}\.\d{1,10}$/.test(value);
 
 export function createSlack(config: Config, chat: Chat) {
   const db = new DatabaseSync(config.databasePath);
-  db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1000;
+  let nextCleanup = 0;
+  try {
+    db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1000;
     CREATE TABLE IF NOT EXISTS rove_slack_settings (singleton INTEGER PRIMARY KEY CHECK(singleton=1), value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS rove_slack_thread (scope TEXT PRIMARY KEY, conversation TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS rove_slack_job (
@@ -88,6 +90,37 @@ export function createSlack(config: Config, chat: Chat) {
       next_at INTEGER NOT NULL DEFAULT 0);
     UPDATE rove_slack_job SET status='pending' WHERE status='processing';
     UPDATE rove_slack_job SET status='uncertain' WHERE status='delivering';`);
+    if (
+      !db
+        .prepare('PRAGMA table_info(rove_slack_job)')
+        .all()
+        .some((column) => column.name === 'finished_at')
+    )
+      db.exec(
+        'ALTER TABLE rove_slack_job ADD COLUMN finished_at INTEGER NOT NULL DEFAULT 0',
+      );
+    db.exec(`CREATE INDEX IF NOT EXISTS rove_slack_job_queue ON rove_slack_job(scope,sequence) WHERE status IN ('pending','processing','ready','delivering');
+      CREATE INDEX IF NOT EXISTS rove_slack_job_retention ON rove_slack_job(status,finished_at);`);
+    prune();
+  } catch (error) {
+    db.close();
+    throw error;
+  }
+  function prune() {
+    const now = Date.now();
+    if (now < nextCleanup) return;
+    // Keep seven days of retry IDs and button origins; active work is never pruned.
+    db.prepare(
+      `UPDATE rove_slack_job SET finished_at=? WHERE finished_at=0 AND status IN ('sent','failed','uncertain','cancelled')`,
+    ).run(now);
+    db.exec(
+      "UPDATE rove_slack_job SET content='', reply='' WHERE status='sent' AND (content<>'' OR reply<>'')",
+    );
+    db.prepare(
+      "DELETE FROM rove_slack_job WHERE status IN ('sent','failed','uncertain','cancelled') AND finished_at < ?",
+    ).run(now - 7 * 86400000);
+    nextCleanup = now + 60000;
+  }
   const secrets = createSecrets(config.authSecret);
   let stopping = false;
   let saving = false;
@@ -293,6 +326,16 @@ export function createSlack(config: Config, chat: Chat) {
       'conversation' | 'reply' | 'status' | 'attempts' | 'next_at'
     > & { conversation?: string },
   ) {
+    prune();
+    if (
+      job.approvalId &&
+      db
+        .prepare(
+          "SELECT id FROM rove_slack_job WHERE approvalId=? AND status IN ('pending','processing','ready','delivering')",
+        )
+        .get(job.approvalId)
+    )
+      return;
     if (db.prepare('SELECT id FROM rove_slack_job WHERE id=?').get(job.id))
       return;
     if (
@@ -537,6 +580,7 @@ export function createSlack(config: Config, chat: Chat) {
   }
   async function processJob() {
     if (stopping || saving) return;
+    prune();
     const job = db
       .prepare(`SELECT job.* FROM rove_slack_job AS job
         WHERE job.status IN ('pending','ready') AND job.next_at <= ?
@@ -606,9 +650,9 @@ export function createSlack(config: Config, chat: Chat) {
         secrets.decrypt(state.botToken),
         JSON.parse(job.reply),
       );
-      db.prepare("UPDATE rove_slack_job SET status='sent' WHERE id=?").run(
-        job.id,
-      );
+      db.prepare(
+        "UPDATE rove_slack_job SET status='sent', content='', reply='', finished_at=? WHERE id=?",
+      ).run(Date.now(), job.id);
     } catch (error) {
       const phase = String(
         db.prepare('SELECT status FROM rove_slack_job WHERE id=?').get(job.id)

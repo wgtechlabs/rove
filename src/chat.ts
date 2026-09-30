@@ -19,6 +19,7 @@ export function createChat(
   },
 ) {
   const db = new DatabaseSync(config.databasePath);
+  let agent: ReturnType<typeof createAgent>;
   try {
     db.exec(`PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;
       CREATE TABLE IF NOT EXISTS rove_model (
@@ -34,20 +35,20 @@ export function createChat(
         conversation_id TEXT NOT NULL REFERENCES rove_conversation(id),
         prompt TEXT NOT NULL, reply TEXT NOT NULL
       );`);
+    if (
+      !db
+        .prepare('PRAGMA table_info(rove_conversation)')
+        .all()
+        .some((column) => column.name === 'scope')
+    )
+      db.exec(
+        "ALTER TABLE rove_conversation ADD COLUMN scope TEXT NOT NULL DEFAULT 'web'",
+      );
+    agent = createAgent(config, tools);
   } catch (error) {
     db.close();
     throw error;
   }
-  if (
-    !db
-      .prepare('PRAGMA table_info(rove_conversation)')
-      .all()
-      .some((column) => column.name === 'scope')
-  )
-    db.exec(
-      "ALTER TABLE rove_conversation ADD COLUMN scope TEXT NOT NULL DEFAULT 'web'",
-    );
-  const agent = createAgent(config, tools);
   const { encrypt, decrypt } = createSecrets(config.authSecret);
   // ponytail: one in-flight reply per deployment; use a durable job queue before multiple replicas.
   let busy = false;

@@ -548,6 +548,7 @@ test('Slack offers a durable Continue reply action after an approved tool finish
   const f = await fixture(t);
   f.approval();
   let executions = 0;
+  let continuations = 0;
   const decide = f.chat.decide;
   f.chat.decide = async (id, body, scope) => {
     const current = f.chat.get(id, scope);
@@ -557,6 +558,8 @@ test('Slack offers a durable Continue reply action after an approved tool finish
       throw new HttpError(502, 'Local model continuation failed.');
     }
     assert.equal(current.pending?.status, 'ready');
+    continuations++;
+    if (continuations === 1) throw new HttpError(502, 'Still unavailable.');
     return decide(id, body, scope);
   };
   await f.slack.handle(signed(event('ERESUME')));
@@ -605,7 +608,39 @@ test('Slack offers a durable Continue reply action after an approved tool finish
   );
   await f.slack.handle(signed(resume, true));
   await f.slack.handle(signed(resume, true));
+  await f.slack.handle(
+    signed(
+      action(
+        f.posts[1] as Record<string, unknown>,
+        'rove_resume',
+        '1002.000002',
+      ),
+      true,
+    ),
+  );
   await until(() => f.posts.length === 3);
+  await delay(350);
+  assert.equal(continuations, 1);
+  const retry = action(
+    f.posts[2] as Record<string, unknown>,
+    'rove_resume',
+    '1003.000001',
+  );
+  await f.slack.handle(signed(retry, true));
+  await f.slack.handle(
+    signed(
+      action(
+        f.posts[2] as Record<string, unknown>,
+        'rove_resume',
+        '1003.000002',
+      ),
+      true,
+    ),
+  );
+  await until(() => f.posts.length === 4);
+  await delay(350);
+  assert.equal(f.posts.length, 4);
+  assert.equal(continuations, 2);
   assert.equal(executions, 1);
   assert.equal(f.decisions.length, 1);
 });
@@ -644,4 +679,93 @@ test('a rate-limited thread does not block another thread or allow its own follo
     ['Hello', 'A separate thread', 'A follow-up in the delayed thread'],
   );
   assert.equal(f.sends[0]?.id, f.sends[2]?.id);
+});
+
+test('Slack scrubs delivered payloads and expires terminal retry records without pruning active work', async (t) => {
+  const f = await fixture(t);
+  await f.slack.handle(signed(event('ERETAIN')));
+  f.slack.start();
+  await until(() => f.posts.length === 1);
+  await f.restart();
+  const db = new DatabaseSync(f.config.databasePath);
+  t.after(() => db.close());
+  assert.deepEqual(
+    {
+      ...db
+        .prepare("SELECT content,reply FROM rove_slack_job WHERE id='ERETAIN'")
+        .get(),
+    },
+    { content: '', reply: '' },
+  );
+  await f.slack.handle(signed(event('ERETAIN')));
+  assert.equal(
+    db.prepare('SELECT COUNT(*) AS n FROM rove_slack_job').get()?.n,
+    1,
+  );
+  for (const status of [
+    'failed',
+    'uncertain',
+    'cancelled',
+    'pending',
+    'ready',
+  ]) {
+    db.prepare(`INSERT INTO rove_slack_job(id,scope,channel,thread,user,content,status,finished_at)
+      VALUES(?, 'test', 'CROOM', '1000.000001', 'UALICE', 'saved input', ?, ?)`).run(
+      status,
+      status,
+      Date.now(),
+    );
+  }
+  const later = Date.now() + 8 * 86400000;
+  t.mock.method(Date, 'now', () => later);
+  await f.slack.handle(signed(event('EFRESH')));
+  assert.deepEqual(
+    db
+      .prepare('SELECT id FROM rove_slack_job ORDER BY id')
+      .all()
+      .map((row) => row.id),
+    ['EFRESH', 'pending', 'ready'],
+  );
+});
+
+test('application startup rolls back every opened database when a service fails to initialize', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'rove-startup-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const exec = DatabaseSync.prototype.exec;
+  const close = DatabaseSync.prototype.close;
+  const open = new Set<DatabaseSync>();
+  let failure = '';
+  t.mock.method(
+    DatabaseSync.prototype,
+    'exec',
+    function (this: DatabaseSync, sql: string) {
+      open.add(this);
+      if (sql.includes(failure))
+        throw new Error('Simulated initialization failure');
+      return exec.call(this, sql);
+    },
+  );
+  t.mock.method(DatabaseSync.prototype, 'close', function (this: DatabaseSync) {
+    open.delete(this);
+    return close.call(this);
+  });
+  for (const stage of [
+    'rove_extension',
+    'rove_aip',
+    'ALTER TABLE rove_conversation',
+    'rove_run',
+    'rove_slack_job',
+  ]) {
+    failure = stage;
+    await assert.rejects(
+      createApplication({
+        baseURL: origin,
+        authSecret: 'local-test-auth-secret-at-least-32-characters',
+        setupSecret: 'local-test-setup-secret-at-least-32-characters',
+        databasePath: join(dir, `${stage.replaceAll(' ', '-')}.sqlite`),
+      }),
+      /Simulated initialization failure/,
+    );
+    assert.equal(open.size, 0, stage);
+  }
 });
