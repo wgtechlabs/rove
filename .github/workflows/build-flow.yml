@@ -22,6 +22,7 @@ jobs:
     secrets: inherit
     with:
       ci-profile: node
+      ci-runtime-version: "24"
       # Keep Node as the application runtime; install the pinned Bun toolchain.
       ci-setup-command: npm install --global bun@1.3.10
       ci-install-command: bun install --frozen-lockfile
