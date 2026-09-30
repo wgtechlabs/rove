@@ -848,6 +848,16 @@ test('HTTP ingress admits signed large Slack interactions while preserving route
     assert.equal(
       (
         await send(
+          '//example.invalid/api/slack/interactivity',
+          raw,
+          request.headers,
+        )
+      ).status,
+      413,
+    );
+    assert.equal(
+      (
+        await send(
           '/api/slack/interactivity',
           'x'.repeat(MAX_SLACK_BODY + 1),
           request.headers,
