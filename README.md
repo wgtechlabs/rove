@@ -9,14 +9,15 @@ thinking and unsure expressions. See the [Rove avatar guide](public/brand/README
 wordmark uses Fredoka SemiBold 600; the product interface uses Inter.
 See [DESIGN.md](DESIGN.md) and the [font licenses](public/fonts/README.md).
 
-Rove is a self-hosted foundation for a company-neutral AI agent. The goal is a
-shared agent you configure through the web, connect to your tools and channels,
+Rove is a self-hosted, company-neutral AI agent. Configure a
+shared agent through the web, connect to your tools and channels,
 and teach through reviewed **Agent Improvement Proposals (AIPs)**. Your company
 supplies the knowledge, policies and workflows.
 
-> **Early preview:** administrator setup, sign-in, recovery and AI web chat are
-> available. Connect your own model provider to start chatting. Tools, external
-> channels and AIPs are still being built.
+> **MVP preview:** web chat, approved tool execution, Markdown skills, declarative
+> plugins, remote MCP, optional Slack, and GitHub-backed AIPs are implemented.
+> Bring your own provider and integration credentials. Live compatibility depends
+> on your provider and installed integrations.
 
 [Quick start](#quick-start) · [Railway](#deploy-on-railway) ·
 [Connect a model](#connect-a-model) · [Development](#development)
@@ -30,9 +31,9 @@ supplies the knowledge, policies and workflows.
 | Persistent SQLite storage and Docker/Railway configuration | Available |
 | AI web chat with saved conversations | Available |
 | Web configuration for model connection and system instructions | Available |
-| Optional Slack channel, activated from the web interface | Planned |
-| Web configuration for tools, MCP servers, plugins and skills | Planned |
-| AIPs for proposing and reviewing improvements | Planned |
+| Optional Slack channel, activated from the web interface | Implemented |
+| Web configuration for tools, MCP servers, plugins and skills | Implemented |
+| AIP drafts, GitHub PRs and verified skill adoption | Implemented |
 
 The MVP starts with one company and one administrator per deployment. Web setup
 requires no Slack or AI-provider credentials. A Rove CLI, Discord and Telegram
@@ -120,8 +121,8 @@ are excluded from the image. A published image is not required.
 The endpoint must support OpenAI-compatible Chat Completions with text messages,
 `stream: false` and `max_completion_tokens`. Replies are limited to 2,048 tokens
 (including reasoning where the provider uses it). Provider billing and available
-models come from your own account. Native Anthropic, tool execution, file uploads
-and streaming are not included in this milestone.
+models come from your own account. Connected tools also require compatible
+function calling. Native Anthropic, file uploads and streaming are outside this MVP.
 
 Your API key stays on the server, encrypted in SQLite using a key derived from
 `BETTER_AUTH_SECRET`; it is never returned by the settings API. Leave the key
@@ -132,7 +133,8 @@ application secret together; conversations themselves are stored as plain text.
 
 Messages and system instructions are sent to your chosen provider. Completed
 exchanges are saved locally and survive restarts. A failed reply leaves the draft
-available to retry; incomplete exchanges are not saved. Rove waits up to 60
+available to retry. Pending actions and completed tool results are persisted so
+approvals survive reloads and interrupted replies can continue without repeating actions. Rove waits up to 60
 seconds for a reply and cancels pending requests on shutdown with a retryable
 error. Drafts are held in the current browser page and are lost on reload.
 
@@ -141,6 +143,78 @@ replies each, and accepts messages up to 4,000 characters. Each request includes
 at most the latest 20 exchanges within a 60,000-character history budget. Older
 history remains visible but may not be sent to the model. Start a new conversation
 when you reach its limit. Conversation deletion is not available yet.
+
+## Customize your agent
+
+Open **Customize Rove** after signing in:
+
+- **Skills:** add Markdown instructions and explicitly enable them. Up to 8,000
+  characters per skill and 24,000 across saved skills and bundles.
+- **Plugins:** add a JSON array of `{ "name": "…", "markdown": "…" }` skills.
+  This MVP supports declarative skill bundles, not downloaded executable code.
+- **Tools & MCP:** save a remote Streamable HTTP endpoint and optional bearer
+  token, enable it, then select **Discover tools**. All discovered tools on an
+  enabled connection are available to the model. Every call pauses for an
+  administrator to approve its exact arguments or deny it.
+
+Approvals expire after 15 minutes and become invalid when the relevant connection
+or proposal changes. Rove permits at most six tool calls per message. A failed
+model continuation can resume from its saved tool result. An uncertain external
+outcome is never silently retried; check the external system before requesting
+another action. Conversation messages, proposal drafts, approval arguments and
+tool results are stored locally as plaintext; integration credentials are encrypted.
+
+MCP limits: eight servers, 32 enabled tools in total, four catalog pages, and
+text/JSON results up to 16 KB. Public HTTPS endpoints are required; loopback HTTP
+is available only when Rove itself uses a loopback development URL. Redirects,
+private network destinations, schema references and regex patterns are rejected.
+Local stdio servers and OAuth are outside this MVP. Re-discover tools after changing
+a connection. Only connect servers your company trusts.
+
+### Enable Slack
+
+1. Create and install a Slack app with `app_mentions:read`, `im:history`, and
+   `chat:write`. Subscribe to `app_mention` and `message.im`; enable the App Home
+   Messages tab.
+2. Under **Customize Rove → Slack**, save the bot token, signing secret, allowed
+   user IDs, allowed channel IDs, and explicit administrator user IDs. Every Slack
+   administrator must also be an allowed user. Enable DMs only if wanted.
+3. Use `https://YOUR-ROVE-HOST/api/slack/events` for Event Subscriptions and
+   `https://YOUR-ROVE-HOST/api/slack/interactivity` for Interactivity.
+4. Enable the connection, mention Rove in an allowed channel, and verify a reply.
+   Saving checks the bot token; successful Slack URL verification and a real reply
+   are still needed to verify the installation.
+
+Empty allowlists deny access. External shared channels, bots and unsupported
+message types are ignored. Replies and approval buttons stay in the originating
+thread, and web history is isolated from Slack history. Channel follow-ups must
+mention Rove. An administrator must participate in the original conversation to
+approve tools: a non-admin's private DM cannot receive another person's approval.
+Use an allowed channel with an administrator for that work.
+
+Slack events are acknowledged into a durable queue and deduplicated. Rate-limited
+responses retry from the saved reply. Unknown delivery outcomes are retained for
+manual checking instead of blindly posting duplicates. Run one replica.
+
+### Improve through AIPs
+
+Connect your **company's repository** under **GitHub & AIPs**, using a scoped token
+with Contents and Pull requests read/write permission. Ask Rove to draft an Agent
+Improvement Proposal in web chat or Slack. Review its title, summary, proposed
+skill, rationale and validation plan; request revisions or cancellation there.
+
+Drafting, publishing and adoption are separate administrator-reviewed calls.
+Publishing creates a draft PR containing only `.rove/skills/<name>.md` with the
+stored proposed content. Rove never merges it. After a human reviews and merges
+in GitHub, ask Rove to adopt it in the original conversation. Adoption checks the
+matching merged PR and exact file content at its merge commit, then activates the
+skill. Changes made during GitHub review require a new matching proposal.
+
+Each conversation supports 100 proposals. Proposals do not include conversation
+transcripts or source-channel URLs in PR bodies. Review the proposed text for
+company-sensitive information before approving publication. If publication has an
+unknown outcome, reconcile the recorded branch and GitHub PR manually; Rove blocks
+republication of that proposal to prevent duplicates.
 
 ## Configuration
 
@@ -191,7 +265,10 @@ Tests use real Better Auth sessions and SQLite with dummy credentials, covering
 setup races, authorization, recovery, session revocation, restarts and limits.
 Chat tests exercise a local HTTP provider to verify request compatibility,
 encrypted configuration, saved history, retries and failure handling. They do not
-call a live model or prove compatibility with every provider.
+call a live model or prove compatibility with every provider. Tool-loop tests cover
+restart/crash recovery and approval replay. MCP tests use real local HTTP/SSE
+servers; Slack and GitHub tests use controlled API boundaries. These do not prove
+your live Slack installation, GitHub token, or hosted MCP server configuration.
 To check container persistence and shutdown:
 
 ```sh

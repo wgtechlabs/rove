@@ -1,21 +1,23 @@
-import {
-  createCipheriv,
-  createDecipheriv,
-  createHash,
-  randomBytes,
-  randomUUID,
-} from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
+import { type AgentTools, createAgent } from './agent.js';
 import { HttpError, textField } from './auth.js';
 import type { Config } from './config.js';
 import {
   type Message,
   type ProviderSettings,
   providerURL,
-  reply,
 } from './provider.js';
+import { createSecrets } from './secrets.js';
 
-export function createChat(config: Config) {
+export function createChat(
+  config: Config,
+  tools: AgentTools = {
+    instructions: () => '',
+    tools: async () => [],
+    execute: async () => '',
+  },
+) {
   const db = new DatabaseSync(config.databasePath);
   try {
     db.exec(`PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;
@@ -36,42 +38,22 @@ export function createChat(config: Config) {
     db.close();
     throw error;
   }
-  const key = createHash('sha256')
-    .update('rove:model-key:v1:')
-    .update(config.authSecret)
-    .digest();
+  if (
+    !db
+      .prepare('PRAGMA table_info(rove_conversation)')
+      .all()
+      .some((column) => column.name === 'scope')
+  )
+    db.exec(
+      "ALTER TABLE rove_conversation ADD COLUMN scope TEXT NOT NULL DEFAULT 'web'",
+    );
+  const agent = createAgent(config, tools);
+  const { encrypt, decrypt } = createSecrets(config.authSecret);
   // ponytail: one in-flight reply per deployment; use a durable job queue before multiple replicas.
   let busy = false;
   let stopping = false;
   let active: AbortController | undefined;
 
-  function encrypt(value: string) {
-    const nonce = randomBytes(12);
-    const cipher = createCipheriv('aes-256-gcm', key, nonce);
-    const ciphertext = Buffer.concat([
-      cipher.update(value, 'utf8'),
-      cipher.final(),
-    ]);
-    return Buffer.concat([nonce, cipher.getAuthTag(), ciphertext]).toString(
-      'base64',
-    );
-  }
-  function decrypt(value: string) {
-    try {
-      const data = Buffer.from(value, 'base64');
-      const cipher = createDecipheriv('aes-256-gcm', key, data.subarray(0, 12));
-      cipher.setAuthTag(data.subarray(12, 28));
-      return Buffer.concat([
-        cipher.update(data.subarray(28)),
-        cipher.final(),
-      ]).toString('utf8');
-    } catch {
-      throw new HttpError(
-        503,
-        'The saved API key cannot be opened. Save a new key in model settings.',
-      );
-    }
-  }
   function saved() {
     return db.prepare('SELECT * FROM rove_model WHERE singleton = 1').get();
   }
@@ -124,19 +106,34 @@ export function createChat(config: Config) {
     db.prepare("UPDATE rove_model SET api_key = '' WHERE singleton = 1").run();
     return settings();
   }
-  function list() {
+  function list(scope = 'web') {
     return db
       .prepare(
-        'SELECT id, title, updated_at AS updatedAt FROM rove_conversation ORDER BY updated_at DESC, id',
+        'SELECT id, title, updated_at AS updatedAt FROM rove_conversation WHERE scope = ? ORDER BY updated_at DESC, id',
       )
-      .all();
+      .all(scope);
   }
-  function get(id: string) {
+  function get(id: string, scope = 'web') {
+    // Final model results are durable before presentation; repair a crash between the two writes.
+    const owned = db
+      .prepare('SELECT title FROM rove_conversation WHERE id=? AND scope=?')
+      .get(id, scope);
+    if (!owned) throw new HttpError(404, 'Conversation not found.');
+    for (const run of agent.completed(id, `${scope}:${id}`)) {
+      if (
+        !db
+          .prepare('SELECT 1 FROM rove_exchange WHERE request_id=?')
+          .get(run.id)
+      )
+        persist(id, run.id, run.prompt, run.answer || '', {
+          title: String(owned.title),
+        });
+    }
     const row = db
       .prepare(
-        'SELECT id, title, updated_at AS updatedAt FROM rove_conversation WHERE id = ?',
+        'SELECT id, title, updated_at AS updatedAt FROM rove_conversation WHERE id = ? AND scope = ?',
       )
-      .get(id);
+      .get(id, scope);
     if (!row) throw new HttpError(404, 'Conversation not found.');
     const exchanges = db
       .prepare(
@@ -147,14 +144,18 @@ export function createChat(config: Config) {
       { role: 'user' as const, content: String(item.prompt) },
       { role: 'assistant' as const, content: String(item.reply) },
     ]);
+    const pending = agent.pending(id, `${scope}:${id}`);
     return {
+      ...(pending ? { pending } : {}),
       id: String(row.id),
       title: String(row.title),
       updatedAt: Number(row.updatedAt),
-      messages,
+      messages: pending
+        ? [...messages, { role: 'user' as const, content: pending.prompt }]
+        : messages,
     };
   }
-  function create() {
+  function create(scope = 'web') {
     if (
       Number(
         db.prepare('SELECT COUNT(*) AS count FROM rove_conversation').get()
@@ -166,14 +167,16 @@ export function createChat(config: Config) {
         'This preview supports up to 200 conversations.',
       );
     const id = randomUUID();
-    db.prepare('INSERT INTO rove_conversation VALUES (?, ?, ?)').run(
-      id,
-      'New conversation',
-      Date.now(),
-    );
-    return get(id);
+    db.prepare(
+      'INSERT INTO rove_conversation(id,title,updated_at,scope) VALUES (?, ?, ?, ?)',
+    ).run(id, 'New conversation', Date.now(), scope);
+    return get(id, scope);
   }
-  async function send(id: string, body: Record<string, unknown>) {
+  async function send(
+    id: string,
+    body: Record<string, unknown>,
+    scope = 'web',
+  ) {
     if (stopping)
       throw new HttpError(
         503,
@@ -188,7 +191,7 @@ export function createChat(config: Config) {
       )
     )
       throw new HttpError(400, 'Send a message with a valid request ID.');
-    const conversation = get(id);
+    const conversation = get(id, scope);
     const previous = db
       .prepare(
         'SELECT conversation_id, prompt FROM rove_exchange WHERE request_id = ?',
@@ -236,27 +239,97 @@ export function createChat(config: Config) {
     busy = true;
     active = new AbortController();
     try {
-      const answer = await reply(provider, history, active.signal);
-      db.exec('BEGIN IMMEDIATE');
-      try {
-        db.prepare(
-          'INSERT INTO rove_exchange(request_id, conversation_id, prompt, reply) VALUES (?, ?, ?, ?)',
-        ).run(requestId, id, content, answer);
-        db.prepare(
-          'UPDATE rove_conversation SET title = ?, updated_at = ? WHERE id = ?',
-        ).run(
-          conversation.messages.length
-            ? conversation.title
-            : content.slice(0, 80),
-          Date.now(),
+      const result = await agent.start(
+        requestId,
+        id,
+        `${scope}:${id}`,
+        content,
+        history,
+        provider,
+        active.signal,
+      );
+      if (result.status !== 'done') return get(id, scope);
+      const answer = result.answer || '';
+      persist(id, requestId, content, answer, conversation);
+      return get(id, scope);
+    } finally {
+      busy = false;
+      active = undefined;
+    }
+  }
+  function persist(
+    id: string,
+    requestId: string,
+    content: string,
+    answer: string,
+    conversation: { title: string },
+  ) {
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      db.prepare(
+        'INSERT OR IGNORE INTO rove_exchange(request_id, conversation_id, prompt, reply) VALUES (?, ?, ?, ?)',
+      ).run(requestId, id, content, answer);
+      db.prepare(
+        'UPDATE rove_conversation SET title = ?, updated_at = ? WHERE id = ?',
+      ).run(
+        db
+          .prepare(
+            'SELECT COUNT(*) AS count FROM rove_exchange WHERE conversation_id=?',
+          )
+          .get(id)?.count !== 1
+          ? conversation.title
+          : content.slice(0, 80),
+        Date.now(),
+        id,
+      );
+      db.exec('COMMIT');
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+  async function decide(
+    id: string,
+    body: Record<string, unknown>,
+    scope = 'web',
+  ) {
+    if (busy || stopping)
+      throw new HttpError(
+        409,
+        'Rove is busy or restarting. Try again shortly.',
+      );
+    const conversation = get(id, scope);
+    const approvalId = textField(body, 'approvalId', 36, 36);
+    const decision = textField(body, 'decision', 1, 10);
+    const row = saved();
+    if (!row?.api_key)
+      throw new HttpError(409, 'Connect a model before continuing.');
+    const provider: ProviderSettings = {
+      baseURL: String(row.base_url),
+      model: String(row.model),
+      systemPrompt: String(row.system_prompt),
+      apiKey: decrypt(String(row.api_key)),
+    };
+    busy = true;
+    active = new AbortController();
+    try {
+      const result = await agent.decide(
+        id,
+        `${scope}:${id}`,
+        approvalId,
+        decision,
+        provider,
+        active.signal,
+      );
+      if (result.status === 'done')
+        persist(
           id,
+          result.id,
+          result.prompt,
+          result.answer || '',
+          conversation,
         );
-        db.exec('COMMIT');
-      } catch (error) {
-        db.exec('ROLLBACK');
-        throw error;
-      }
-      return get(id);
+      return get(id, scope);
     } finally {
       busy = false;
       active = undefined;
@@ -270,10 +343,14 @@ export function createChat(config: Config) {
     get,
     create,
     send,
+    decide,
     cancelPending() {
       stopping = true;
       active?.abort();
     },
-    close: () => db.close(),
+    close() {
+      agent.close();
+      db.close();
+    },
   };
 }

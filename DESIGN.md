@@ -104,7 +104,7 @@ components:
 
 Rove is a dark-by-default administration interface with original cyan accents for focused company setup, conversations and model administration. A cute cyan round avatar and lowercase rove wordmark establish identity on the dark masthead; light ink, a deep canvas and subtly lighter working surfaces keep forms clear. Fredoka SemiBold gives the wordmark its friendly character; Inter keeps the working interface clear. Both fonts are served locally as WOFF2 with system fallbacks. The transparent SVG mark has two black eyes; no raster assets are required.
 
-This document records the implemented `public/style.css`, `public/index.html`, `public/app.js`, `public/chat.js`, `public/brand/icon.svg` and local fonts in `public/fonts/`.
+This document records the implemented `public/style.css`, `public/index.html`, `public/app.js`, `public/chat.js`, `public/manage.js`, `public/brand/icon.svg` and local fonts in `public/fonts/`.
 
 **Key Characteristics:**
 - Dark masthead with cyan branding and primary actions.
@@ -128,9 +128,9 @@ Use Inter throughout the interface, with the system UI stack as fallback. Local 
 
 The masthead content caps at 1200px, with a 76px minimum height and 16px 36px padding. Authentication is a centered single column capped at 680px, with 24px minimum side gutters and 48px top margin. Introduction, horizontal setup steps and form follow a clear vertical sequence.
 
-The authenticated workspace caps at 1200px. A 260px sidebar contains conversation navigation above account identity and model settings. A soft vertical divider separates it from the dark chat or settings surface, which uses 32px 36px padding. The message history grows naturally above the composer; a compact heading and horizontal divider establish the current conversation. Model settings replace the chat within the same working surface rather than opening an overlay.
+The authenticated workspace caps at 1200px. A 260px sidebar contains conversation navigation above Customize Rove, model settings and account identity. A soft vertical divider separates it from the dark chat or settings surface, which uses 32px 36px padding. The message history grows naturally above the composer; a compact heading and horizontal divider establish the current conversation. Model settings and Customize Rove replace the chat within the same working surface rather than opening an overlay.
 
-At 700px and below, the masthead wraps with 12px 20px padding and a 68px minimum height. Authentication gutters become 16px, authentication headings become 2rem, and form padding uses panel-mobile. Setup steps become vertical. The workspace becomes one column: conversation buttons form a horizontally scrolling row, account identity sits beside the settings action, and the working surface uses 24px 20px padding. Conversation buttons cap at 220px on mobile. Settings headings stack and composer actions wrap when needed.
+At 700px and below, the masthead wraps with 12px 20px padding and a 68px minimum height. Authentication gutters become 16px, authentication headings become 2rem, and form padding uses panel-mobile. Setup steps become vertical. The workspace becomes one column: conversation buttons form a horizontally scrolling row, Customize Rove and model settings become full-width stacked actions above account identity, and the working surface uses 24px 20px padding. Conversation buttons cap at 220px on mobile. Settings headings stack and composer actions wrap when needed.
 
 ## Elevation & Depth
 
@@ -151,6 +151,10 @@ Inline errors use alert semantics and a tinted surface; empty errors are hidden.
 Conversation navigation uses quiet, single-line titles with ellipsis. The current conversation gains a deep teal fill, stronger border and semibold weight, with a semantic current-page marker. User messages use the deeper rounded canvas surface; Rove responses remain on the subtly lighter working surface. Both retain visible speaker labels. The composer has a persistent label, keyboard shortcut hint and plain-text multiline input; Enter inserts a line break and Ctrl or Command + Enter submits.
 
 Model settings use the same labeled fields and focus treatment as authentication. The saved API key remains hidden behind a blank password field, with a hint describing retention or replacement. Inline save status distinguishes saved configuration from a verified provider connection. Empty chat states guide administrators to settings, and a failed initial load exposes a reload action.
+
+Customize Rove uses wrapping secondary navigation for Skills, Tools & MCP, Plugins, Slack, and GitHub & AIPs. The current section has a deep teal fill, cyan border and semantic current-page marker. Configuration records use flat rows separated by soft horizontal rules, with explicit enabled status and edit actions. Editors share the existing labeled fields and native checkbox targets; saved credentials remain blank with retention hints. Slack request URLs wrap within the working surface, and the GitHub section explains the ordered proposal review and adoption steps.
+
+Pending tool calls appear inside the conversation as cyan-outlined approval panels with a 12px radius, 20px padding and separate approve and deny actions. Padding reduces to 16px on mobile. Exact arguments use wrapped monospace text on the deeper canvas, with a vertically scrollable area capped at 360px. Saved results expose a Continue reply action. View proposals reveals native disclosure rows containing the proposal record, with wrapped monospace content and summary targets at least 44px tall.
 
 ## Do's and Don'ts
 
