@@ -1,3 +1,4 @@
+import { mountManage } from './manage.js';
 // Static markup only. Conversation and account values always use textContent/value.
 export function mountChat(main, admin, api, expire, signout) {
   let alive = true;
@@ -5,6 +6,7 @@ export function mountChat(main, admin, api, expire, signout) {
   let settings;
   let current;
   let conversations = [];
+  let manager;
   const drafts = new Map();
   const avatar = document.querySelector('.brand-mark');
   avatar.dataset.expression = 'idle';
@@ -15,16 +17,17 @@ export function mountChat(main, admin, api, expire, signout) {
       <div class="sidebar-heading"><h2>Conversations</h2><button id="new-chat" class="secondary" type="button">New chat</button></div>
       <p id="list-status" class="small" role="status">Loading conversations…</p>
       <nav id="conversation-list" aria-label="Saved conversations"></nav>
-      <div class="sidebar-account"><button id="settings-open" class="secondary" type="button">Model settings</button><strong id="account-name"></strong><span id="account-email" class="small"></span><span class="small">Administrator</span></div>
+      <div class="sidebar-account"><button id="manage-open" class="secondary" type="button">Customize Rove</button><button id="settings-open" class="secondary" type="button">Model settings</button><strong id="account-name"></strong><span id="account-email" class="small"></span><span class="small">Administrator</span></div>
     </aside>
     <div class="workspace-content">
       <p id="workspace-error" class="error" role="alert" tabindex="-1"></p><button id="reload-workspace" class="secondary" type="button" hidden>Reload workspace</button>
       <section id="chat-view" class="chat-view" aria-labelledby="chat-title">
-        <div class="chat-heading"><h1 id="chat-title" tabindex="-1">Start a conversation</h1><p id="model-label" class="small">Loading model settings…</p></div>
+        <div class="chat-heading"><h1 id="chat-title" tabindex="-1">Start a conversation</h1><p id="model-label" class="small">Loading model settings…</p><button id="proposals-open" class="secondary" type="button">View proposals</button></div><div id="proposal-list" hidden></div>
         <div id="messages" class="messages" role="log" aria-label="Messages" aria-live="polite" aria-relevant="additions"></div>
         <div id="chat-empty" class="chat-empty"><h2>A place to think things through.</h2><p id="empty-description">Connect a model, then start a conversation with Rove.</p><button id="connect-model" class="primary" type="button" hidden>Connect a model</button></div>
         <form id="composer" class="composer"><label for="message">Message Rove</label><textarea id="message" name="content" rows="3" maxlength="4000" placeholder="What would you like to work on?" required aria-describedby="composer-hint"></textarea><div class="composer-actions"><p id="composer-hint" class="small">Enter for a new line. Ctrl or ⌘ + Enter to send.</p><button id="send-message" class="primary" type="submit">Send message</button></div><p id="send-status" class="small" role="status"></p></form>
       </section>
+      <section id="manage-view" class="settings-view" hidden></section>
       <section id="settings-view" class="settings-view" aria-labelledby="settings-title" hidden>
         <div class="settings-heading"><div><h1 id="settings-title" tabindex="-1">Model settings</h1><p class="description">Choose an OpenAI-compatible endpoint for your conversations.</p></div><button id="settings-close" class="secondary" type="button">Back to chat</button></div>
         <form id="model-settings">
@@ -56,8 +59,10 @@ export function mountChat(main, admin, api, expire, signout) {
     signout.disabled = value;
     find('#settings-open').disabled = value || !settings;
     find('#new-chat').disabled = value || !settings;
-    message.disabled = value || !settings?.configured;
-    send.disabled = value || !settings?.configured;
+    find('#proposals-open').disabled = value || !current;
+    message.disabled =
+      value || !settings?.configured || Boolean(current?.pending);
+    send.disabled = value || !settings?.configured || Boolean(current?.pending);
   }
 
   async function run(action) {
@@ -121,6 +126,7 @@ export function mountChat(main, admin, api, expire, signout) {
 
   function updateConversation(conversation) {
     current = conversation;
+    find('#proposal-list').hidden = true;
     conversations = [
       conversation,
       ...conversations.filter((item) => item.id !== conversation.id),
@@ -142,6 +148,58 @@ export function mountChat(main, admin, api, expire, signout) {
       article.append(label, content);
       messages.append(article);
     }
+    if (current?.pending) {
+      const pending = current.pending;
+      const panel = document.createElement('section');
+      panel.className = 'approval';
+      const heading = document.createElement('h2');
+      heading.textContent =
+        pending.status === 'waiting'
+          ? 'Review this action'
+          : 'Continue after the saved result';
+      const description = document.createElement('p');
+      description.textContent = `${pending.name}: ${pending.description || 'Proposed action.'} Administrator approval is required. Review the exact arguments below. Approval expires after 15 minutes.`;
+      const args = document.createElement('pre');
+      try {
+        args.textContent = JSON.stringify(
+          pending.detail ? JSON.parse(pending.detail) : pending.arguments,
+          null,
+          2,
+        );
+      } catch {
+        args.textContent = pending.detail;
+      }
+      const actions = document.createElement('div');
+      actions.className = 'settings-actions';
+      for (const decision of pending.status === 'waiting'
+        ? ['approve', 'deny']
+        : ['approve']) {
+        const control = document.createElement('button');
+        control.type = 'button';
+        control.className = decision === 'approve' ? 'primary' : 'secondary';
+        control.textContent =
+          pending.status !== 'waiting'
+            ? 'Continue reply'
+            : decision === 'approve'
+              ? 'Approve this action'
+              : 'Deny action';
+        control.onclick = () =>
+          run(async () => {
+            avatar.dataset.expression = 'thinking';
+            const result = await api(
+              `/api/admin/conversations/${current.id}/approval`,
+              { approvalId: pending.id, decision },
+            );
+            if (!alive) return;
+            avatar.dataset.expression = 'idle';
+            updateConversation(result);
+            renderMessages();
+          });
+        actions.append(control);
+      }
+      panel.append(heading, description, args, actions);
+      messages.append(panel);
+    }
     find('#chat-empty').hidden = Boolean(current?.messages.length);
     find('#chat-title').textContent = current?.title || 'Start a conversation';
     message.value = drafts.get(current?.id)?.content || '';
@@ -151,6 +209,7 @@ export function mountChat(main, admin, api, expire, signout) {
   }
 
   function showChat() {
+    find('#manage-view').hidden = true;
     settingsView.hidden = true;
     chatView.hidden = false;
     document.title = 'Chat · Rove';
@@ -184,12 +243,52 @@ export function mountChat(main, admin, api, expire, signout) {
     avatar.dataset.expression = 'idle';
     find('#settings-status').textContent = '';
     renderSettings();
+    find('#manage-view').hidden = true;
     chatView.hidden = true;
     settingsView.hidden = false;
     document.title = 'Model settings · Rove';
     find('#settings-title').focus();
   }
 
+  find('#proposals-open').onclick = () =>
+    run(async () => {
+      const { aips } = await api(`/api/admin/aips/${current.id}`);
+      if (!alive) return;
+      const list = find('#proposal-list');
+      list.replaceChildren();
+      list.hidden = false;
+      if (!aips.length) {
+        const empty = document.createElement('p');
+        empty.className = 'hint';
+        empty.textContent =
+          'No proposals in this conversation. Connect GitHub in Customize Rove, then ask Rove to draft an AIP.';
+        list.append(empty);
+      }
+      for (const aip of aips) {
+        const details = document.createElement('details');
+        details.className = 'configuration-row';
+        const title = document.createElement('summary');
+        title.textContent = `${aip.title} · ${aip.status}`;
+        const content = document.createElement('pre');
+        content.className = 'proposal-content';
+        content.textContent = JSON.stringify(aip, null, 2);
+        details.append(title, content);
+        list.append(details);
+      }
+    });
+  find('#manage-open').onclick = () =>
+    run(async () => {
+      const view = find('#manage-view');
+      manager?.dispose();
+      manager = mountManage(view, api, run, showChat);
+      await manager.load();
+      if (!alive) return;
+      chatView.hidden = true;
+      settingsView.hidden = true;
+      view.hidden = false;
+      document.title = 'Customize · Rove';
+      view.querySelector('h1').focus();
+    });
   find('#settings-open').onclick = showSettings;
   find('#connect-model').onclick = showSettings;
   find('#settings-close').onclick = showChat;
@@ -322,6 +421,7 @@ export function mountChat(main, admin, api, expire, signout) {
   initialize();
   return () => {
     alive = false;
+    manager?.dispose();
     avatar.dataset.expression = 'idle';
     signout.disabled = false;
     drafts.clear();

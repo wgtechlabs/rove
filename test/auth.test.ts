@@ -151,7 +151,7 @@ test('protected setup, administrator authorization, recovery, sign-out and resta
       'UPDATE session SET userId = (SELECT user_id FROM rove_admin)',
     ).run();
     db.close();
-    app.close();
+    await app.close();
     app = await createApplication({ ...config, setupSecret: undefined });
     assert.deepEqual(await (await app.fetch(request('/api/setup'))).json(), {
       required: false,
@@ -227,7 +227,7 @@ test('protected setup, administrator authorization, recovery, sign-out and resta
       /max-age=/,
     );
   } finally {
-    app.close();
+    await app.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -264,7 +264,7 @@ test('malformed input and persistent rate limits cannot be bypassed with proxy h
       attempt.headers.set('x-forwarded-for', `192.0.2.${i}`);
       assert.equal((await app.fetch(attempt)).status, 401);
     }
-    app.close();
+    await app.close();
     app = await createApplication(config);
     assert.equal((await app.fetch(request('/api/setup', account))).status, 429);
     assert.equal(
@@ -272,7 +272,7 @@ test('malformed input and persistent rate limits cannot be bypassed with proxy h
       404,
     );
   } finally {
-    app.close();
+    await app.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });

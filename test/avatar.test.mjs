@@ -39,7 +39,7 @@ test('avatar follows reply lifecycle, retries and disposal, not general loading'
   };
   const source = await readFile('public/chat.js', 'utf8');
   const mountChat = runInNewContext(
-    `${source.replace('export function', 'function')}; mountChat`,
+    `${source.replace(/^import .*;\n/, '').replace('export function', 'function')}; mountChat`,
     { document, crypto, requestAnimationFrame: (callback) => callback() },
   );
   const dispose = mountChat(main, {}, api, () => {}, element());

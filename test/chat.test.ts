@@ -68,7 +68,7 @@ async function fixture(t: TestContext) {
     }
   });
   t.after(async () => {
-    app.close();
+    await app.close();
     await new Promise<void>((resolve, reject) => {
       server.close((error) => (error ? reject(error) : resolve()));
       server.closeAllConnections();
@@ -103,7 +103,7 @@ async function fixture(t: TestContext) {
     calls,
     provider,
     async restart() {
-      app.close();
+      await app.close();
       app = await createApplication(config);
     },
     async conversation() {
@@ -578,7 +578,7 @@ test('a corrupt saved key fails safely and replacing the key restores the same r
   };
   const rejected = await f.fetch(`${conversation}/messages`, message);
   assert.equal(rejected.status, 503);
-  assert.match((await rejected.json()).message, /save a new key/i);
+  assert.match((await rejected.json()).message, /save a new credential/i);
   assert.deepEqual((await (await f.fetch(conversation)).json()).messages, []);
   assert.equal(f.calls.length, 0);
   assert.equal((await f.fetch('/api/admin/settings', f.settings)).status, 200);

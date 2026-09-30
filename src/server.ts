@@ -62,8 +62,8 @@ server.listen(port, '0.0.0.0', () =>
 for (const signal of ['SIGTERM', 'SIGINT'] as const) {
   process.once(signal, () => {
     app.cancelPending();
-    server.close(() => {
-      app.close();
+    server.close(async () => {
+      await app.close();
       process.exit(0);
     });
     setTimeout(() => process.exit(1), 10_000).unref();
