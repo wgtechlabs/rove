@@ -50,7 +50,7 @@ jobs:
       publish-pr-artifacts: false
       publish-manual-artifacts: false
 
-      container-registry: docker-hub
+      container-registry: both
       # The container action prefixes the repository owner: wgtechlabs/rove.
       container-image-name: rove
       container-pr-comment-enabled: false
