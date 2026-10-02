@@ -140,7 +140,7 @@ function fixture(t: TestContext) {
   }
 }
 
-test('manifest contracts reject executable authority and duplicate contributions', () => {
+test('manifest contracts reject undeclared executable authority and duplicate contributions', () => {
   const pkg = parsePackage(manifest());
   assert.equal(compatibility(pkg), null);
   for (const change of [
@@ -162,11 +162,11 @@ test('manifest contracts reject executable authority and duplicate contributions
     { skills: [{ name: 'a', markdown: `\${settings.unknown}` }] },
   ])
     assert.throws(() => parsePackage({ ...manifest(), ...change }));
-  assert.match(
-    compatibility(parsePackage({ ...manifest(), category: 'user' })) ?? '',
-    /unavailable/,
+  assert.equal(
+    compatibility(parsePackage({ ...manifest(), category: 'user' })),
+    null,
   );
-  assert.match(
+  assert.equal(
     compatibility(
       parsePackage({
         ...manifest(),
@@ -174,8 +174,8 @@ test('manifest contracts reject executable authority and duplicate contributions
           { id: 'policy', title: 'Policy', content: 'Reviewed guidance' },
         ],
       }),
-    ) ?? '',
-    /pages are unavailable/,
+    ),
+    null,
   );
   const executable = {
     ...manifest(),
@@ -204,7 +204,9 @@ test('manifest contracts reject executable authority and duplicate contributions
     { category: 'agent' },
     { capabilities: [] },
     { execution: undefined },
+    { execution: { runtime: 'node', source: 'é'.repeat(16001) } },
     { operations: [] },
+    { operations: [{ ...executable.operations[0], id: 'a'.repeat(65) }] },
     {
       operations: [
         {
@@ -280,8 +282,8 @@ test('approved releases install inactive, atomically activate, update and roll b
     /different bytes/,
   );
   const before = f.current().active;
-  await f.install({ ...manifest('3.0.0'), category: 'user' });
-  await assert.rejects(f.activate(), /unavailable/);
+  await f.install({ ...manifest('3.0.0'), category: 'user', skills: [] });
+  await assert.rejects(f.activate(), /no supported contributions/);
   assert.equal(f.current().active, before);
   await assert.rejects(
     f.plugins.install({ repo, tag: 'republished' }),

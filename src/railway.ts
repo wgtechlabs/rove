@@ -10,9 +10,16 @@ import {
 } from 'railway';
 import { HttpError } from './auth.js';
 import type { Config } from './config.js';
+import {
+  SANDBOX_COMMAND,
+  SANDBOX_OUTPUT_BYTES,
+  type SandboxInput,
+  sandboxResult,
+  sandboxRunner,
+} from './sandbox-runner.js';
 
 const DEADLINE_MS = 120_000;
-const OUTPUT_BYTES = 16_384;
+const OUTPUT_BYTES = SANDBOX_OUTPUT_BYTES;
 const MARKER = 'rove-sandbox-smoke';
 const COMMAND =
   'test "$(cat /tmp/rove-smoke.txt)" = rove-sandbox-smoke && ' +
@@ -65,7 +72,7 @@ function abortable<T>(promise: PromiseLike<T>, signal: AbortSignal) {
   });
 }
 
-/** Internal lifecycle smoke only. Downloaded executable plugins are not admitted. */
+/** Fresh owned VMs for fixed smoke checks and guarded offline plugin execution. */
 export function createRailwayRuntime(
   config: Config,
   env: NodeJS.ProcessEnv = process.env,
@@ -96,7 +103,9 @@ export function createRailwayRuntime(
     !!token &&
     !!environmentId &&
     ['bearer', 'project-token'].includes(authType);
-  let active: Promise<{ runId: string; status: 'passed' }> | undefined;
+  let active:
+    | Promise<{ runId: string; status: 'passed'; output: string }>
+    | undefined;
   let controller: AbortController | undefined;
   let reconciling: Promise<void> | undefined;
   let closed = false;
@@ -117,13 +126,13 @@ export function createRailwayRuntime(
       environmentId: environmentId || null,
       authType: configured ? authType : null,
       setupNeeded: !configured,
-      verification: 'required',
-      executablePlugins: false,
-      network: 'isolated-private-network-with-public-internet',
+      verification: 'not-run',
+      executablePlugins: configured && !closed,
+      network: 'offline-plugin-network-namespace',
       limitations: [
-        'Executable plugins remain unavailable until live containment and lifecycle verification passes.',
-        'Public internet is available; destination allowlists and deny-all egress are unsupported.',
-        'Project-token authorization, resource ceilings, and crash cleanup need live verification.',
+        'Live Railway containment and crash cleanup have not been verified.',
+        'Each invocation requires Linux namespaces, delegated cgroup v2 limits, and a minimal Node runtime; missing capabilities reject execution.',
+        'Plugins run offline without credentials. External actions use separately approved MCP tools.',
       ],
       pendingCleanup: pending().map((row) => ({
         id: row.id,
@@ -151,17 +160,26 @@ export function createRailwayRuntime(
         const signals = [AbortSignal.timeout(10_000)];
         if (signal) signals.push(signal);
         if (init?.signal) signals.push(init.signal);
+        // The pinned SDK omits API resource options. Add them only to our
+        // create request; guest cgroups independently enforce tighter limits.
+        let body = init?.body;
+        const creating =
+          recordId &&
+          typeof body === 'string' &&
+          body.includes('sandboxCreate');
+        if (creating) {
+          const request = JSON.parse(body as string);
+          request.variables.input.resources = { cpu: 1, memoryGB: 2 };
+          body = JSON.stringify(request);
+        }
         const response = await fetchImplementation(input, {
           ...init,
+          body,
           redirect: 'error',
           signal: AbortSignal.any(signals),
         });
         // Persist identity before the SDK's readiness polling, which can fail after creation.
-        if (
-          recordId &&
-          typeof init?.body === 'string' &&
-          init.body.includes('sandboxCreate')
-        ) {
+        if (creating) {
           const body = (await response.clone().json()) as {
             data?: { sandboxCreate?: { id?: unknown } };
           };
@@ -223,7 +241,7 @@ export function createRailwayRuntime(
     }
   }
 
-  async function perform(signal?: AbortSignal) {
+  async function perform(script: string | undefined, signal?: AbortSignal) {
     const runId = randomUUID();
     const deadline = Date.now() + DEADLINE_MS;
     const bound = AbortSignal.any([
@@ -238,6 +256,7 @@ export function createRailwayRuntime(
     let vm: Instance | undefined;
     let command: Command | undefined;
     let failure: unknown;
+    let output = '';
     try {
       // The SDK uses the abort-aware fetch for creation and each readiness poll.
       vm = await sdk.create({
@@ -251,12 +270,16 @@ export function createRailwayRuntime(
       ).run(vm.id, runId);
       if (vm.networkIsolation !== 'ISOLATED')
         throw new Error('Unexpected network mode.');
-      await abortable(vm.files.write('/tmp/rove-smoke.txt', MARKER), bound);
-      const content = await abortable(
-        vm.files.read('/tmp/rove-smoke.txt', 'text', { length: 128 }),
-        bound,
-      );
-      if (content !== MARKER) throw new Error('Unexpected file result.');
+      if (script) {
+        await abortable(vm.files.write('/tmp/rove-runner.sh', script), bound);
+      } else {
+        await abortable(vm.files.write('/tmp/rove-smoke.txt', MARKER), bound);
+        const content = await abortable(
+          vm.files.read('/tmp/rove-smoke.txt', 'text', { length: 128 }),
+          bound,
+        );
+        if (content !== MARKER) throw new Error('Unexpected file result.');
+      }
       let outputBytes = 0;
       const collect = (chunk: string) => {
         outputBytes += Buffer.byteLength(chunk);
@@ -264,16 +287,27 @@ export function createRailwayRuntime(
         if (outputBytes > OUTPUT_BYTES)
           throw new HttpError(502, 'Sandbox output exceeded the allowed size.');
       };
-      command = vm.exec(COMMAND, { onStdout: collect, onStderr: collect });
+      command = vm.exec(script ? SANDBOX_COMMAND : COMMAND, {
+        onStdout: collect,
+        onStderr: collect,
+      });
       const result = await abortable(command, bound);
       if (
         result.exitCode !== 0 ||
         result.timedOut ||
         result.truncated ||
-        result.stdout !== 'rove-sandbox-ok' ||
-        result.stderr !== ''
+        Buffer.byteLength(result.stdout) + Buffer.byteLength(result.stderr) >
+          OUTPUT_BYTES ||
+        (!script &&
+          (result.stdout !== 'rove-sandbox-ok' || result.stderr !== ''))
       )
-        throw new Error('Unexpected command result.');
+        throw new HttpError(
+          502,
+          script
+            ? 'Sandbox operation failed or native isolation is unavailable.'
+            : 'Sandbox smoke failed.',
+        );
+      if (script) output = sandboxResult(result.stdout);
       db.prepare(
         "UPDATE rove_sandbox_run SET outcome = 'passed' WHERE id = ?",
       ).run(runId);
@@ -283,7 +317,7 @@ export function createRailwayRuntime(
           ? error
           : new HttpError(
               502,
-              'Sandbox smoke failed. Check Railway and pending cleanup before retrying.',
+              'Sandbox operation failed. Check Railway and pending cleanup before retrying.',
             );
       if (command) void command.kill('KILL').catch(() => {});
     } finally {
@@ -298,10 +332,10 @@ export function createRailwayRuntime(
         );
     }
     if (failure) throw failure;
-    return { runId, status: 'passed' as const };
+    return { runId, status: 'passed' as const, output };
   }
 
-  async function smoke(signal?: AbortSignal) {
+  async function run(script: string | undefined, signal?: AbortSignal) {
     if (closed) throw new HttpError(503, 'Sandbox service is closed.');
     if (!configured)
       throw new HttpError(
@@ -315,13 +349,23 @@ export function createRailwayRuntime(
         'A sandbox operation or cleanup is already pending.',
       );
     controller = new AbortController();
-    active = perform(signal);
+    active = perform(script, signal);
     try {
       return await active;
     } finally {
       active = undefined;
       controller = undefined;
     }
+  }
+
+  async function smoke(signal?: AbortSignal) {
+    const { runId, status } = await run(undefined, signal);
+    return { runId, status };
+  }
+
+  async function execute(input: SandboxInput, signal: AbortSignal) {
+    const script = sandboxRunner(input);
+    return (await run(script, signal)).output;
   }
 
   async function close() {
@@ -332,5 +376,5 @@ export function createRailwayRuntime(
     return closing;
   }
 
-  return { status, reconcile, smoke, close };
+  return { status, reconcile, smoke, execute, close };
 }

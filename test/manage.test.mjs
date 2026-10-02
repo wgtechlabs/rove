@@ -56,8 +56,9 @@ function dom() {
 async function management(Element) {
   const source = await readFile('public/manage.js', 'utf8');
   const plugins = await readFile('public/plugins.js', 'utf8');
+  const pages = await readFile('public/plugin-pages.js', 'utf8');
   return runInNewContext(
-    `${plugins.replace('export function', 'function')}\n${source.replace(/^import[^\n]*\n/, '').replace('export function', 'function')}; mountManage`,
+    `${plugins.replace('export function', 'function')}\n${pages.replace('export function', 'function')}\n${source.replace(/^import[^\n]*\n/gm, '').replace('export function', 'function')}; mountManage`,
     { document: { createElement: (tag) => new Element(tag) } },
   );
 }
@@ -362,5 +363,111 @@ test('managed extensions cannot be edited locally and new repositories are not p
   await pending;
   assert.equal(root.querySelector('#manage-source-approved').checked, false);
   assert.equal(button('Prepare release'), undefined);
+  manager.dispose();
+});
+
+test('plugin pages keep content inert and route reviewed JSON with the displayed revision', async () => {
+  const { Element, root, focused } = dom();
+  let pending;
+  const requests = [];
+  const paths = [];
+  const action = {
+    name: 'rove_plugin_example',
+    label: 'Prepare a report',
+    description: '<img src=x onerror=alert(1)>',
+    revision: 'revision-one',
+    parameters: {
+      type: 'object',
+      properties: { title: { type: 'string' } },
+      required: ['title'],
+    },
+  };
+  const api = async (path) => {
+    paths.push(path);
+    if (path === '/api/admin/extensions')
+      return { skills: [], plugins: [], servers: [] };
+    return {
+      plugins: [
+        {
+          id: 'company',
+          name: '<script>Company</script>',
+          pages: [
+            {
+              id: 'reports',
+              title: 'Reports',
+              content: '<script>document.cookie</script>\nCompany guidance.',
+              actions: [action.name],
+            },
+          ],
+          actions: [action],
+        },
+      ],
+    };
+  };
+  const manager = (await management(Element))(
+    root,
+    api,
+    (work) => {
+      pending = work();
+      return pending;
+    },
+    () => {},
+    async (request) => {
+      requests.push(JSON.parse(JSON.stringify(request)));
+    },
+  );
+  await manager.load();
+  const button = (text) =>
+    root.all().find((el) => el.tag === 'button' && el.textContent === text);
+  button('Pages & actions').onclick();
+  await pending;
+  assert.deepEqual(paths, [
+    '/api/admin/extensions',
+    '/api/admin/plugins/contributions',
+  ]);
+  assert.ok(
+    root
+      .all()
+      .some(
+        (el) =>
+          el.textContent ===
+          '<script>document.cookie</script>\nCompany guidance.',
+      ),
+  );
+  assert.equal(
+    root.all().some((el) => ['script', 'img'].includes(el.tag)),
+    false,
+  );
+  const opener = button(action.label);
+  opener.onclick();
+  assert.equal(focused().textContent, action.label);
+  const args = root.querySelector('#manage-action-company');
+  assert.equal(args.value, '{}');
+  assert.ok(
+    root
+      .all()
+      .some((el) => el.tag === 'pre' && el.textContent.includes('"required"')),
+  );
+  const submit = () =>
+    root.querySelector('form').onsubmit({ preventDefault() {} });
+  args.value = '[]';
+  submit();
+  await assert.rejects(pending, /must be a JSON object/);
+  assert.equal(requests.length, 0);
+  args.value = '{"title":"A report"}';
+  args.oninput();
+  button('Close action').onclick();
+  assert.equal(focused(), opener);
+  opener.onclick();
+  assert.equal(root.querySelector('#manage-action-company').value, args.value);
+  submit();
+  await pending;
+  assert.deepEqual(requests, [
+    {
+      name: action.name,
+      revision: action.revision,
+      arguments: { title: 'A report' },
+    },
+  ]);
   manager.dispose();
 });

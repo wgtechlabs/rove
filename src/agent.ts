@@ -35,6 +35,7 @@ interface Run {
   pending?: {
     id: string;
     name: string;
+    label?: string;
     arguments: Record<string, unknown>;
     revision: string;
     created: number;
@@ -152,6 +153,7 @@ export function createAgent(config: Config, tools: AgentTools) {
       run.pending = {
         id: randomUUID(),
         name: definition.name,
+        label: definition.label,
         arguments: args as Record<string, unknown>,
         revision: definition.revision,
         created: Date.now(),
@@ -190,6 +192,7 @@ export function createAgent(config: Config, tools: AgentTools) {
       name: string,
       args: unknown,
       signal: AbortSignal,
+      expectedRevision?: string,
     ) {
       if (scope !== `web:${conversation}`)
         throw new HttpError(
@@ -221,6 +224,8 @@ export function createAgent(config: Config, tools: AgentTools) {
           previous.conversation !== conversation ||
           previous.scope !== scope ||
           previous.pending?.name !== name ||
+          (expectedRevision !== undefined &&
+            previous.pending.revision !== expectedRevision) ||
           !isDeepStrictEqual(previous.pending.arguments, argumentsSnapshot)
         )
           throw new HttpError(
@@ -242,12 +247,20 @@ export function createAgent(config: Config, tools: AgentTools) {
           409,
           'This dashboard action is no longer available.',
         );
+      if (
+        expectedRevision !== undefined &&
+        definition.revision !== expectedRevision
+      )
+        throw new HttpError(
+          409,
+          'This dashboard action changed. Reload its page before reviewing it.',
+        );
       signal.throwIfAborted();
       const run: Run = {
         id,
         conversation,
         scope,
-        prompt: `Run action: ${definition.name}`,
+        prompt: `Run action: ${definition.label || definition.name}`,
         history: [],
         status: 'waiting',
         steps: 1,
@@ -255,6 +268,7 @@ export function createAgent(config: Config, tools: AgentTools) {
         pending: {
           id: randomUUID(),
           name: definition.name,
+          label: definition.label,
           arguments: argumentsSnapshot,
           revision: definition.revision,
           created: Date.now(),

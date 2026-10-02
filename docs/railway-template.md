@@ -37,8 +37,9 @@ when needed. The template cannot mint account permissions. See
 
 After deployment authorization, verify fresh setup and web chat, install a
 declarative release, restart twice, confirm state and rollback, then test core
-and plugin updates independently. Before enabling executable plugins, complete
-the separate live containment checks. Do not mark this journey verified from a
+and plugin updates independently. Before relying on executable plugins in production, complete
+the separate live containment checks. The implementation checks isolation on every
+call and refuses execution when the environment lacks the required capabilities. Do not mark this journey verified from a
 container build or mocked API tests.
 
 Reference: Railway's [template editor and variable functions](https://docs.railway.com/templates/create).

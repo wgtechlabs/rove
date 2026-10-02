@@ -9,6 +9,7 @@ interface Conversation {
   pending?: {
     id: string;
     name: string;
+    label?: string;
     arguments: unknown;
     status: string;
     detail?: string;
@@ -525,7 +526,7 @@ export function createSlack(
         .at(-1)?.content || 'Request processed.';
     const pending = conversation.pending;
     const approval = pending
-      ? `Approval required for ${pending.name}.\n${pending.description || ''}\n${pending.detail ?? JSON.stringify(pending.arguments)}`
+      ? `Approval required for ${pending.label || pending.name}.\n${pending.description || ''}\n${pending.detail ?? JSON.stringify(pending.arguments)}`
       : '';
     // Slack repeats message text in form-encoded interactions; reserve space for its envelope.
     const reviewable =

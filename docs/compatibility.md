@@ -25,7 +25,7 @@ Native `rove-plugin.json` assets use a separate source-matching loader. AIP acti
 
 These adapters reject unsupported executable hooks, local MCP commands, SSE-only transport, dependencies, agents, commands, scripts and external skill resources. Codex `agents/openai.yaml` metadata is rejected because invocation policy and tool dependencies need an explicit mapping. Unknown behavioral manifest fields are rejected instead of producing a partly working plugin.
 
-An import is limited to 500 tree entries, 24 consumed files, 32 KB per consumed file and 128 KB total source bytes. Symlinks, submodules, executable file modes, incomplete trees and paths outside the repository are rejected. Rove's native limits also apply: at most eight skills, eight remote servers, and 24,000 combined instruction characters. Packages with additional resources or behavior need a supported declarative release or a future executable extension.
+An import is limited to 500 tree entries, 24 consumed files, 32 KB per consumed file and 128 KB total source bytes. Symlinks, submodules, executable file modes, incomplete trees and paths outside the repository are rejected. Rove's native limits also apply: at most eight skills, eight remote servers, and 24,000 combined instruction characters. Packages with additional resources or behavior need a supported native release; executable behavior must be rewritten for the offline User Plugin contract.
 
 ## Verification record
 

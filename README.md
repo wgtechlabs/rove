@@ -16,7 +16,8 @@ supplies the knowledge, policies and workflows.
 
 > **MVP preview:** web chat, approved tool execution, Markdown skills, declarative
 > release installations, remote MCP, optional Slack, and reviewed AIP releases are implemented.
-> Executable User Plugins stay unavailable pending live sandbox verification.
+> Offline User Plugin tools, dashboard actions and pages are implemented.
+> Live Railway containment and template installation still need validation.
 > Installable channels currently support a signed JSON protocol; provider-specific plugins are separate work.
 > Bring your own provider and integration credentials. Live compatibility depends
 > on your provider and installed integrations.
@@ -38,7 +39,8 @@ supplies the knowledge, policies and workflows.
 | Web configuration for tools, MCP servers, plugins and skills | Implemented |
 | Approved GitHub releases, plugin settings, activation and rollback | Implemented |
 | AIP final review, GitHub release verification and separate activation | Implemented |
-| Railway Sandbox lifecycle integration | Included; executable activation gated on live verification |
+| User Plugin tools, dashboard actions, pages and agent workflow steps | Implemented; every operation requires approval |
+| Railway Sandbox execution | Implemented with per-call isolation checks; live compatibility unverified |
 
 The MVP starts with one company and one administrator per deployment. Web setup
 requires no Slack or AI-provider credentials. A Rove CLI, Discord and Telegram
@@ -161,6 +163,8 @@ Open **Customize Rove** after signing in:
   contents and permissions, configure settings and secrets, then activate it.
   Keep previous versions for rollback. See the [package contract](docs/plugins.md)
   and [supported imports](docs/compatibility.md).
+- **Pages & actions:** open company pages and request actions from active plugins.
+  Review and approve each action in chat; dashboard actions need no model connection.
 - **Local bundles:** keep existing locally edited groups of Markdown skills.
   Released plugin content is immutable and managed from Plugins.
 - **Tools & MCP:** save a remote Streamable HTTP endpoint and optional bearer
@@ -175,7 +179,7 @@ outcome is never silently retried; check the external system before requesting
 another action. Conversation messages, proposal drafts, approval arguments and
 tool results are stored locally as plaintext; integration credentials are encrypted.
 
-MCP limits: eight servers, 32 enabled tools in total, four catalog pages, and
+MCP limits: eight servers, 32 combined MCP tools and plugin operations, four catalog pages, and
 text/JSON results up to 16 KB. Public HTTPS endpoints are required; loopback HTTP
 is available only when Rove itself uses a loopback development URL. Redirects,
 private network destinations, schema references and regex patterns are rejected.

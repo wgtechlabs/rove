@@ -16,6 +16,7 @@ const assets: Record<string, [string, string]> = {
   '/app.js': ['app.js', 'text/javascript; charset=utf-8'],
   '/manage.js': ['manage.js', 'text/javascript; charset=utf-8'],
   '/plugins.js': ['plugins.js', 'text/javascript; charset=utf-8'],
+  '/plugin-pages.js': ['plugin-pages.js', 'text/javascript; charset=utf-8'],
   '/chat.js': ['chat.js', 'text/javascript; charset=utf-8'],
   '/style.css': ['style.css', 'text/css; charset=utf-8'],
   '/brand/icon.svg': ['brand/icon.svg', 'image/svg+xml'],
@@ -42,10 +43,10 @@ export async function createApplication(
   try {
     extensions = createExtensions(config);
     cleanup.push(() => extensions.close());
-    plugins = createPlugins(config, extensions);
-    cleanup.push(() => plugins.close());
     runtime = createRailwayRuntime(config);
     cleanup.push(() => runtime.close());
+    plugins = createPlugins(config, extensions, fetch, process.env, runtime);
+    cleanup.push(() => plugins.close());
     void runtime
       .reconcile()
       .catch(() => console.error('Sandbox cleanup needs attention.'));
@@ -67,17 +68,29 @@ export async function createApplication(
           .join('\n\n');
       },
       preview(name, args, scope) {
-        return name.startsWith('rove_aip_')
-          ? aips.preview(name, args, scope)
-          : JSON.stringify(args, null, 2);
+        if (name.startsWith('rove_aip_'))
+          return aips.preview(name, args, scope);
+        if (name.startsWith('rove_plugin_')) return plugins.preview(name, args);
+        return JSON.stringify(args, null, 2);
       },
       async tools(scope, signal) {
-        return [...(await extensions.tools(signal)), ...aips.tools(scope)];
+        const tools = [
+          ...(await extensions.tools(signal)),
+          ...(await plugins.tools(signal)),
+        ];
+        if (tools.length > 32)
+          throw new HttpError(
+            409,
+            'Enable at most 32 MCP and plugin operations.',
+          );
+        return [...tools, ...aips.tools(scope)];
       },
       execute(name, args, revision, scope, signal) {
-        return name.startsWith('rove_aip_')
-          ? aips.execute(name, args, revision, scope, signal)
-          : extensions.execute(name, args, revision, signal);
+        if (name.startsWith('rove_aip_'))
+          return aips.execute(name, args, revision, scope, signal);
+        if (name.startsWith('rove_plugin_'))
+          return plugins.execute(name, args, revision, signal);
+        return extensions.execute(name, args, revision, signal);
       },
     });
     cleanup.push(() => chat.close());
@@ -135,6 +148,8 @@ export async function createApplication(
           );
         if (path === '/api/admin/extensions') return json(extensions.list());
         if (path === '/api/admin/plugins') return json(plugins.list());
+        if (path === '/api/admin/plugins/contributions')
+          return json(plugins.contributions());
         if (path === '/api/admin/runtime') return json(runtime.status());
         if (path === '/api/admin/channels') return json(slack.status());
         if (path === '/api/admin/slack') return json(slack.settings());

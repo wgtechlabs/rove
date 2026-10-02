@@ -17,7 +17,31 @@ permissions:
   security-events: write
 
 jobs:
+  sandbox-containment:
+    name: Offline sandbox containment
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+      - run: npm install --global bun@1.3.10
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      # A disposable GitHub VM, never the app host or a Railway deployment.
+      # No deployment credentials are passed to the root-only regression.
+      - name: Exercise native containment and runaway cleanup
+        run: |
+          sudo ln -sf "$(command -v node)" /usr/local/bin/node
+          sudo env ROVE_NATIVE_SANDBOX_TEST=1 /usr/local/bin/node --test dist/test/sandbox-runner.test.js
+
   build-flow:
+    needs: sandbox-containment
     uses: wgtechlabs/build-flow-action/.github/workflows/app.yml@b46ac3e40de838b87e1da6b3e69382982d080916 # v0.2.1
     secrets: inherit
     with:

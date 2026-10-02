@@ -45,7 +45,11 @@ export const pluginPackage = z
     execution: z
       .object({
         runtime: z.literal('node'),
-        source: z.string().min(1).max(32000),
+        source: z
+          .string()
+          .min(1)
+          .max(32000)
+          .refine((source) => Buffer.byteLength(source) <= 32000),
       })
       .strict()
       .optional(),
@@ -53,7 +57,7 @@ export const pluginPackage = z
       .array(
         z
           .object({
-            id: pluginId,
+            id: pluginId.max(64),
             name,
             description: z.string().min(1).max(1000),
             inputSchema: z
@@ -237,13 +241,20 @@ export function parsePackage(value: unknown): PluginPackage {
   return parsed.data;
 }
 
-export function compatibility(pkg: PluginPackage): string | null {
-  if (pkg.pages.length)
-    return 'Custom plugin pages are unavailable until their core renderer is implemented.';
+export function compatibility(
+  pkg: PluginPackage,
+  executable = false,
+): string | null {
   if (pkg.category === 'channel' && pkg.channel) return null;
-  if (pkg.category !== 'agent')
-    return 'Executable User Plugins require verified sandbox isolation. Activation is unavailable.';
-  if (!pkg.skills.length && !pkg.instructions && !pkg.servers.length)
+  if (pkg.execution && !executable)
+    return 'Configure Railway Sandbox before activating executable User Plugins. Execution is unavailable.';
+  if (
+    !pkg.skills.length &&
+    !pkg.instructions &&
+    !pkg.servers.length &&
+    !pkg.pages.length &&
+    !pkg.operations.length
+  )
     return 'This package has no supported contributions.';
   return null;
 }

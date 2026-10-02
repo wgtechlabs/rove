@@ -1,14 +1,17 @@
+import { renderPluginPages } from './plugin-pages.js';
 import { renderPlugins } from './plugins.js';
 
 // User-controlled values only enter textContent or form controls.
-export function mountManage(root, api, run, back) {
+export function mountManage(root, api, run, back, requestAction) {
   let section = 'skills';
   let state;
   let alive = true;
   let runtime;
   const selectedVersions = new Map();
+  const actionDrafts = new Map();
   const labels = {
     plugins: 'Plugins',
+    pages: 'Pages & actions',
     skills: 'Skills',
     servers: 'Tools & MCP',
     bundles: 'Local bundles',
@@ -454,15 +457,33 @@ export function mountManage(root, api, run, back) {
           });
         },
       });
+    } else if (section === 'pages') {
+      intro(
+        'Pages & actions',
+        'Company pages from your active plugins. Review and approve each action in chat.',
+      );
+      renderPluginPages(content, state, {
+        node,
+        button,
+        field,
+        run,
+        requestAction,
+        drafts: actionDrafts,
+      });
     } else if (section === 'slack') renderSlack();
     else if (section === 'github') renderGitHub();
     else renderCollection();
     content.querySelector('h2')?.focus();
   }
   async function load() {
-    const result = await api(
-      `/api/admin/${['slack', 'github', 'plugins'].includes(section) ? section : 'extensions'}`,
-    );
+    const endpoint =
+      {
+        slack: 'slack',
+        github: 'github',
+        plugins: 'plugins',
+        pages: 'plugins/contributions',
+      }[section] || 'extensions';
+    const result = await api(`/api/admin/${endpoint}`);
     if (section === 'plugins') runtime = await api('/api/admin/runtime');
     if (!alive) return;
     state = result;

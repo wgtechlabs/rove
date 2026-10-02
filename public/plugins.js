@@ -606,7 +606,7 @@ export function renderPlugins(content, state, runtime, ui) {
     node(
       'p',
       runtime.configured
-        ? 'Railway connection configured. Live isolation verification is still required.'
+        ? 'Railway connection configured. Every code execution must pass sandbox isolation checks.'
         : 'Railway Sandbox needs deployment credentials. Web chat and declarative plugins work independently.',
       'description',
     ),

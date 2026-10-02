@@ -14,6 +14,7 @@ import type { ToolDefinition } from '../src/provider.js';
 
 const action: ToolDefinition = {
   name: 'company_summary',
+  label: 'Company summary',
   description: 'Summarize approved input.',
   parameters: { type: 'object', properties: { text: { type: 'string' } } },
   revision: 'v1',
@@ -83,6 +84,8 @@ test('dashboard actions share durable approval and execute once without model co
   const waiting = await f.chat.requestAction(conversation.id, body);
   assert.equal(f.chat.settings().configured, false);
   assert.equal(waiting.pending?.status, 'waiting');
+  assert.equal(waiting.pending?.label, 'Company summary');
+  assert.equal(waiting.pending?.prompt, 'Run action: Company summary');
   assert.equal(f.executions.length, 0);
   assert.deepEqual(waiting.pending?.arguments, body.arguments);
   assert.equal(
@@ -130,6 +133,30 @@ test('dashboard actions share durable approval and execute once without model co
       })
     ).messages,
     finished.messages,
+  );
+  assert.equal(f.executions.length, 1);
+});
+
+test('dashboard requests bind the displayed revision and retain retry identity', async (t) => {
+  const f = fixture(t);
+  const conversation = f.chat.create();
+  const body = { ...request(), revision: 'old' };
+  await assert.rejects(f.chat.requestAction(conversation.id, body), /changed/);
+  assert.equal(f.chat.get(conversation.id).pending, undefined);
+  body.revision = 'v1';
+  const waiting = await f.chat.requestAction(conversation.id, body);
+  await assert.rejects(
+    f.chat.requestAction(conversation.id, { ...body, revision: 'v2' }),
+    /request ID/,
+  );
+  await f.chat.decide(conversation.id, {
+    approvalId: waiting.pending?.id,
+    decision: 'approve',
+  });
+  f.catalog([{ ...action, revision: 'v2' }]);
+  assert.equal(
+    (await f.chat.requestAction(conversation.id, body)).pending,
+    undefined,
   );
   assert.equal(f.executions.length, 1);
 });

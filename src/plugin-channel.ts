@@ -174,7 +174,7 @@ function replyText(conversation: Conversation) {
     return `Tool outcome saved. An authorized administrator can continue the reply using approval ${pending.id} and decision resume.`;
   if (detail.length > 24000)
     return `Tool request is too large to review here. An authorized administrator can deny approval ${pending.id}.`;
-  return `Approval ${pending.id}\nTool: ${pending.name}\n${pending.description || ''}\n${detail}\nAn authorized administrator may send approve or deny for this approval.`;
+  return `Approval ${pending.id}\nTool: ${pending.label || pending.name}\n${pending.description || ''}\n${detail}\nAn authorized administrator may send approve or deny for this approval.`;
 }
 
 /** Owns verification, permissions, durable dispatch, credentials and delivery. */

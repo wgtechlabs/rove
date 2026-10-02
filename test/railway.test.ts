@@ -38,6 +38,7 @@ function fixture(t: TestContext) {
     databasePath: join(dir, 'rove.sqlite'),
   };
   const calls = {
+    files: [] as { path: string; value: string }[],
     created: [] as CreateOptions[],
     connected: [] as { id: string; options: ConnectOptions }[],
     commands: [] as string[],
@@ -59,7 +60,8 @@ function fixture(t: TestContext) {
     status: 'RUNNING',
     networkIsolation: 'ISOLATED',
     files: {
-      write: async (_path: string, value: string) => {
+      write: async (path: string, value: string) => {
+        calls.files.push({ path, value });
         file = value;
       },
       read: async () => file,
@@ -143,7 +145,7 @@ test('trusted smoke persists ownership, uses ISOLATED, separates secrets, and ve
   assert.equal(f.calls.created[0]?.authType, 'bearer');
   assert.equal(f.calls.created[0]?.idleTimeoutMinutes, 1);
   assert.equal(JSON.stringify(runtime.status()).includes(token), false);
-  assert.equal(runtime.status().verification, 'required');
+  assert.equal(runtime.status().verification, 'not-run');
   assert.equal(runtime.status().pendingCleanup.length, 0);
   assert.equal(f.calls.connected.length, 2);
 });
@@ -220,7 +222,10 @@ test('real SDK uses project-token headers and captured creation identity survive
   let destroyed = false;
   const transport: typeof fetch = async (_input, init) => {
     assert.equal(init?.redirect, 'error');
-    const body = JSON.parse(String(init?.body)) as { query: string };
+    const body = JSON.parse(String(init?.body)) as {
+      query: string;
+      variables: { input?: { resources: { cpu: number; memoryGB: number } } };
+    };
     requests.push({ headers: new Headers(init?.headers), query: body.query });
     const info = {
       id: 'owned-failed-vm',
@@ -228,8 +233,13 @@ test('real SDK uses project-token headers and captured creation identity survive
       networkIsolation: 'ISOLATED',
       environmentId: 'test-environment',
     };
-    if (body.query.includes('sandboxCreate'))
+    if (body.query.includes('sandboxCreate')) {
+      assert.deepEqual(body.variables.input?.resources, {
+        cpu: 1,
+        memoryGB: 2,
+      });
       return Response.json({ data: { sandboxCreate: info } });
+    }
     if (body.query.includes('sandboxDestroy')) {
       destroyed = true;
       return Response.json({ data: { sandboxDestroy: true } });
@@ -257,5 +267,96 @@ test('real SDK uses project-token headers and captured creation identity survive
       'test-project-token',
     );
     assert.equal(request.headers.get('authorization'), null);
+  }
+});
+
+const operation = {
+  source:
+    'export async function run({ args }) { return { total: args.quantity * 2 }; }',
+  operation: 'calculate',
+  args: { quantity: 3 },
+  settings: { label: 'demo', enabled: true },
+};
+
+test('offline execution writes a guarded runner, returns bounded results only after confirmed destruction, and never forwards credentials', async (t) => {
+  const f = fixture(t);
+  f.behavior.execute = async (options) => {
+    const stdout = JSON.stringify({ result: { total: 6 } });
+    options.onStdout?.(stdout);
+    return { ...result, stdout };
+  };
+  const runtime = f.open();
+  assert.equal(runtime.status().executablePlugins, true);
+  assert.equal(runtime.status().verification, 'not-run');
+  assert.equal(
+    await runtime.execute(operation, new AbortController().signal),
+    '{"total":6}',
+  );
+  assert.equal(f.calls.destroys, 1);
+  assert.equal(f.calls.connected.length, 2);
+  assert.equal(f.calls.files[0]?.path, '/tmp/rove-runner.sh');
+  const script = f.calls.files[0]?.value || '';
+  assert.match(script, /cgroup.kill/);
+  assert.match(script, /--net --pid --mount/);
+  assert.equal(script.includes(operation.source), false);
+  assert.equal(script.includes(token), false);
+  assert.equal(script.includes(environment.BETTER_AUTH_SECRET), false);
+  assert.deepEqual(Object.keys(f.calls.created[0]?.env || {}), [
+    'ROVE_SMOKE_RUN_ID',
+  ]);
+  assert.deepEqual(f.calls.commands, [
+    '/usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin /bin/sh /tmp/rove-runner.sh',
+  ]);
+  assert.equal(runtime.status().pendingCleanup.length, 0);
+  // Controlled SDK results never promote the separate live-verification claim.
+  assert.equal(runtime.status().verification, 'not-run');
+});
+
+test('invalid inputs and already-cancelled calls never create a sandbox', async (t) => {
+  const f = fixture(t);
+  const runtime = f.open();
+  await assert.rejects(
+    runtime.execute({ ...operation, source: '' }, new AbortController().signal),
+    status(400),
+  );
+  await assert.rejects(runtime.execute(operation, AbortSignal.abort()));
+  assert.equal(f.calls.created.length, 0);
+  assert.equal(runtime.status().pendingCleanup.length, 0);
+});
+
+test('native boundary failure, invalid output, cancellation, and cleanup failure never return operation success', async (t) => {
+  for (const mode of ['isolation', 'result', 'output', 'cancel', 'cleanup']) {
+    const f = fixture(t);
+    const abort = new AbortController();
+    f.behavior.cleanupError = mode === 'cleanup';
+    f.behavior.execute = async (options) => {
+      if (mode === 'cancel') {
+        abort.abort();
+        return new Promise<ExecResult>(() => {});
+      }
+      if (mode === 'output') options.onStderr?.('x'.repeat(16_385));
+      return {
+        ...result,
+        exitCode: mode === 'isolation' ? 1 : 0,
+        stdout: mode === 'result' ? 'unexpected output' : '{"result":"ok"}',
+        stderr:
+          mode === 'isolation'
+            ? 'rove-runner-failed: writable-cgroup-v2-required'
+            : '',
+      };
+    };
+    const runtime = f.open();
+    await assert.rejects(
+      runtime.execute(operation, abort.signal),
+      status(mode === 'cancel' ? 408 : mode === 'cleanup' ? 503 : 502),
+    );
+    assert.equal(f.calls.destroys, 1);
+    if (mode === 'cleanup') {
+      assert.equal(runtime.status().pendingCleanup.length, 1);
+      await assert.rejects(
+        runtime.execute(operation, abort.signal),
+        status(409),
+      );
+    } else assert.equal(runtime.status().pendingCleanup.length, 0);
   }
 });

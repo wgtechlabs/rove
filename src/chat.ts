@@ -282,14 +282,18 @@ export function createChat(
       );
     if (
       Object.keys(body).some(
-        (key) => !['name', 'arguments', 'requestId'].includes(key),
+        (key) => !['name', 'arguments', 'requestId', 'revision'].includes(key),
       )
     )
       throw new HttpError(
         400,
-        'Send only an action name, arguments and request ID.',
+        'Send only an action name, arguments, request ID and revision.',
       );
     const name = textField(body, 'name', 1, 160);
+    const revision =
+      body.revision === undefined
+        ? undefined
+        : textField(body, 'revision', 1, 256);
     const requestId = textField(body, 'requestId', 36, 36);
     if (!requestIdPattern.test(requestId))
       throw new HttpError(400, 'Request an action with a valid request ID.');
@@ -312,6 +316,7 @@ export function createChat(
         name,
         body.arguments,
         active.signal,
+        revision,
       );
       return get(id);
     } finally {

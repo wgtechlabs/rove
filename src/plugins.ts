@@ -19,6 +19,11 @@ import {
   parsePackage,
   repositoryName,
 } from './plugin-manifest.js';
+import {
+  checkOperationArguments,
+  operationDefinition,
+  type PluginRuntime,
+} from './plugin-operations.js';
 import { createSecrets } from './secrets.js';
 
 const digestSchema = z.string().regex(/^[a-f0-9]{64}$/);
@@ -90,6 +95,7 @@ export function createPlugins(
   extensions: ReturnType<typeof createExtensions>,
   fetchImpl: typeof fetch = fetch,
   env: NodeJS.ProcessEnv = process.env,
+  runtime?: PluginRuntime,
 ) {
   const db = new DatabaseSync(config.databasePath);
   const secrets = createSecrets(config.authSecret);
@@ -106,6 +112,16 @@ export function createPlugins(
   const lifetime = new AbortController();
   let closed = false;
   let busy = false;
+  // ponytail: one executable plugin call per deployment; add per-installation leases if throughput requires them.
+  let executing = false;
+  function mutable() {
+    if (closed) throw new HttpError(503, 'Plugins are shutting down.');
+    if (executing)
+      throw new HttpError(
+        409,
+        'Wait for the current plugin call before changing plugins.',
+      );
+  }
   const source = (repo: string) =>
     db.prepare('SELECT * FROM rove_plugin_source WHERE repo=?').get(repo);
   function installations(): Installation[] {
@@ -224,7 +240,10 @@ export function createPlugins(
               commit: release.commit,
               manifest: release.manifest,
               origin: release.origin,
-              blocked: compatibility(release.manifest),
+              blocked: compatibility(
+                release.manifest,
+                runtime?.status().configured,
+              ),
             };
           }),
         audit: db
@@ -234,13 +253,15 @@ export function createPlugins(
           .all(item.id),
       })),
       executable: {
-        available: false,
-        reason:
-          'Live Railway isolation verification is required before executable User Plugins can activate. Declarative channel adapters do not execute downloaded code.',
+        available: Boolean(runtime?.status().configured),
+        reason: runtime?.status().configured
+          ? 'Custom code runs offline in Railway Sandbox with approval for each call. Live Railway behavior must be verified on your deployment.'
+          : 'Configure Railway Sandbox to activate executable User Plugins. Custom code receives ordinary settings and approved input, never credentials or network access.',
       },
     };
   }
   function saveSource(body: unknown) {
+    mutable();
     const input = parse(sourceInput, body);
     if (/[\r\n]/.test(input.token ?? '') || (input.token && input.clearToken))
       throw new HttpError(
@@ -442,6 +463,7 @@ export function createPlugins(
     return values;
   }
   function configure(body: unknown) {
+    mutable();
     const input = parse(configuration, body);
     const item = current(input.id, input.revision);
     const pkg = selected(item, input.digest).manifest;
@@ -506,7 +528,7 @@ export function createPlugins(
     pkg: PluginPackage,
     signal: AbortSignal,
   ): Promise<ManagedExtension[]> {
-    const blocked = compatibility(pkg);
+    const blocked = compatibility(pkg, runtime?.status().configured);
     if (blocked) throw new HttpError(409, blocked);
     if (pkg.channel && !channelAccess.safeParse(item.channelAccess).success)
       throw new HttpError(
@@ -642,12 +664,36 @@ export function createPlugins(
       );
     item.active = release.digest;
     item.environmentFingerprint = environmentFingerprint(item);
+    const operationCount = installations().reduce(
+      (count, entry) =>
+        count +
+        (entry.id === item.id
+          ? release.manifest.operations.length
+          : entry.active
+            ? selected(entry, entry.active).manifest.operations.length
+            : 0),
+      0,
+    );
+    const serverCount =
+      extensions
+        .list()
+        .servers.filter(
+          (server) => server.enabled && server.managedBy !== item.id,
+        )
+        .reduce((count, server) => count + server.tools.length, 0) +
+      entries.reduce((count, entry) => count + entry.tools.length, 0);
+    if (operationCount + serverCount > 32)
+      throw new HttpError(
+        409,
+        'Enable at most 32 MCP and plugin operations across this deployment.',
+      );
     extensions.replaceManaged(item.id, entries, (connection) =>
       write(connection, item, 'activated', release.digest),
     );
     return list();
   }
   function deactivate(body: unknown) {
+    mutable();
     const input = parse(target, body);
     const item = current(input.id, input.revision);
     item.active = null;
@@ -683,8 +729,160 @@ export function createPlugins(
       ),
     };
   }
-  async function run<T>(action: () => Promise<T>) {
+  function activeContributions() {
     if (closed) throw new HttpError(503, 'Plugins are shutting down.');
+    const executionTarget = runtime?.status();
+    return installations().flatMap((item) => {
+      if (
+        !item.active ||
+        !source(item.repo)?.approved ||
+        item.environmentFingerprint !== environmentFingerprint(item)
+      )
+        return [];
+      const pkg = selected(item, item.active).manifest;
+      if (
+        compatibility(pkg, executionTarget?.configured) ||
+        pkg.capabilities.some((grant) => !item.grants.includes(grant))
+      )
+        return [];
+      const values = validateValues(pkg, item, true);
+      if (
+        pkg.secrets.some(
+          (field) => field.required && !secretValue(item, field.key),
+        )
+      )
+        return [];
+      const revision = hash(
+        JSON.stringify([
+          item.revision,
+          item.active,
+          values,
+          item.grants,
+          item.environmentFingerprint,
+          executionTarget?.environmentId ?? null,
+          executionTarget?.authType ?? null,
+        ]),
+      );
+      return [
+        {
+          item,
+          pkg,
+          values,
+          operations: pkg.operations.map((operation) => ({
+            operation,
+            definition: operationDefinition(item.id, revision, operation),
+          })),
+        },
+      ];
+    });
+  }
+  function operationCatalog() {
+    const available = activeContributions();
+    const count =
+      available.reduce((sum, entry) => sum + entry.operations.length, 0) +
+      extensions
+        .list()
+        .servers.filter((server) => server.enabled)
+        .reduce((sum, server) => sum + server.tools.length, 0);
+    if (count > 32)
+      throw new HttpError(
+        409,
+        'Enable at most 32 MCP and plugin operations across this deployment.',
+      );
+    return available;
+  }
+  function contributions() {
+    return {
+      plugins: operationCatalog()
+        .filter(
+          ({ pkg }) =>
+            pkg.pages.length ||
+            pkg.operations.some((operation) =>
+              operation.surfaces.includes('action'),
+            ),
+        )
+        .map(({ item, pkg, operations }) => ({
+          id: item.id,
+          name: pkg.name,
+          pages: pkg.pages.map((page) => ({
+            ...page,
+            actions: page.actions.flatMap((id) =>
+              operations
+                .filter(({ operation }) => operation.id === id)
+                .map(({ definition }) => definition.name),
+            ),
+          })),
+          actions: operations.flatMap(({ definition, operation }) =>
+            definition.surfaces?.includes('action')
+              ? [{ ...definition, label: operation.name }]
+              : [],
+          ),
+        })),
+    };
+  }
+  function findOperation(name: string) {
+    for (const entry of operationCatalog()) {
+      const operation = entry.operations.find(
+        ({ definition }) => definition.name === name,
+      );
+      if (operation) return { ...entry, ...operation };
+    }
+    throw new HttpError(409, 'This plugin operation is no longer enabled.');
+  }
+  async function execute(
+    name: string,
+    args: Record<string, unknown>,
+    revision: string,
+    signal: AbortSignal,
+  ) {
+    const entry = findOperation(name);
+    if (entry.definition.revision !== revision)
+      throw new HttpError(
+        409,
+        'The plugin configuration changed. Request a new approval.',
+      );
+    const input = structuredClone(args);
+    await checkOperationArguments(entry.definition, input);
+    mutable();
+    if (busy)
+      throw new HttpError(
+        409,
+        'Wait for the current plugin change before running an operation.',
+      );
+    if (findOperation(name).definition.revision !== revision)
+      throw new HttpError(
+        409,
+        'The plugin configuration changed. Request a new approval.',
+      );
+    if (!runtime || !entry.pkg.execution)
+      throw new HttpError(409, 'Plugin execution is unavailable.');
+    const operationSignal = AbortSignal.any([signal, lifetime.signal]);
+    operationSignal.throwIfAborted();
+    executing = true;
+    try {
+      const result = await runtime.execute(
+        {
+          source: entry.pkg.execution.source,
+          operation: entry.operation.id,
+          args: input,
+          settings: entry.values,
+        },
+        operationSignal,
+      );
+      operationSignal.throwIfAborted();
+      if (findOperation(name).definition.revision !== revision)
+        throw new HttpError(
+          409,
+          'The plugin configuration changed during execution.',
+        );
+      return result;
+    } finally {
+      executing = false;
+      if (closed && !busy) db.close();
+    }
+  }
+  async function run<T>(action: () => Promise<T>) {
+    mutable();
     if (busy)
       throw new HttpError(
         409,
@@ -723,6 +921,18 @@ export function createPlugins(
     configure,
     deactivate,
     activeChannel,
+    contributions,
+    tools: async (signal: AbortSignal) => {
+      signal.throwIfAborted();
+      return operationCatalog().flatMap((entry) =>
+        entry.operations.map(({ definition }) => definition),
+      );
+    },
+    execute,
+    preview: (name: string, args: Record<string, unknown>) => {
+      const { pkg, operation } = findOperation(name);
+      return `${pkg.name}: ${operation.name}\nOffline custom code; no network or credentials.\n${JSON.stringify(args, null, 2)}`;
+    },
     install: (body: unknown) => run(() => install(body)),
     activate: (body: unknown) => run(() => activate(body)),
     activateRelease: (skill: ReleasedSkill) =>
@@ -743,7 +953,7 @@ export function createPlugins(
       if (closed) return;
       closed = true;
       lifetime.abort();
-      if (!busy) db.close();
+      if (!busy && !executing) db.close();
     },
   };
 }
