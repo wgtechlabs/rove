@@ -51,8 +51,6 @@ jobs:
       ci-setup-command: |
         npm install --global bun@1.3.10
         docker compose up -d --wait postgres redis
-        echo "TEST_DATABASE_URL=postgres://rove:rove@127.0.0.1:54329/postgres" >> "$GITHUB_ENV"
-        echo "TEST_REDIS_URL=redis://127.0.0.1:6389" >> "$GITHUB_ENV"
       ci-install-command: bun install --frozen-lockfile
       ci-lint-command: |
         bun run check
