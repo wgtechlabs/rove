@@ -75,7 +75,11 @@ const string = (value: unknown) => (typeof value === 'string' ? value : '');
 const slackId = (value: string) => /^[A-Z][A-Z0-9]{1,30}$/.test(value);
 const timestamp = (value: string) => /^\d{1,20}\.\d{1,10}$/.test(value);
 
-export function createSlack(config: Config, chat: Chat) {
+export function createSlack(
+  config: Config,
+  chat: Chat,
+  onFailure?: () => void,
+) {
   const db = new DatabaseSync(config.databasePath);
   let nextCleanup = 0;
   try {
@@ -712,6 +716,8 @@ export function createSlack(config: Config, chat: Chat) {
       if (!running && !stopping && !saving) {
         running = processJob()
           .catch(() => {
+            cancelPending();
+            onFailure?.();
             console.error('Slack processing failed.');
           })
           .finally(() => {

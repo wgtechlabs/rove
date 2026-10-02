@@ -53,8 +53,10 @@ export function mountChat(main, admin, api, expire, signout) {
   function setBusy(value) {
     busy = value;
     main.setAttribute('aria-busy', String(value));
-    for (const control of main.querySelectorAll('button, input, textarea')) {
-      control.disabled = value;
+    for (const control of main.querySelectorAll(
+      'button, input, textarea, select',
+    )) {
+      control.disabled = value || control.dataset.unavailable === 'true';
     }
     signout.disabled = value;
     find('#settings-open').disabled = value || !settings;

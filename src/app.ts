@@ -2,16 +2,19 @@ import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { createAips } from './aip.js';
 import { createIdentity, HttpError } from './auth.js';
+import { createChannels } from './channels.js';
 import { createChat } from './chat.js';
 import type { Config } from './config.js';
 import { createExtensions } from './extensions.js';
-import { createSlack } from './slack.js';
+import { createPlugins } from './plugins.js';
+import { createRailwayRuntime } from './railway.js';
 
 export const MAX_BODY = 32768;
 const assets: Record<string, [string, string]> = {
   '/': ['index.html', 'text/html; charset=utf-8'],
   '/app.js': ['app.js', 'text/javascript; charset=utf-8'],
   '/manage.js': ['manage.js', 'text/javascript; charset=utf-8'],
+  '/plugins.js': ['plugins.js', 'text/javascript; charset=utf-8'],
   '/chat.js': ['chat.js', 'text/javascript; charset=utf-8'],
   '/style.css': ['style.css', 'text/css; charset=utf-8'],
   '/brand/icon.svg': ['brand/icon.svg', 'image/svg+xml'],
@@ -31,13 +34,20 @@ export async function createApplication(
   let extensions: ReturnType<typeof createExtensions>;
   let aips: ReturnType<typeof createAips>;
   let chat: ReturnType<typeof createChat>;
-  let slack: ReturnType<typeof createSlack>;
+  let slack: ReturnType<typeof createChannels>;
+  let plugins: ReturnType<typeof createPlugins>;
+  let runtime: ReturnType<typeof createRailwayRuntime>;
   try {
     extensions = createExtensions(config);
     cleanup.push(() => extensions.close());
-    aips = createAips(config, (skill) => {
-      extensions.adoptSkill(skill);
-    });
+    plugins = createPlugins(config, extensions);
+    cleanup.push(() => plugins.close());
+    runtime = createRailwayRuntime(config);
+    cleanup.push(() => runtime.close());
+    void runtime
+      .reconcile()
+      .catch(() => console.error('Sandbox cleanup needs attention.'));
+    aips = createAips(config, (skill) => plugins.activateRelease(skill));
     cleanup.push(() => aips.close());
     chat = createChat(config, {
       instructions(scope) {
@@ -69,7 +79,7 @@ export async function createApplication(
       },
     });
     cleanup.push(() => chat.close());
-    slack = createSlack(config, chat);
+    slack = createChannels(config, chat);
     cleanup.push(() => slack.close());
     slack.start();
   } catch (error) {
@@ -94,6 +104,9 @@ export async function createApplication(
         return json(admin);
       if (request.method === 'GET') {
         if (path === '/api/admin/extensions') return json(extensions.list());
+        if (path === '/api/admin/plugins') return json(plugins.list());
+        if (path === '/api/admin/runtime') return json(runtime.status());
+        if (path === '/api/admin/channels') return json(slack.status());
         if (path === '/api/admin/slack') return json(slack.settings());
         if (path === '/api/admin/github') return json(aips.settings());
         const aipRoute = /^\/api\/admin\/aips\/([a-f0-9-]{36})$/.exec(path);
@@ -133,6 +146,16 @@ export async function createApplication(
       if (!body || typeof body !== 'object' || Array.isArray(body))
         throw new HttpError(400, 'Send a JSON object.');
       const values = body as Record<string, unknown>;
+      if (path === '/api/admin/plugins/sources')
+        return json(plugins.saveSource(values));
+      if (path === '/api/admin/plugins/install')
+        return json(await plugins.install(values));
+      if (path === '/api/admin/plugins/configure')
+        return json(plugins.configure(values));
+      if (path === '/api/admin/plugins/activate')
+        return json(await plugins.activate(values));
+      if (path === '/api/admin/plugins/deactivate')
+        return json(plugins.deactivate(values));
       if (path === '/api/admin/extensions')
         return json(extensions.save(values));
       if (path === '/api/admin/extensions/probe') {
@@ -205,6 +228,8 @@ export async function createApplication(
       await slack.close();
       chat.close();
       aips.close();
+      plugins.close();
+      await runtime.close();
       extensions.close();
       identity.close();
     },

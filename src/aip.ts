@@ -1,12 +1,25 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { z } from 'zod';
+import {
+  decodedFile,
+  githubClient,
+  loadRelease,
+  shaSchema,
+  tagSchema,
+  type VerifiedRelease,
+  workflowPathSchema,
+} from './aip-release.js';
 import { HttpError } from './auth.js';
 import type { Config } from './config.js';
 import { createSecrets } from './secrets.js';
 
 const proposal = z
   .object({
+    packageVersion: z
+      .string()
+      .regex(/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/)
+      .default('1.0.0'),
     title: z.string().trim().min(1).max(120),
     summary: z.string().trim().min(1).max(500),
     bullets: z.array(z.string().trim().min(1).max(500)).min(1).max(7),
@@ -29,6 +42,8 @@ const stageInput = z.discriminatedUnion('action', [
   z.object({ action: z.literal('cancel'), id: z.uuid() }).strict(),
 ]);
 const targetInput = z.object({ id: z.uuid() }).strict();
+const reviewInput = targetInput.extend({ headSha: shaSchema });
+const releaseInput = targetInput.extend({ tag: tagSchema });
 const settingsInput = z
   .object({
     repo: z
@@ -37,6 +52,7 @@ const settingsInput = z
       .regex(/^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9_.-]{1,100}$/)
       .refine((value) => !['.', '..'].includes(value.split('/')[1] ?? '')),
     token: z.string().trim().max(1000).optional(),
+    workflowPath: workflowPathSchema.optional(),
   })
   .strict();
 
@@ -48,7 +64,11 @@ type Status =
   | 'uncertain'
   | 'published'
   | 'adopting'
-  | 'adopted';
+  | 'adopted'
+  | 'reviewed'
+  | 'verified'
+  | 'activating'
+  | 'activated';
 interface Aip extends Proposal {
   id: string;
   scope: string;
@@ -60,12 +80,17 @@ interface Aip extends Proposal {
   number?: number;
   url?: string;
   mergeCommit?: string;
+  baseBranch?: string;
+  candidateHead?: string;
+  review?: { headSha: string; reviewedAt: number };
+  release?: Omit<VerifiedRelease, 'manifest' | 'bytes'>;
 }
-export interface AdoptedSkill {
+export interface ReleasedSkill {
   id: string;
   name: string;
   content: string;
-  enabled: boolean;
+  enabled: true;
+  release: VerifiedRelease;
 }
 
 function parse<T>(schema: z.ZodType<T>, value: unknown): T {
@@ -78,10 +103,10 @@ function parse<T>(schema: z.ZodType<T>, value: unknown): T {
   return result.data;
 }
 
-/** Persist source-scoped proposals; approved calls publish draft PRs or adopt verified merged skills. */
+/** Keep source-scoped proposals and require separate final review, release verification and activation. */
 export function createAips(
   config: Config,
-  onAdopt?: (skill: AdoptedSkill) => void | Promise<void>,
+  onActivate?: (skill: ReleasedSkill) => void | Promise<void>,
   fetchImpl: typeof fetch = fetch,
 ) {
   const secrets = createSecrets(config.authSecret);
@@ -94,6 +119,16 @@ export function createAips(
       CREATE TABLE IF NOT EXISTS rove_aip (
         id TEXT PRIMARY KEY, scope TEXT NOT NULL, data TEXT NOT NULL
       );`);
+    if (
+      !db
+        .prepare('PRAGMA table_info(rove_github)')
+        .all()
+        .some((column) => column.name === 'workflow_path')
+    ) {
+      db.exec(
+        "ALTER TABLE rove_github ADD COLUMN workflow_path TEXT NOT NULL DEFAULT '.github/workflows/plugin-release.yml'",
+      );
+    }
   } catch (error) {
     db.close();
     throw error;
@@ -111,6 +146,9 @@ export function createAips(
     return {
       repo: row ? String(row.repo) : '',
       configured: Boolean(row?.token),
+      workflowPath: row
+        ? String(row.workflow_path)
+        : '.github/workflows/plugin-release.yml',
     };
   }
   function saveSettings(body: unknown) {
@@ -130,11 +168,15 @@ export function createAips(
         'Enter a GitHub token. Changing the repository requires a new token.',
       );
     }
-    db.prepare(`INSERT INTO rove_github VALUES(1,?,?,?) ON CONFLICT(singleton) DO UPDATE SET
-      repo=excluded.repo, token=excluded.token, version=excluded.version`).run(
+    db.prepare(`INSERT INTO rove_github(singleton,repo,token,version,workflow_path) VALUES(1,?,?,?,?) ON CONFLICT(singleton) DO UPDATE SET
+      repo=excluded.repo, token=excluded.token, version=excluded.version, workflow_path=excluded.workflow_path`).run(
       input.repo,
       input.token ? secrets.encrypt(input.token) : String(existing?.token),
       randomUUID(),
+      input.workflowPath ??
+        String(
+          existing?.workflow_path ?? '.github/workflows/plugin-release.yml',
+        ),
     );
     return settings();
   }
@@ -181,13 +223,35 @@ export function createAips(
         parameters: z.toJSONSchema(targetInput),
         revision: current,
       },
-      {
-        name: 'rove_aip_adopt',
-        description:
-          'Adopt this conversation’s published AIP only after GitHub confirms its PR merged and the merged file exactly matches the stored skill. Requires a separate administrator approval; creating or merging a PR alone does not activate a skill.',
-        parameters: z.toJSONSchema(targetInput),
+      ...(
+        [
+          [
+            'inspect',
+            'Inspect the final PR revision before human review. Fetches the exact single-skill package and binds a candidate head SHA. It never approves or activates it.',
+            targetInput,
+          ],
+          [
+            'review',
+            'Record explicit administrator review of the inspected final PR head SHA and exact proposal content. This is a human decision, distinct from publication, automated checks, merging, or activation.',
+            reviewInput,
+          ],
+          [
+            'verify_release',
+            'After human review and merge, verify the tagged release artifact against the merge commit, approved skill, and configured successful release workflow. Verification does not activate it.',
+            releaseInput,
+          ],
+          [
+            'activate',
+            'Activate this conversation’s verified release after a separate administrator approval. Rechecks GitHub evidence and installs exactly the pinned artifact. The source repository must be approved in plugin settings.',
+            targetInput,
+          ],
+        ] as const
+      ).map(([action, description, schema]) => ({
+        name: `rove_aip_${action}`,
+        description,
+        parameters: z.toJSONSchema(schema),
         revision: current,
-      },
+      })),
     ];
   }
   function get(scope: string, id: string) {
@@ -200,13 +264,27 @@ export function createAips(
   function preview(name: string, args: unknown, scope: string): string {
     if (name === 'rove_aip_stage')
       return JSON.stringify({ tool: name, ...parse(stageInput, args) });
-    if (name !== 'rove_aip_publish' && name !== 'rove_aip_adopt')
-      throw new HttpError(404, 'Unknown AIP tool.');
+    const input = target(name, args);
     return JSON.stringify({
       action: name,
       destination: settings().repo,
-      proposal: get(scope, parse(targetInput, args).id),
+      request: input,
+      proposal: get(scope, input.id),
     });
+  }
+  function target(name: string, args: unknown) {
+    if (name === 'rove_aip_review') return parse(reviewInput, args);
+    if (name === 'rove_aip_verify_release') return parse(releaseInput, args);
+    if (
+      ['rove_aip_publish', 'rove_aip_inspect', 'rove_aip_activate'].includes(
+        name,
+      )
+    )
+      return parse(targetInput, args);
+    throw new HttpError(
+      404,
+      'Unknown AIP tool. Legacy direct adoption is unavailable.',
+    );
   }
 
   async function execute(
@@ -238,6 +316,7 @@ export function createAips(
           (item) =>
             item.status === 'draft' &&
             item.skillName === content.skillName &&
+            item.packageVersion === content.packageVersion &&
             item.skillContent === content.skillContent,
         );
         if (existing)
@@ -274,9 +353,8 @@ export function createAips(
       write(record);
       return JSON.stringify(record);
     }
-    if (name !== 'rove_aip_publish' && name !== 'rove_aip_adopt')
-      throw new HttpError(404, 'Unknown AIP tool.');
-    const record = get(scope, parse(targetInput, args).id);
+    const input = target(name, args);
+    const record = get(scope, input.id);
     const row = saved();
     const repo = String(row?.repo);
     const token = secrets.decrypt(String(row?.token));
@@ -292,59 +370,124 @@ export function createAips(
       AbortSignal.timeout(60000),
       ...(signal ? [signal] : []),
     ]);
-    async function github(path: string, body?: unknown, method = 'POST') {
-      const response = await fetchImpl(
-        `https://api.github.com/repos/${repo}${path}`,
-        {
-          method: body === undefined ? 'GET' : method,
-          headers: {
-            Accept: 'application/vnd.github+json',
-            Authorization: `Bearer ${token}`,
-            'Content-Type': 'application/json',
-            'X-GitHub-Api-Version': '2022-11-28',
-          },
-          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-          signal: combined,
-          redirect: 'error',
-        },
-      );
-      if (!response.ok)
-        throw new HttpError(
-          502,
-          `GitHub request failed (${response.status}). Check repository access and the AIP’s recorded state.`,
-        );
-      if (!response.body)
-        throw new HttpError(502, 'GitHub returned an empty response.');
-      const reader = response.body.getReader();
-      const chunks: Uint8Array[] = [];
-      let size = 0;
-      try {
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          size += value.byteLength;
-          if (size > 256000)
-            throw new HttpError(502, 'The GitHub response was too large.');
-          chunks.push(value);
-        }
-      } finally {
-        await reader.cancel().catch(() => {});
-        reader.releaseLock();
-      }
-      let result: unknown;
-      try {
-        result = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-      } catch {
-        throw new HttpError(502, 'GitHub returned an invalid response.');
-      }
-      if (!result || typeof result !== 'object' || Array.isArray(result))
-        throw new HttpError(502, 'GitHub returned an invalid response.');
-      return result as Record<string, unknown>;
-    }
+    const client = githubClient(repo, token, combined, fetchImpl);
+    const github = client.object;
     try {
       if (name === 'rove_aip_publish')
         return JSON.stringify(await publish(record, repo, github));
-      return JSON.stringify(await adopt(record, github));
+      if (record.status === 'adopted' || record.status === 'activated') {
+        if (name === 'rove_aip_activate') return JSON.stringify(record);
+        throw new HttpError(
+          409,
+          'This proposal is already active. Create a new proposal to change it.',
+        );
+      }
+      if (
+        ![
+          'published',
+          'adopting',
+          'reviewed',
+          'verified',
+          'activating',
+        ].includes(record.status)
+      )
+        throw new HttpError(
+          409,
+          'Publish this AIP before reviewing its release.',
+        );
+      const head = await inspect(record, client);
+      if (name === 'rove_aip_inspect') {
+        if (record.candidateHead !== head.sha) {
+          record.candidateHead = head.sha;
+          delete record.review;
+          delete record.release;
+          record.status = 'published';
+        }
+      } else if (name === 'rove_aip_review') {
+        const requested = parse(reviewInput, input);
+        if (
+          requested.headSha !== record.candidateHead ||
+          requested.headSha !== head.sha
+        )
+          throw new HttpError(
+            409,
+            'Inspect the current PR head before reviewing its exact revision.',
+          );
+        record.review = { headSha: head.sha, reviewedAt: Date.now() };
+        delete record.release;
+        record.status = 'reviewed';
+      } else {
+        if (!record.review || record.review.headSha !== head.sha)
+          throw new HttpError(
+            409,
+            'The final PR revision needs fresh human review before release verification or activation.',
+          );
+        if (!head.mergeCommit)
+          throw new HttpError(
+            409,
+            'The reviewed pull request is not verified as merged.',
+          );
+        const tag =
+          name === 'rove_aip_verify_release'
+            ? parse(releaseInput, input).tag
+            : record.release?.tag;
+        if (!tag)
+          throw new HttpError(
+            409,
+            'Verify a release before requesting separate activation.',
+          );
+        const release = await loadRelease(
+          {
+            repo,
+            token,
+            tag,
+            expectedCommit: head.mergeCommit,
+            workflowPath: settings().workflowPath,
+            signal: combined,
+          },
+          fetchImpl,
+        );
+        if (release.bytes !== packageBytes(record))
+          throw new HttpError(
+            409,
+            'The released package differs from the human-reviewed proposal.',
+          );
+        if (name === 'rove_aip_verify_release') {
+          const { manifest: _manifest, bytes: _bytes, ...identity } = release;
+          record.release = identity;
+          record.mergeCommit = release.commit;
+          record.status = 'verified';
+        } else {
+          if (
+            !record.release ||
+            !['verified', 'activating'].includes(record.status) ||
+            release.digest !== record.release.digest ||
+            release.assetId !== record.release.assetId ||
+            release.commit !== record.release.commit
+          )
+            throw new HttpError(
+              409,
+              'The verified release changed. Verify it again and approve a new activation.',
+            );
+          if (!onActivate)
+            throw new HttpError(503, 'Release activation is not available.');
+          record.status = 'activating';
+          write(record);
+          // The registry must make this idempotent by pinned release identity across crash recovery.
+          await onActivate({
+            id: record.id,
+            name: record.skillName,
+            content: record.skillContent,
+            enabled: true,
+            release,
+          });
+          record.status = 'activated';
+        }
+      }
+      record.updatedAt = Date.now();
+      record.version++;
+      write(record);
+      return JSON.stringify(record);
     } finally {
       busy = false;
       active = undefined;
@@ -355,7 +498,6 @@ export function createAips(
   type Github = (
     path: string,
     body?: unknown,
-    method?: string,
   ) => Promise<Record<string, unknown>>;
   function requiredString(value: unknown) {
     if (typeof value !== 'string' || !value)
@@ -363,7 +505,16 @@ export function createAips(
     return value;
   }
   async function publish(record: Aip, repo: string, github: Github) {
-    if (record.status === 'published' || record.status === 'adopted')
+    if (
+      [
+        'published',
+        'reviewed',
+        'verified',
+        'activating',
+        'activated',
+        'adopted',
+      ].includes(record.status)
+    )
       return record;
     if (record.status !== 'draft')
       throw new HttpError(
@@ -381,6 +532,7 @@ export function createAips(
       (commit.tree as Record<string, unknown> | undefined)?.sha,
     );
     record.repo = repo;
+    record.baseBranch = base;
     record.branch = `rove/aip-${record.id}`;
     record.status = 'publishing';
     record.updatedAt = Date.now();
@@ -390,9 +542,19 @@ export function createAips(
         content: record.skillContent,
         encoding: 'utf-8',
       });
+      const manifestBlob = await github('/git/blobs', {
+        content: packageBytes(record),
+        encoding: 'utf-8',
+      });
       const tree = await github('/git/trees', {
         base_tree: baseTree,
         tree: [
+          {
+            path: 'rove-plugin.json',
+            mode: '100644',
+            type: 'blob',
+            sha: requiredString(manifestBlob.sha),
+          },
           {
             path: `.rove/skills/${record.skillName}.md`,
             mode: '100644',
@@ -415,7 +577,7 @@ export function createAips(
         head: record.branch,
         base,
         draft: true,
-        body: `${record.summary}\n\n${record.bullets.map((item) => `- ${item}`).join('\n')}\n\n## Rationale\n\n${record.rationale}\n\n## Validation plan\n\n${record.validation}\n\nThis draft proposes one skill. It does not activate it. Validation above is a plan, not a claim that checks ran.`,
+        body: `${record.summary}\n\n${record.bullets.map((item) => `- ${item}`).join('\n')}\n\n## Rationale\n\n${record.rationale}\n\n## Validation plan\n\n${record.validation}\n\nThis draft proposes one versioned skill package. Human review of its final revision, a successful configured release workflow, a source-matching release artifact, and separate activation are required. It does not activate it. Validation above is a plan, not a claim that checks ran.`,
       });
       if (!Number.isSafeInteger(pr.number) || Number(pr.number) < 1)
         throw new HttpError(
@@ -441,56 +603,92 @@ export function createAips(
       throw failure;
     }
   }
-  async function adopt(record: Aip, github: Github) {
-    if (record.status === 'adopted') return record;
-    if (record.status !== 'published' && record.status !== 'adopting')
+  function packageBytes(record: Aip) {
+    return `${JSON.stringify({ schemaVersion: 1, apiVersion: 1, id: record.skillName, name: record.skillName, version: record.packageVersion ?? '1.0.0', category: 'agent', description: record.summary, skills: [{ name: record.skillName, markdown: record.skillContent }] }, null, 2)}\n`;
+  }
+  async function inspect(record: Aip, client: ReturnType<typeof githubClient>) {
+    const pr = await client.object(`/pulls/${record.number}`);
+    const metadata = z
+      .object({
+        changed_files: z.literal(2),
+        merged: z.boolean(),
+        merge_commit_sha: z.string().nullable(),
+        base: z.object({
+          ref: z.string(),
+          repo: z.object({ full_name: z.string() }),
+        }),
+        head: z.object({
+          ref: z.string(),
+          sha: shaSchema,
+          repo: z.object({ full_name: z.string() }),
+        }),
+      })
+      .safeParse(pr);
+    if (!metadata.success)
       throw new HttpError(
         409,
-        'Publish and merge this AIP’s pull request before adopting it.',
+        'The PR must contain exactly the proposed skill and package manifest.',
       );
-    if (!onAdopt) throw new HttpError(503, 'Skill adoption is not available.');
-    const pr = await github(`/pulls/${record.number}`);
-    const base = pr.base as { repo?: { full_name?: string } } | undefined;
-    const head = pr.head as { ref?: string } | undefined;
-    if (
-      pr.merged !== true ||
-      base?.repo?.full_name?.toLowerCase() !== record.repo?.toLowerCase() ||
-      head?.ref !== record.branch
-    ) {
-      throw new HttpError(
-        409,
-        'The matching AIP pull request is not verified as merged.',
-      );
+    const data = metadata.data;
+    if (!record.baseBranch) {
+      const repo = await client.object('');
+      record.baseBranch = requiredString(repo.default_branch);
     }
-    const mergeCommit = requiredString(pr.merge_commit_sha);
-    const file = await github(
-      `/contents/.rove/skills/${record.skillName}.md?ref=${encodeURIComponent(mergeCommit)}`,
-    );
     if (
-      file.type !== 'file' ||
-      file.encoding !== 'base64' ||
-      typeof file.content !== 'string' ||
-      Buffer.from(file.content, 'base64').toString('utf8') !==
-        record.skillContent
-    ) {
+      data.base.repo.full_name.toLowerCase() !== record.repo?.toLowerCase() ||
+      data.head.repo.full_name.toLowerCase() !== record.repo?.toLowerCase() ||
+      data.base.ref !== record.baseBranch ||
+      data.head.ref !== record.branch
+    )
       throw new HttpError(
         409,
-        'The merged skill differs from the approved proposal. Create a new proposal for the reviewed content.',
+        'The pull request source or destination changed.',
       );
+    const paths = [`rove-plugin.json`, `.rove/skills/${record.skillName}.md`];
+    const files = z
+      .array(
+        z.object({
+          filename: z.string(),
+          status: z.enum(['added', 'modified']),
+        }),
+      )
+      .length(2)
+      .safeParse(
+        await client.request(`/pulls/${record.number}/files?per_page=3`),
+      );
+    if (
+      !files.success ||
+      !paths.every(
+        (path) =>
+          files.data.filter((file) => file.filename === path).length === 1,
+      )
+    )
+      throw new HttpError(
+        409,
+        'The PR includes changes outside the proposed package.',
+      );
+    for (const sha of [
+      data.head.sha,
+      ...(data.merged ? [parse(shaSchema, data.merge_commit_sha)] : []),
+    ]) {
+      const manifest = decodedFile(
+        await client.object(`/contents/rove-plugin.json?ref=${sha}`),
+      );
+      const skill = decodedFile(
+        await client.object(
+          `/contents/.rove/skills/${record.skillName}.md?ref=${sha}`,
+        ),
+      );
+      if (manifest !== packageBytes(record) || skill !== record.skillContent)
+        throw new HttpError(
+          409,
+          'The PR content differs from the stored proposal. Create a new proposal for the changed content.',
+        );
     }
-    record.status = 'adopting';
-    record.mergeCommit = mergeCommit;
-    write(record);
-    await onAdopt({
-      id: record.id,
-      name: record.skillName,
-      content: record.skillContent,
-      enabled: true,
-    });
-    record.status = 'adopted';
-    record.updatedAt = Date.now();
-    write(record);
-    return record;
+    return {
+      sha: data.head.sha,
+      mergeCommit: data.merged ? data.merge_commit_sha : null,
+    };
   }
   return {
     settings,

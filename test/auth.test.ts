@@ -57,6 +57,23 @@ test('protected setup, administrator authorization, recovery, sign-out and resta
       required: true,
     });
     assert.equal((await app.fetch(request('/api/admin/me'))).status, 401);
+    for (const path of [
+      '/api/admin/plugins',
+      '/api/admin/runtime',
+      '/api/admin/channels',
+    ])
+      assert.equal((await app.fetch(request(path))).status, 401);
+    for (const action of [
+      'sources',
+      'install',
+      'configure',
+      'activate',
+      'deactivate',
+    ])
+      assert.equal(
+        (await app.fetch(request(`/api/admin/plugins/${action}`, {}))).status,
+        401,
+      );
     assert.equal(
       (
         await app.fetch(
@@ -124,6 +141,28 @@ test('protected setup, administrator authorization, recovery, sign-out and resta
     assert.match(setCookie, /Secure/i);
     assert.match(setCookie, /SameSite=Lax/i);
     const cookie = cookies(signedIn);
+    for (const path of [
+      '/api/admin/plugins',
+      '/api/admin/runtime',
+      '/api/admin/channels',
+    ])
+      assert.equal(
+        (await app.fetch(request(path, undefined, cookie))).status,
+        200,
+      );
+    assert.equal(
+      (
+        await app.fetch(
+          request(
+            '/api/admin/plugins/sources',
+            { repo: 'example/company-agent', approved: true },
+            cookie,
+            'https://attacker.example',
+          ),
+        )
+      ).status,
+      403,
+    );
     assert.deepEqual(
       await (
         await app.fetch(request('/api/admin/me', undefined, cookie))

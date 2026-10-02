@@ -269,9 +269,12 @@ export function createAgent(config: Config, tools: AgentTools) {
               scope,
               signal,
             );
-          } catch {
+          } catch (error) {
             result =
-              'Action failed or its outcome could not be confirmed. Check the external system before trying again. This approved call will not be repeated.';
+              error instanceof HttpError &&
+              [400, 404, 409].includes(error.status)
+                ? `${error.message} Check the recorded state before requesting another approval. This approved call will not be repeated.`
+                : 'Action failed or its outcome could not be confirmed. Check the external system before trying again. This approved call will not be repeated.';
           }
           toolResult(run, result);
         }

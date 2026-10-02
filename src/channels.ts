@@ -1,0 +1,146 @@
+import { HttpError } from './auth.js';
+import type { Config } from './config.js';
+import { createSlack } from './slack.js';
+
+// Version 1 admits only core-bundled, provider-verified HTTP ingress. It does
+// not load downloaded adapters or accept caller-supplied actors/scopes.
+export const CHANNEL_API_VERSION = 1;
+
+export function createChannels(
+  config: Config,
+  chat: Parameters<typeof createSlack>[1],
+) {
+  let slack: ReturnType<typeof createSlack> | undefined;
+  let retiring: Promise<void> | undefined;
+  let failed = false;
+  let stopping = false;
+  let started = false;
+
+  function status() {
+    return {
+      apiVersion: CHANNEL_API_VERSION,
+      id: 'slack',
+      bundled: true,
+      state: stopping
+        ? 'stopped'
+        : failed
+          ? 'failed'
+          : slack
+            ? 'ready'
+            : 'stopped',
+      message: failed
+        ? 'Slack is unavailable. Check its configuration and save to retry. Web chat is still available.'
+        : '',
+    };
+  }
+  function fail() {
+    failed = true;
+    const previous = slack;
+    slack = undefined;
+    if (!previous) return;
+    previous.cancelPending();
+    retiring = previous
+      .close()
+      .catch(() => {
+        console.error('Slack cleanup failed.');
+      })
+      .finally(() => {
+        retiring = undefined;
+      });
+  }
+  function initialize() {
+    if (stopping || slack || retiring) return;
+    try {
+      slack = createSlack(config, chat, fail);
+      slack.settings();
+      if (started) slack.start();
+      failed = false;
+    } catch {
+      fail();
+    }
+  }
+  function requireChannel(channel: string) {
+    if (channel !== 'slack')
+      throw new HttpError(404, 'This channel is not supported.');
+  }
+  function available() {
+    if (!slack || stopping)
+      throw new HttpError(503, 'Slack is temporarily unavailable.');
+    return slack;
+  }
+  function settings(channel = 'slack') {
+    requireChannel(channel);
+    try {
+      if (slack) return { ...slack.settings(), health: status() };
+    } catch {
+      fail();
+    }
+    return {
+      enabled: false,
+      configured: false,
+      allowedUsers: [],
+      allowedChannels: [],
+      adminUsers: [],
+      allowDM: false,
+      teamId: '',
+      botUserId: '',
+      failures: [],
+      health: status(),
+    };
+  }
+  initialize();
+  return {
+    start() {
+      started = true;
+      initialize();
+      slack?.start();
+    },
+    status,
+    settings,
+    async save(body: Record<string, unknown>, channel = 'slack') {
+      requireChannel(channel);
+      await retiring;
+      initialize();
+      try {
+        await available().save(body);
+        return settings(channel);
+      } catch (error) {
+        if (error instanceof HttpError) throw error;
+        fail();
+        throw new HttpError(
+          503,
+          'Slack settings could not be saved. Try again.',
+        );
+      }
+    },
+    async handle(request: Request) {
+      if (
+        request.method !== 'POST' ||
+        !['/api/slack/events', '/api/slack/interactivity'].includes(
+          new URL(request.url).pathname,
+        )
+      )
+        throw new HttpError(404, 'This channel route is not supported.');
+      try {
+        return await available().handle(request);
+      } catch (error) {
+        if (error instanceof HttpError) throw error;
+        fail();
+        throw new HttpError(503, 'Slack is temporarily unavailable.');
+      }
+    },
+    cancelPending() {
+      stopping = true;
+      slack?.cancelPending();
+    },
+    async close() {
+      stopping = true;
+      const previous = slack;
+      slack = undefined;
+      await previous?.close().catch(() => {
+        console.error('Slack cleanup failed.');
+      });
+      await retiring;
+    },
+  };
+}
