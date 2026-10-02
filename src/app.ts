@@ -304,6 +304,8 @@ export async function createApplication(
     throw new HttpError(404, 'Not found.');
   }
   function cancelPending() {
+    // Start the sandbox cleanup deadline before HTTP, channel, and chat drains.
+    void runtime.close();
     installedChannels?.cancelPending();
     slack.cancelPending();
     chat.cancelPending();

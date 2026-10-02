@@ -102,6 +102,7 @@ export async function createRailwayRuntime(
     | undefined;
   let controller: AbortController | undefined;
   let reconciling: Promise<void> | undefined;
+  const cleanupController = new AbortController();
   let closed = false;
   let closing: Promise<void> | undefined;
 
@@ -206,16 +207,23 @@ export async function createRailwayRuntime(
       return false;
     }
     await recordState('cleanup');
+    const signal = AbortSignal.any([
+      cleanupController.signal,
+      AbortSignal.timeout(15_000),
+    ]);
     try {
+      signal.throwIfAborted();
       const vm = await abortable(
-        sdk.connect(row.sandbox_id, connection(row.environment_id)),
-        AbortSignal.timeout(15_000),
+        sdk.connect(row.sandbox_id, connection(row.environment_id, signal)),
+        signal,
       );
       if (vm.status !== 'DESTROYED') {
-        await abortable(vm.destroy(), AbortSignal.timeout(15_000));
+        signal.throwIfAborted();
+        await abortable(vm.destroy(), signal);
+        signal.throwIfAborted();
         const after = await abortable(
-          sdk.connect(row.sandbox_id, connection(row.environment_id)),
-          AbortSignal.timeout(15_000),
+          sdk.connect(row.sandbox_id, connection(row.environment_id, signal)),
+          signal,
         );
         if (after.status !== 'DESTROYED') return false;
       }
@@ -231,7 +239,10 @@ export async function createRailwayRuntime(
     if (reconciling) return reconciling;
     reconciling = (async () => {
       // Never resume commands: even a failed response may have produced an external effect.
-      for (const row of await pending()) await destroy(row);
+      for (const row of await pending()) {
+        if (closed) break;
+        await destroy(row);
+      }
     })();
     try {
       await reconciling;
@@ -403,7 +414,12 @@ export async function createRailwayRuntime(
     if (closing) return closing;
     closed = true;
     controller?.abort();
-    closing = Promise.allSettled([active, reconciling]).then(() => {});
+    // Leave time for channel drains and Redis lease release before the 10s hard exit.
+    // Unconfirmed cleanup remains durable for the next owner to reconcile.
+    const timer = setTimeout(() => cleanupController.abort(), 3_000).unref();
+    closing = Promise.allSettled([active, reconciling]).then(() => {
+      clearTimeout(timer);
+    });
     return closing;
   }
 

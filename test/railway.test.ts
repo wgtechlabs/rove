@@ -1,13 +1,16 @@
 import assert from 'node:assert/strict';
 import { type TestContext, test } from 'node:test';
-import type {
-  ConnectOptions,
-  CreateOptions,
-  ExecOptions,
-  ExecResult,
+import {
+  type ConnectOptions,
+  type CreateOptions,
+  type ExecOptions,
+  type ExecResult,
+  Sandbox,
 } from 'railway';
+import { createApplication } from '../src/app.js';
 import { HttpError } from '../src/auth.js';
 import { createRailwayRuntime } from '../src/railway.js';
+import { closeRuntime, openRuntime } from '../src/runtime.js';
 import { testRuntime } from './storage.js';
 
 const token = 'test-only-railway-token';
@@ -165,6 +168,163 @@ test('excessive output or cancellation kills the command and independently destr
   }
 });
 
+test('shutdown interrupts stalled provider cleanup and retains the owned VM for recovery', async (t) => {
+  const f = await fixture(t);
+  let markEntered!: () => void;
+  const entered = new Promise<void>((resolve) => {
+    markEntered = resolve;
+  });
+  let providerAborted = false;
+  t.mock.method(
+    globalThis,
+    'fetch',
+    async (_input: string | URL | Request, init?: RequestInit) => {
+      markEntered();
+      await new Promise<void>((resolve) => {
+        const fallback = setTimeout(resolve, 8_000);
+        init?.signal?.addEventListener(
+          'abort',
+          () => {
+            providerAborted = true;
+            clearTimeout(fallback);
+            resolve();
+          },
+          { once: true },
+        );
+      });
+      throw new Error('Provider request interrupted.');
+    },
+  );
+  t.mock.method(
+    f.sdk,
+    'connect',
+    async (_id: string, options: ConnectOptions) => ({
+      ...f.vm,
+      destroy: async () => {
+        await options.fetch?.('https://backboard.railway.com/graphql/v2');
+      },
+    }),
+  );
+  const runtime = await f.open();
+  const operation = assert.rejects(runtime.smoke(), status(503));
+  await entered;
+  const start = Date.now();
+  await runtime.close();
+  await operation;
+  assert.ok(Date.now() - start < 5_000, 'cleanup must fit the shutdown budget');
+  assert.equal(providerAborted, true);
+  assert.equal(
+    (await runtime.status()).pendingCleanup[0]?.sandboxId,
+    'test-vm',
+  );
+  assert.equal((await runtime.status()).pendingCleanup[0]?.state, 'cleanup');
+  await assert.rejects(runtime.smoke(), status(503));
+  assert.equal(f.calls.created.length, 1);
+});
+
+test('application cancellation bounds startup reconciliation and releases ownership for recovery', async (t) => {
+  const f = await fixture(t);
+  const first = await f.open();
+  await first.close();
+  for (const id of ['first-vm', 'next-vm']) {
+    await f.config.db.run(
+      "INSERT INTO rove_sandbox_run (id, environment_id, sandbox_id, state, deadline, created_at) VALUES ($1, $2, $1, 'cleanup', 0, 0)",
+      [id, environment.RAILWAY_ENVIRONMENT_ID],
+    );
+  }
+  await f.config.state.close();
+  const savedEnv = { ...process.env };
+  Object.assign(process.env, environment, { ROVE_RAILWAY_AUTH_TYPE: 'bearer' });
+  let markEntered!: () => void;
+  const entered = new Promise<void>((resolve) => {
+    markEntered = resolve;
+  });
+  let markAborted!: () => void;
+  const aborted = new Promise<void>((resolve) => {
+    markAborted = resolve;
+  });
+  let attempts = 0;
+  const transport = t.mock.method(
+    globalThis,
+    'fetch',
+    async (_input: string | URL | Request, init?: RequestInit) => {
+      markEntered();
+      await new Promise<void>((resolve) => {
+        const fallback = setTimeout(resolve, 8_000);
+        init?.signal?.addEventListener(
+          'abort',
+          () => {
+            clearTimeout(fallback);
+            markAborted();
+            resolve();
+          },
+          { once: true },
+        );
+      });
+      throw new Error('Provider request interrupted.');
+    },
+  );
+  const connect = t.mock.method(
+    Sandbox,
+    'connect',
+    async (_id: string, options: ConnectOptions) => {
+      attempts++;
+      await options.fetch?.('https://backboard.railway.com/graphql/v2');
+      return f.vm;
+    },
+  );
+  let app: Awaited<ReturnType<typeof createApplication>> | undefined;
+  try {
+    app = await createApplication(f.config);
+    await entered;
+    app.cancelPending();
+    await Promise.race([
+      aborted,
+      new Promise((_, reject) => {
+        const timer = setTimeout(
+          () =>
+            reject(
+              new Error('Provider cleanup did not cancel before HTTP drain.'),
+            ),
+          5_000,
+        );
+        timer.unref();
+      }),
+    ]);
+    await app.close();
+    assert.equal(
+      attempts,
+      1,
+      'shutdown must leave the remaining backlog for restart',
+    );
+    const restarted = await openRuntime(f.config);
+    try {
+      const recovery = await createRailwayRuntime(
+        restarted,
+        environment,
+        f.sdk,
+      );
+      assert.equal((await recovery.status()).pendingCleanup.length, 2);
+      await recovery.reconcile();
+      assert.equal((await recovery.status()).pendingCleanup.length, 0);
+      assert.equal(f.calls.created.length, 0);
+      await recovery.close();
+    } finally {
+      await closeRuntime(restarted);
+    }
+  } finally {
+    await app?.close();
+    connect.mock.restore();
+    transport.mock.restore();
+    for (const key of Object.keys(environment).concat(
+      'ROVE_RAILWAY_AUTH_TYPE',
+    )) {
+      if (savedEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = savedEnv[key];
+    }
+  }
+});
+
 test('restart retries only owned cleanup and never replays a command', async (t) => {
   const f = await fixture(t);
   f.behavior.cleanupError = true;
@@ -215,7 +375,10 @@ test('real SDK uses project-token headers and captured creation identity survive
   const f = await fixture(t);
   const requests: { headers: Headers; query: string }[] = [];
   let destroyed = false;
-  const transport: typeof fetch = async (_input, init) => {
+  const transport: typeof fetch = async (
+    _input: string | URL | Request,
+    init?: RequestInit,
+  ) => {
     assert.equal(init?.redirect, 'error');
     const body = JSON.parse(String(init?.body)) as {
       query: string;
