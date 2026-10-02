@@ -16,7 +16,8 @@ supplies the knowledge, policies and workflows.
 
 > **MVP preview:** web chat, approved tool execution, Markdown skills, declarative
 > release installations, remote MCP, optional Slack, and reviewed AIP releases are implemented.
-> Executable User/Channel Plugins stay unavailable pending live sandbox verification.
+> Executable User Plugins stay unavailable pending live sandbox verification.
+> Installable channels currently support a signed JSON protocol; provider-specific plugins are separate work.
 > Bring your own provider and integration credentials. Live compatibility depends
 > on your provider and installed integrations.
 
@@ -33,6 +34,7 @@ supplies the knowledge, policies and workflows.
 | AI web chat with saved conversations | Available |
 | Web configuration for model connection and system instructions | Available |
 | Optional Slack channel, activated from the web interface | Implemented |
+| Installable signed JSON channel gateway | Implemented; provider plugins are separate |
 | Web configuration for tools, MCP servers, plugins and skills | Implemented |
 | Approved GitHub releases, plugin settings, activation and rollback | Implemented |
 | AIP final review, GitHub release verification and separate activation | Implemented |
@@ -218,6 +220,11 @@ skill, rationale and validation plan; request revisions or cancellation there.
 Drafting and publishing remain separate administrator-reviewed calls. A proposal
 includes its next numeric package version. Publishing creates a draft PR with
 `.rove/skills/<name>.md` and a matching `rove-plugin.json`; it never merges it.
+Proposals can include a complete native plugin package, preserving its source,
+settings and permissions in that same review. Package ID and version must match
+the proposal. Preparing executable source does not enable its execution.
+The complete native-package draft or revision is limited to 16,000 UTF-8 bytes,
+including its proposal text; the model's output limit may be smaller.
 Inspect the final PR revision in the originating conversation and explicitly
 approve that exact revision. The same administrator may author and review it.
 
@@ -230,6 +237,8 @@ conversation. The company repository must also be approved under **Plugins**.
 Rove checks the final head, permitted file changes, merge, workflow identity,
 source commit and artifact bytes. Changed or missing evidence blocks activation.
 AIP-bound packages cannot bypass this gate through the general installer.
+If a release requires settings, secrets or permissions, configure it in Plugins
+and return to the originating conversation to approve activation again.
 
 The old merged-skill adoption path is closed. Previously adopted local content
 keeps working; pending legacy single-file proposals need a compatible package

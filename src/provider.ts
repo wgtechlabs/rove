@@ -10,6 +10,7 @@ export interface ToolDefinition {
   description: string;
   parameters: Record<string, unknown>;
   revision: string;
+  surfaces?: Array<'tool' | 'action' | 'step'>;
 }
 export interface ToolCall {
   id: string;

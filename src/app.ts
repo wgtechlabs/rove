@@ -6,6 +6,7 @@ import { createChannels } from './channels.js';
 import { createChat } from './chat.js';
 import type { Config } from './config.js';
 import { createExtensions } from './extensions.js';
+import { createPluginChannels } from './plugin-channel.js';
 import { createPlugins } from './plugins.js';
 import { createRailwayRuntime } from './railway.js';
 
@@ -37,6 +38,7 @@ export async function createApplication(
   let slack: ReturnType<typeof createChannels>;
   let plugins: ReturnType<typeof createPlugins>;
   let runtime: ReturnType<typeof createRailwayRuntime>;
+  let installedChannels: ReturnType<typeof createPluginChannels> | undefined;
   try {
     extensions = createExtensions(config);
     cleanup.push(() => extensions.close());
@@ -82,6 +84,17 @@ export async function createApplication(
     slack = createChannels(config, chat);
     cleanup.push(() => slack.close());
     slack.start();
+    try {
+      installedChannels = createPluginChannels(
+        config,
+        chat,
+        plugins.activeChannel,
+      );
+      cleanup.push(() => installedChannels?.close());
+      installedChannels.start();
+    } catch {
+      console.error('Installed channels are unavailable.');
+    }
   } catch (error) {
     await Promise.allSettled(cleanup.reverse().map(async (close) => close()));
     throw error;
@@ -89,6 +102,14 @@ export async function createApplication(
   const json = (body: unknown, status = 200) => Response.json(body, { status });
   async function route(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
+    const channelRoute = /^\/api\/channels\/([a-f0-9-]{36})\/events$/.exec(
+      path,
+    );
+    if (request.method === 'POST' && channelRoute?.[1]) {
+      if (!installedChannels)
+        throw new HttpError(503, 'Installed channels are unavailable.');
+      return installedChannels.handle(request, channelRoute[1]);
+    }
     if (
       request.method === 'POST' &&
       ['/api/slack/events', '/api/slack/interactivity'].includes(path)
@@ -103,6 +124,15 @@ export async function createApplication(
       if (request.method === 'GET' && path === '/api/admin/me')
         return json(admin);
       if (request.method === 'GET') {
+        const channelStatus =
+          /^\/api\/admin\/plugins\/([a-f0-9-]{36})\/channel$/.exec(path);
+        if (channelStatus?.[1])
+          return json(
+            installedChannels?.status(channelStatus[1]) ?? {
+              state: 'failed',
+              jobs: [],
+            },
+          );
         if (path === '/api/admin/extensions') return json(extensions.list());
         if (path === '/api/admin/plugins') return json(plugins.list());
         if (path === '/api/admin/runtime') return json(runtime.status());
@@ -171,6 +201,10 @@ export async function createApplication(
         /^\/api\/admin\/conversations\/([a-f0-9-]{36})\/approval$/.exec(path);
       if (approvalRoute?.[1])
         return json(await chat.decide(approvalRoute[1], values));
+      const actionRoute =
+        /^\/api\/admin\/conversations\/([a-f0-9-]{36})\/actions$/.exec(path);
+      if (actionRoute?.[1])
+        return json(await chat.requestAction(actionRoute[1], values));
       if (path === '/api/admin/settings')
         return json(chat.saveSettings(body as Record<string, unknown>));
       if (path === '/api/admin/settings/disconnect')
@@ -219,12 +253,17 @@ export async function createApplication(
   }
   return {
     cancelPending() {
+      installedChannels?.cancelPending();
       slack.cancelPending();
       chat.cancelPending();
     },
     async close() {
+      installedChannels?.cancelPending();
       slack.cancelPending();
       chat.cancelPending();
+      await installedChannels?.close().catch(() => {
+        console.error('Installed channel cleanup failed.');
+      });
       await slack.close();
       chat.close();
       aips.close();

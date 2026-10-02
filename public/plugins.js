@@ -1,6 +1,7 @@
 // Packages contribute data only; the host owns every control and action.
 export function renderPlugins(content, state, runtime, ui) {
-  const { node, button, field, submit, api, change, selectedVersions } = ui;
+  const { node, button, field, submit, api, run, change, selectedVersions } =
+    ui;
   const path = (action) => `/api/admin/plugins/${action}`;
   const unavailable = (control, value) => {
     control.disabled = value;
@@ -149,6 +150,62 @@ export function renderPlugins(content, state, runtime, ui) {
         }
         fields[setting.key] = control;
       }
+      const access = {};
+      if (manifest.channel) {
+        const group = node('fieldset', null, 'plugin-permissions');
+        group.append(node('legend', 'Channel access'));
+        form.append(group);
+        access.tenant = field(
+          group,
+          `channel-${item.id}-tenant`,
+          'Workspace ID',
+          'text',
+          item.channelAccess?.tenant || '',
+        );
+        access.tenant.required = true;
+        access.tenant.maxLength = 200;
+        for (const [key, label] of [
+          ['users', 'Allowed user IDs'],
+          ['admins', 'Users allowed to approve actions'],
+          ['destinations', 'Allowed conversation destinations'],
+        ]) {
+          access[key] = field(
+            group,
+            `channel-${item.id}-${key}`,
+            label,
+            'textarea',
+            (item.channelAccess?.[key] || []).join('\n'),
+            key === 'admins'
+              ? 'Enter one provider ID per line. These users must also be in the allowed users list.'
+              : 'Enter one provider ID per line.',
+          );
+          access[key].rows = 3;
+          access[key].maxLength = 20000;
+          access[key].required = key !== 'admins';
+        }
+        info(body, 'Incoming webhook', `/api/channels/${item.id}/events`);
+        info(body, 'Delivery endpoint', manifest.channel.outgoing.url);
+        const health = node('p', '', 'hint');
+        health.tabIndex = -1;
+        health.setAttribute('role', 'status');
+        body.append(
+          button('Check channel deliveries', () =>
+            run(async () => {
+              const result = await api(path(`${item.id}/channel`));
+              health.textContent =
+                result.state !== 'ready'
+                  ? 'Channel processing is unavailable. Check the deployment logs, then restart Rove.'
+                  : result.jobs.length
+                    ? result.jobs
+                        .map((job) => `${job.count} ${job.status}`)
+                        .join(' · ')
+                    : 'No events received yet.';
+              health.focus();
+            }),
+          ),
+          health,
+        );
+      }
       const bindings = {};
       for (const secret of manifest.secrets) {
         const saved = item.secrets[secret.key];
@@ -233,7 +290,15 @@ export function renderPlugins(content, state, runtime, ui) {
         grants[capability] = field(
           permissions,
           `grant-${item.id}-${capability.replaceAll(':', '-')}`,
-          server ? `Allow tools from ${server.name}` : capability,
+          server
+            ? `Allow tools from ${server.name}`
+            : {
+                'channel:ingress':
+                  'Receive verified messages from this channel',
+                'channel:delivery':
+                  'Send replies to allowed channel destinations',
+                'execute:offline': 'Run isolated code without network access',
+              }[capability] || capability,
           'checkbox',
           item.grants.includes(capability),
           server?.url || '',
@@ -313,6 +378,26 @@ export function renderPlugins(content, state, runtime, ui) {
             ]),
           ),
           secrets,
+          ...(manifest.channel
+            ? {
+                channelAccess: {
+                  tenant: access.tenant.value.trim(),
+                  ...Object.fromEntries(
+                    ['users', 'admins', 'destinations'].map((key) => [
+                      key,
+                      [
+                        ...new Set(
+                          access[key].value
+                            .split('\n')
+                            .map((value) => value.trim())
+                            .filter(Boolean),
+                        ),
+                      ],
+                    ]),
+                  ),
+                },
+              }
+            : {}),
           grants: Object.entries(grants)
             .filter(([, control]) => control.checked)
             .map(([key]) => key),

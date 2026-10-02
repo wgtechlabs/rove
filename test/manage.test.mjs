@@ -105,7 +105,8 @@ test('plugin management keeps package text inert and saves explicit grants befor
   const manifest = {
     name: '<img src=x onerror=alert(1)>',
     version: '1.0.0',
-    category: 'agent',
+    category: 'channel',
+    channel: { outgoing: { url: 'https://integration.example/reply' } },
     description: 'An internal test package',
     skills: [{ name: 'Read me', markdown: '<script>untrusted</script>' }],
     instructions: '',
@@ -116,7 +117,7 @@ test('plugin management keeps package text inert and saves explicit grants befor
     servers: [
       { id: 'read', name: 'Knowledge', url: 'https://tools.example/mcp' },
     ],
-    capabilities: ['mcp:read'],
+    capabilities: ['mcp:read', 'channel:ingress', 'channel:delivery'],
   };
   const installation = {
     id: 'installation-id',
@@ -197,6 +198,8 @@ test('plugin management keeps package text inert and saves explicit grants befor
       return { skills: [], plugins: [], servers: [] };
     if (path === '/api/admin/runtime')
       return { configured: false, pendingCleanup: [] };
+    if (path.endsWith('/channel'))
+      return { state: 'ready', jobs: [{ status: 'uncertain', count: 1 }] };
     return state;
   };
   const manager = (await management(Element))(root, api, run, () => {});
@@ -235,6 +238,19 @@ test('plugin management keeps package text inert and saves explicit grants befor
   );
   const grant = root.querySelector('#manage-grant-installation-id-mcp-read');
   assert.equal(grant.checked, false);
+  root.querySelector('#manage-channel-installation-id-tenant').value =
+    'workspace-1';
+  root.querySelector('#manage-channel-installation-id-users').value =
+    'member-1\nadmin-1\nmember-1';
+  root.querySelector('#manage-channel-installation-id-admins').value =
+    'admin-1';
+  root.querySelector('#manage-channel-installation-id-destinations').value =
+    'room-1';
+  button('Check channel deliveries').onclick();
+  await pending;
+  assert.ok(
+    root.all().some((element) => element.textContent === '1 uncertain'),
+  );
   const company = root.querySelector('#manage-plugin-installation-id-company');
   company.value = 'Example company';
   const form = root
@@ -273,6 +289,12 @@ test('plugin management keeps package text inert and saves explicit grants befor
       digest,
       values: { company: 'Example company' },
       grants: ['mcp:read'],
+      channelAccess: {
+        tenant: 'workspace-1',
+        users: ['member-1', 'admin-1'],
+        admins: ['admin-1'],
+        destinations: ['room-1'],
+      },
       secrets: {
         token: { source: 'environment', name: 'ROVE_PLUGIN_SECRET_KNOWLEDGE' },
       },

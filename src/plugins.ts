@@ -12,6 +12,7 @@ import {
   type ManagedExtension,
 } from './extensions.js';
 import { mcpURL } from './mcp.js';
+import { type ActiveChannel, channelAccess } from './plugin-channel.js';
 import {
   compatibility,
   type PluginPackage,
@@ -54,6 +55,7 @@ const configuration = activation.extend({
   values: z.record(z.string(), z.union([z.string().max(2000), z.boolean()])),
   secrets: z.record(z.string(), secretBinding).default({}),
   grants: z.array(z.string().max(160)).max(16),
+  channelAccess: channelAccess.optional(),
 });
 type Binding =
   | { source: 'stored'; encrypted: string }
@@ -68,6 +70,7 @@ interface Installation {
   secrets: Record<string, Binding>;
   grants: string[];
   environmentFingerprint?: string;
+  channelAccess?: z.infer<typeof channelAccess>;
 }
 const hash = (value: string) =>
   createHash('sha256').update(value).digest('hex');
@@ -194,6 +197,7 @@ export function createPlugins(
         revision: item.revision,
         values: item.values,
         grants: item.grants,
+        channelAccess: item.channelAccess,
         secrets: Object.fromEntries(
           Object.entries(item.secrets).map(([key, binding]) => [
             key,
@@ -232,7 +236,7 @@ export function createPlugins(
       executable: {
         available: false,
         reason:
-          'Live Railway isolation verification is required before executable User or Channel Plugins can activate.',
+          'Live Railway isolation verification is required before executable User Plugins can activate. Declarative channel adapters do not execute downloaded code.',
       },
     };
   }
@@ -443,6 +447,12 @@ export function createPlugins(
     const pkg = selected(item, input.digest).manifest;
     item.values = input.values;
     item.grants = [...new Set(input.grants)];
+    if (input.channelAccess && !pkg.channel)
+      throw new HttpError(
+        400,
+        'Channel access rules require a Channel Plugin.',
+      );
+    item.channelAccess = input.channelAccess;
     for (const [key, binding] of Object.entries(input.secrets)) {
       if (binding.source === 'remove') delete item.secrets[key];
       else
@@ -467,7 +477,7 @@ export function createPlugins(
           ? (env[binding.name] ?? '')
           : '';
     if (value.length > 2000 || /[\r\n]/.test(value))
-      throw new HttpError(400, 'A bound MCP credential is invalid.');
+      throw new HttpError(400, 'A bound plugin credential is invalid.');
     return value;
   }
   function environmentFingerprint(item: Installation) {
@@ -498,13 +508,18 @@ export function createPlugins(
   ): Promise<ManagedExtension[]> {
     const blocked = compatibility(pkg);
     if (blocked) throw new HttpError(409, blocked);
+    if (pkg.channel && !channelAccess.safeParse(item.channelAccess).success)
+      throw new HttpError(
+        400,
+        'Configure the channel workspace, allowed users and destinations before activation.',
+      );
     const values = validateValues(pkg, item, true);
     if (
       pkg.capabilities.some((capability) => !item.grants.includes(capability))
     )
       throw new HttpError(
         409,
-        'Grant each requested MCP permission before activation.',
+        'Grant each requested permission before activation.',
       );
     for (const field of pkg.secrets)
       if (field.required && !secretValue(item, field.key))
@@ -641,6 +656,33 @@ export function createPlugins(
     );
     return list();
   }
+  function activeChannel(id: string): ActiveChannel | undefined {
+    if (closed) return;
+    const item = installations().find((entry) => entry.id === id);
+    if (!item?.active || !source(item.repo)?.approved) return;
+    const pkg = selected(item, item.active).manifest;
+    if (
+      !pkg.channel ||
+      !item.channelAccess ||
+      pkg.capabilities.some(
+        (capability) => !item.grants.includes(capability),
+      ) ||
+      item.environmentFingerprint !== environmentFingerprint(item)
+    )
+      return;
+    return {
+      ...channelAccess.parse(item.channelAccess),
+      revision: item.revision,
+      digest: item.active,
+      spec: pkg.channel,
+      secrets: Object.fromEntries(
+        [pkg.channel.signing.secret, pkg.channel.outgoing.secret].map((key) => [
+          key,
+          secretValue(item, key),
+        ]),
+      ),
+    };
+  }
   async function run<T>(action: () => Promise<T>) {
     if (closed) throw new HttpError(503, 'Plugins are shutting down.');
     if (busy)
@@ -680,6 +722,7 @@ export function createPlugins(
     saveSource,
     configure,
     deactivate,
+    activeChannel,
     install: (body: unknown) => run(() => install(body)),
     activate: (body: unknown) => run(() => activate(body)),
     activateRelease: (skill: ReleasedSkill) =>

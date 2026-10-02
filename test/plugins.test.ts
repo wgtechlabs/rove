@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { type TestContext, test } from 'node:test';
+import { createChat } from '../src/chat.js';
 import { createExtensions } from '../src/extensions.js';
+import { createPluginChannels } from '../src/plugin-channel.js';
 import { compatibility, parsePackage } from '../src/plugin-manifest.js';
 import { createPlugins } from '../src/plugins.js';
 
@@ -164,6 +166,66 @@ test('manifest contracts reject executable authority and duplicate contributions
     compatibility(parsePackage({ ...manifest(), category: 'user' })) ?? '',
     /unavailable/,
   );
+  assert.match(
+    compatibility(
+      parsePackage({
+        ...manifest(),
+        pages: [
+          { id: 'policy', title: 'Policy', content: 'Reviewed guidance' },
+        ],
+      }),
+    ) ?? '',
+    /pages are unavailable/,
+  );
+  const executable = {
+    ...manifest(),
+    category: 'user',
+    execution: {
+      runtime: 'node',
+      source: 'export const run = async () => "done";',
+    },
+    capabilities: ['execute:offline'],
+    operations: [
+      {
+        id: 'summarize',
+        name: 'Summarize',
+        description: 'Summarize supplied data.',
+        inputSchema: {
+          type: 'object',
+          properties: {},
+          additionalProperties: false,
+        },
+        surfaces: ['tool', 'action'],
+      },
+    ],
+  };
+  assert.match(compatibility(parsePackage(executable)) ?? '', /unavailable/);
+  for (const change of [
+    { category: 'agent' },
+    { capabilities: [] },
+    { execution: undefined },
+    { operations: [] },
+    {
+      operations: [
+        {
+          ...executable.operations[0],
+          inputSchema: {
+            type: 'object',
+            $ref: 'https://external.example/schema',
+          },
+        },
+      ],
+    },
+    {
+      operations: [
+        { ...executable.operations[0], surfaces: ['action', 'action'] },
+      ],
+    },
+    {
+      pages: [{ id: 'home', title: 'Home', content: '', actions: ['unknown'] }],
+    },
+  ])
+    assert.throws(() => parsePackage({ ...executable, ...change }));
 });
 
 test('approved releases install inactive, atomically activate, update and roll back across two restarts', async (t) => {
@@ -561,4 +623,189 @@ test('managed MCP uses existing approval revisions, hides secrets and revokes di
     /no longer enabled/,
   );
   assert.equal(effects, 1);
+});
+
+test('verified channel installations gate signed ingress and revoke it on configuration, source and secret changes across restart', async (t) => {
+  const f = fixture(t);
+  const pkg = {
+    ...manifest(),
+    category: 'channel',
+    settings: [],
+    skills: [],
+    secrets: [
+      { key: 'signing', label: 'Signing key', required: true },
+      { key: 'delivery', label: 'Delivery key', required: true },
+    ],
+    capabilities: ['channel:ingress', 'channel:delivery'],
+    channel: {
+      type: 'hmac-json',
+      signing: {
+        secret: 'signing',
+        timestampHeader: 'x-fixture-time',
+        signatureHeader: 'x-fixture-signature',
+      },
+      incoming: {
+        eventId: '/id',
+        tenant: '/tenant',
+        actor: '/actor',
+        destination: '/destination',
+        thread: '/thread',
+        text: '/text',
+      },
+      outgoing: {
+        url: 'https://channel.example/send',
+        secret: 'delivery',
+        fields: { destination: 'destination', thread: 'thread', text: 'text' },
+      },
+    },
+  };
+  const access = {
+    tenant: 'company',
+    users: ['alice'],
+    admins: [],
+    destinations: ['general'],
+  };
+  const configure = (
+    grants: string[],
+    secrets: Record<string, unknown> = {},
+  ) => {
+    const item = f.current();
+    f.plugins.configure({
+      id: item.id,
+      revision: item.revision,
+      digest: item.versions[0]?.digest,
+      values: {},
+      grants,
+      secrets,
+      channelAccess: access,
+    });
+  };
+  await assert.rejects(f.install(pkg), /Approve/);
+  assert.equal(f.state.calls, 0);
+  f.approve();
+  await f.install(pkg);
+  const installation = f.current().id;
+  await assert.rejects(f.activate(), /Configure the channel/);
+  configure([]);
+  await assert.rejects(f.activate(), /Grant/);
+  configure(pkg.capabilities);
+  await assert.rejects(f.activate(), /required secret/);
+  configure(pkg.capabilities, {
+    signing: { source: 'environment', name: 'ROVE_PLUGIN_SECRET_ORDERS' },
+    delivery: { source: 'stored', value: 'fixture-delivery-secret' },
+  });
+  await f.activate();
+  const pinnedDigest = f.current().active;
+  assert.ok(pinnedDigest);
+  assert.equal(f.plugins.activeChannel(installation)?.digest, pinnedDigest);
+  assert.doesNotMatch(
+    JSON.stringify(f.plugins.list()),
+    /environment-mcp-secret|fixture-delivery-secret/,
+  );
+  let chat = createChat(f.config);
+  let gateway = createPluginChannels(f.config, chat, (id) =>
+    f.plugins.activeChannel(id),
+  );
+  const acceptedEvent = randomUUID();
+  const request = (
+    key = f.env.ROVE_PLUGIN_SECRET_ORDERS,
+    id = randomUUID(),
+  ) => {
+    const stamp = Math.floor(Date.now() / 1000);
+    const body = JSON.stringify({
+      id,
+      tenant: 'company',
+      actor: 'alice',
+      destination: 'general',
+      thread: 'topic',
+      text: 'Hello from an installed release.',
+      role: 'admin',
+      scope: 'web',
+    });
+    return new Request(
+      `${f.config.baseURL}/api/channels/${installation}/events`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-fixture-time': String(stamp),
+          'x-fixture-signature': `v1=${createHmac('sha256', key).update(`v1:${stamp}:${body}`).digest('hex')}`,
+        },
+        body,
+      },
+    );
+  };
+  try {
+    assert.equal(
+      (await gateway.handle(request(undefined, acceptedEvent), installation))
+        .status,
+      202,
+    );
+    const db = new DatabaseSync(f.config.databasePath);
+    try {
+      const saved = db
+        .prepare('SELECT scope,snapshot FROM rove_plugin_channel_job')
+        .get();
+      assert.ok(saved);
+      assert.match(
+        String(saved.scope),
+        new RegExp(`^plugin-channel:${installation}:`),
+      );
+      assert.doesNotMatch(
+        String(saved.snapshot),
+        /environment-mcp-secret|fixture-delivery-secret/,
+      );
+    } finally {
+      db.close();
+    }
+    assert.equal(
+      chat.list().length,
+      0,
+      'acknowledging ingress must not execute chat synchronously',
+    );
+    configure(pkg.capabilities);
+    assert.equal(f.plugins.activeChannel(installation), undefined);
+    await assert.rejects(gateway.handle(request(), installation), /not active/);
+    await f.activate();
+    assert.equal((await gateway.handle(request(), installation)).status, 202);
+    f.plugins.saveSource({ repo, approved: false });
+    assert.equal(f.current().active, null);
+    await assert.rejects(gateway.handle(request(), installation), /not active/);
+    f.approve();
+    await f.activate();
+    const oldSigning = f.env.ROVE_PLUGIN_SECRET_ORDERS;
+    f.env.ROVE_PLUGIN_SECRET_ORDERS = 'fixture-rotated-signing-secret';
+    assert.equal(f.plugins.activeChannel(installation), undefined);
+    await assert.rejects(gateway.handle(request(), installation), /not active/);
+    await gateway.close();
+    chat.close();
+    f.restart();
+    chat = createChat(f.config);
+    gateway = createPluginChannels(f.config, chat, (id) =>
+      f.plugins.activeChannel(id),
+    );
+    assert.equal(f.current().active, null);
+    assert.ok(
+      f
+        .current()
+        .audit.some((entry) => entry.event === 'environment-secret-changed'),
+    );
+    await assert.rejects(gateway.handle(request(), installation), /not active/);
+    await f.activate();
+    assert.equal(f.plugins.activeChannel(installation)?.digest, pinnedDigest);
+    await assert.rejects(
+      gateway.handle(request(oldSigning), installation),
+      /Invalid channel signature/,
+    );
+    assert.equal((await gateway.handle(request(), installation)).status, 202);
+    assert.equal(
+      (await gateway.handle(request(undefined, acceptedEvent), installation))
+        .status,
+      200,
+      'accepted event IDs stay deduplicated across manager and gateway restarts',
+    );
+  } finally {
+    await gateway.close();
+    chat.close();
+  }
 });

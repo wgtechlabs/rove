@@ -12,6 +12,7 @@ import {
 } from './aip-release.js';
 import { HttpError } from './auth.js';
 import type { Config } from './config.js';
+import { parsePackage } from './plugin-manifest.js';
 import { createSecrets } from './secrets.js';
 
 const proposal = z
@@ -32,6 +33,12 @@ const proposal = z
       .min(1)
       .max(8000)
       .refine((value) => Boolean(value.trim())),
+    pluginPackage: z
+      .record(z.string(), z.unknown())
+      .optional()
+      .describe(
+        'Optional complete native Rove API v1 plugin package. Its id and version must match skillName and packageVersion. Core validates the full manifest, source and contributions; skillContent remains the human-readable proposal document.',
+      ),
     rationale: z.string().trim().min(1).max(2000),
     validation: z.string().trim().min(1).max(2000),
   })
@@ -101,6 +108,25 @@ function parse<T>(schema: z.ZodType<T>, value: unknown): T {
       'Invalid AIP fields. Check the proposed content and try again.',
     );
   return result.data;
+}
+
+function parseStage(value: unknown) {
+  const input = parse(stageInput, value);
+  if (input.action !== 'cancel' && input.pluginPackage) {
+    if (Buffer.byteLength(JSON.stringify(value)) > 16000)
+      throw new HttpError(
+        400,
+        'Native plugin AIP requests, including proposal fields and source, must fit within 16 KB.',
+      );
+    const pkg = parsePackage(input.pluginPackage);
+    if (pkg.id !== input.skillName || pkg.version !== input.packageVersion)
+      throw new HttpError(
+        400,
+        'The plugin package id and version must match the proposal.',
+      );
+    input.pluginPackage = pkg;
+  }
+  return input;
 }
 
 /** Keep source-scoped proposals and require separate final review, release verification and activation. */
@@ -203,7 +229,7 @@ export function createAips(
       {
         name: 'rove_aip_stage',
         description:
-          'Draft, revise, or cancel an Agent Improvement Proposal in this conversation. Include the exact proposed reusable skill, rationale, and a reproducible validation check. A draft never changes active behavior. Revisions replace the complete draft and invalidate earlier approval.',
+          'Draft, revise, or cancel an Agent Improvement Proposal in this conversation. Include an exact reusable skill or a complete native pluginPackage, rationale, and a reproducible validation check. A draft never changes active behavior. Revisions replace the complete draft and invalidate earlier approval.',
         parameters: {
           type: 'object',
           properties: {
@@ -219,7 +245,7 @@ export function createAips(
       {
         name: 'rove_aip_publish',
         description:
-          'Publish this conversation’s stored AIP as a GitHub draft pull request containing its exact proposed skill. Never merges or adopts it. Inspect the saved proposal first; approval authorizes this exact stored revision and GitHub destination.',
+          'Publish this conversation’s stored AIP as a GitHub draft pull request containing its exact proposed package and proposal document. Never merges or adopts it. Inspect the saved proposal first; approval authorizes this exact stored revision and GitHub destination.',
         parameters: z.toJSONSchema(targetInput),
         revision: current,
       },
@@ -227,7 +253,7 @@ export function createAips(
         [
           [
             'inspect',
-            'Inspect the final PR revision before human review. Fetches the exact single-skill package and binds a candidate head SHA. It never approves or activates it.',
+            'Inspect the final PR revision before human review. Fetches the exact package and proposal document and binds a candidate head SHA. It never approves or activates it.',
             targetInput,
           ],
           [
@@ -237,7 +263,7 @@ export function createAips(
           ],
           [
             'verify_release',
-            'After human review and merge, verify the tagged release artifact against the merge commit, approved skill, and configured successful release workflow. Verification does not activate it.',
+            'After human review and merge, verify the tagged release artifact against the merge commit, approved package, and configured successful release workflow. Verification does not activate it.',
             releaseInput,
           ],
           [
@@ -263,7 +289,7 @@ export function createAips(
 
   function preview(name: string, args: unknown, scope: string): string {
     if (name === 'rove_aip_stage')
-      return JSON.stringify({ tool: name, ...parse(stageInput, args) });
+      return JSON.stringify({ tool: name, ...parseStage(args) });
     const input = target(name, args);
     return JSON.stringify({
       action: name,
@@ -309,7 +335,7 @@ export function createAips(
       );
     }
     if (name === 'rove_aip_stage') {
-      const input = parse(stageInput, args);
+      const input = parseStage(args);
       if (input.action === 'draft') {
         const { action: _action, ...content } = input;
         const existing = list(scope).find(
@@ -317,7 +343,9 @@ export function createAips(
             item.status === 'draft' &&
             item.skillName === content.skillName &&
             item.packageVersion === content.packageVersion &&
-            item.skillContent === content.skillContent,
+            item.skillContent === content.skillContent &&
+            JSON.stringify(item.pluginPackage) ===
+              JSON.stringify(content.pluginPackage),
         );
         if (existing)
           return JSON.stringify({ ...existing, alreadyExists: true });
@@ -346,6 +374,7 @@ export function createAips(
       if (input.action === 'cancel') record.status = 'cancelled';
       else {
         const { action: _action, id: _id, ...content } = input;
+        delete record.pluginPackage;
         Object.assign(record, content);
       }
       record.version++;
@@ -577,7 +606,7 @@ export function createAips(
         head: record.branch,
         base,
         draft: true,
-        body: `${record.summary}\n\n${record.bullets.map((item) => `- ${item}`).join('\n')}\n\n## Rationale\n\n${record.rationale}\n\n## Validation plan\n\n${record.validation}\n\nThis draft proposes one versioned skill package. Human review of its final revision, a successful configured release workflow, a source-matching release artifact, and separate activation are required. It does not activate it. Validation above is a plan, not a claim that checks ran.`,
+        body: `${record.summary}\n\n${record.bullets.map((item) => `- ${item}`).join('\n')}\n\n## Rationale\n\n${record.rationale}\n\n## Validation plan\n\n${record.validation}\n\nThis draft proposes one versioned plugin package. Human review of its final revision, a successful configured release workflow, a source-matching release artifact, and separate activation are required. It does not activate it. Validation above is a plan, not a claim that checks ran.`,
       });
       if (!Number.isSafeInteger(pr.number) || Number(pr.number) < 1)
         throw new HttpError(
@@ -604,6 +633,8 @@ export function createAips(
     }
   }
   function packageBytes(record: Aip) {
+    if (record.pluginPackage)
+      return `${JSON.stringify(parsePackage(record.pluginPackage))}\n`;
     return `${JSON.stringify({ schemaVersion: 1, apiVersion: 1, id: record.skillName, name: record.skillName, version: record.packageVersion ?? '1.0.0', category: 'agent', description: record.summary, skills: [{ name: record.skillName, markdown: record.skillContent }] }, null, 2)}\n`;
   }
   async function inspect(record: Aip, client: ReturnType<typeof githubClient>) {
@@ -627,7 +658,7 @@ export function createAips(
     if (!metadata.success)
       throw new HttpError(
         409,
-        'The PR must contain exactly the proposed skill and package manifest.',
+        'The PR must contain exactly the proposal document and package manifest.',
       );
     const data = metadata.data;
     if (!record.baseBranch) {

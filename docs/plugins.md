@@ -10,13 +10,18 @@ Updating Rove does not require a company fork.
 | --- | --- | --- |
 | Agent Plugin | Skills, instructions and remote MCP | Versioned installation and activation |
 | User Plugin | Rove-specific executable company extension | Reserved category; activation blocked |
-| Channel Plugin | Rove-specific messaging adapter | Reserved category; bundled Slack remains available |
+| Channel Plugin | Rove-specific messaging adapter | Installable signed JSON protocol; bundled Slack remains available |
 
-Downloaded JavaScript, shell hooks, local MCP processes, arbitrary HTML and
-plugin database migrations are rejected. There is no public marketplace yet.
+Downloaded JavaScript never runs in the core process. Executable source may be
+prepared and reviewed, but activation is blocked. Shell hooks, local MCP
+processes, arbitrary HTML and plugin database migrations are rejected.
+There is no public marketplace yet.
 See [format import compatibility](compatibility.md) and the
 [Railway execution gate](railway-sandbox.md). Executable tools, custom dashboard
-actions and workflow steps require that gate and a later external integration.
+actions and workflow steps still require a verified executor and its integration.
+The persisted direct-action approval path is implemented but has no enabled
+executable contributor yet. See [the channel protocol](channel-plugins.md) for
+the supported installable channel boundary.
 
 ## Install and configure
 
@@ -25,7 +30,8 @@ actions and workflow steps require that gate and a later external integration.
 2. Enter a published release tag and choose its format. Preparation downloads and
    validates content, without activating it or running installation scripts.
 3. Inspect the content, source commit and digest. Fill required settings and
-   secrets, and explicitly grant requested MCP connections. Saving configuration
+   secrets, and explicitly grant requested permissions. Channel access rules
+   belong to the administrator and cannot be supplied by the package. Saving configuration
    deactivates an active installation; activate separately after reviewing it.
 4. Select **Activate release**. Rove validates required fields and discovers MCP
    tools before switching the active version in one database transaction. Failure
@@ -66,7 +72,7 @@ it with the committed file. No archive extraction or package manager runs.
 }
 ```
 
-The example endpoint is illustrative and must be replaced. The executable
+The example endpoint is illustrative and must be replaced. The package
 validator is [plugin-manifest.ts](../src/plugin-manifest.ts). Unknown fields fail
 closed. API/schema version must be `1`; package versions use numeric `major.minor.patch`.
 IDs and field keys are lowercase hyphenated slugs. Duplicate contribution IDs,
@@ -76,6 +82,8 @@ Settings support text and booleans, optional defaults and required fields.
 `${settings.KEY}` in skill/instruction text inserts only a declared ordinary
 setting. Secrets cannot be interpolated into prompts. Settings pages are rendered
 by core with native controls and text; a manifest cannot inject scripts or HTML.
+Custom content pages declared in a package remain blocked until the core page
+renderer is implemented; activation never silently drops them.
 
 Secrets have one selected source: an encrypted stored value, or an explicitly
 bound deployment variable named `ROVE_PLUGIN_SECRET_*`. Rove does not expose its
@@ -84,7 +92,7 @@ or removed environment secret deactivates the installation at restart and
 invalidates pending approvals; review and activate again. Tokens are never
 returned by the administration API or copied into artifacts.
 
-Permissions currently name a whole remote MCP connection: `mcp:SERVER_ID`.
+MCP permissions name a whole remote connection: `mcp:SERVER_ID`.
 Granting one exposes its discovered tools to the agent; the existing per-call
 approval remains mandatory. This does not enforce resource-level permissions
 inside the external service. Scope the service credential accordingly.
@@ -107,6 +115,11 @@ Limits: 16 sources, 16 installations, 16 retained releases per installation,
 8 secrets per package. Existing shared limits remain: 32 extension records,
 24,000 instruction characters, 8 MCP servers and 32 enabled tools. Limits include
 local and installed contributions. Cache pruning is not yet exposed.
+
+Native package AIPs have a smaller limit: the whole draft/revision request,
+including proposal text and source, must fit within 16,000 UTF-8 bytes. Model
+output limits may require a smaller proposal. The installer's 128 KB limit does
+not imply that chat can generate or stage a package of that size.
 
 ## Upgrading existing deployments
 

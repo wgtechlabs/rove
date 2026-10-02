@@ -61,6 +61,7 @@ test('protected setup, administrator authorization, recovery, sign-out and resta
       '/api/admin/plugins',
       '/api/admin/runtime',
       '/api/admin/channels',
+      '/api/admin/plugins/00000000-0000-4000-8000-000000000001/channel',
     ])
       assert.equal((await app.fetch(request(path))).status, 401);
     for (const action of [
@@ -74,6 +75,17 @@ test('protected setup, administrator authorization, recovery, sign-out and resta
         (await app.fetch(request(`/api/admin/plugins/${action}`, {}))).status,
         401,
       );
+    assert.equal(
+      (
+        await app.fetch(
+          request(
+            '/api/admin/conversations/00000000-0000-4000-8000-000000000001/actions',
+            {},
+          ),
+        )
+      ).status,
+      401,
+    );
     assert.equal(
       (
         await app.fetch(

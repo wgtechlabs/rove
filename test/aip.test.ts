@@ -10,8 +10,13 @@ import { createAips, type ReleasedSkill } from '../src/aip.js';
 import { createChat } from '../src/chat.js';
 import type { Config } from '../src/config.js';
 import { createExtensions } from '../src/extensions.js';
+import { parsePackage } from '../src/plugin-manifest.js';
 import { createPlugins } from '../src/plugins.js';
 
+const githubSettings = {
+  repo: 'example/knowledge',
+  token: 'dummy-github-token',
+};
 const draft = {
   action: 'draft',
   packageVersion: '1.0.0',
@@ -24,6 +29,36 @@ const draft = {
   rationale: 'Unsupported claims can mislead the company.',
   validation:
     'Ask for an unavailable fact; the agent must say it cannot verify it.',
+};
+const nativePackage = {
+  schemaVersion: 1,
+  apiVersion: 1,
+  id: draft.skillName,
+  name: draft.skillName,
+  version: draft.packageVersion,
+  category: 'user',
+  description: draft.summary,
+  capabilities: ['execute:offline'],
+  execution: {
+    runtime: 'node',
+    source: 'export function run(input) { return input.args; }',
+  },
+  operations: [
+    {
+      id: 'echo',
+      name: 'Echo',
+      description: 'Return the approved input.',
+      inputSchema: { type: 'object' },
+      surfaces: ['tool', 'action', 'step'],
+    },
+  ],
+};
+const oversizedDraft = {
+  ...draft,
+  pluginPackage: {
+    ...nativePackage,
+    execution: { runtime: 'node', source: 'x'.repeat(16000) },
+  },
 };
 function fixture() {
   const directory = mkdtempSync(join(tmpdir(), 'rove-aip-'));
@@ -193,10 +228,7 @@ test('AIP drafts persist, preserve scope, invalidate approvals, and cancel witho
     assert.throws(() =>
       service.saveSettings({ repo: 'example/..', token: 'dummy-github-token' }),
     );
-    service.saveSettings({
-      repo: 'example/knowledge',
-      token: 'dummy-github-token',
-    });
+    service.saveSettings(githubSettings);
     assert.deepEqual(service.settings(), {
       repo: 'example/knowledge',
       configured: true,
@@ -283,11 +315,8 @@ test('AIP drafts persist, preserve scope, invalidate approvals, and cancel witho
       'web:one',
     );
     service.close();
-    assert.equal(
-      readFileSync(f.config.databasePath).includes(
-        Buffer.from('dummy-github-token'),
-      ),
-      false,
+    assert.ok(
+      !readFileSync(f.config.databasePath).includes('dummy-github-token'),
     );
     service = createAips(f.config, undefined, f.fetchImpl);
     assert.equal(service.list('web:one')[0]?.status, 'cancelled');
@@ -307,26 +336,47 @@ test('AIP drafts persist, preserve scope, invalidate approvals, and cancel witho
   }
 });
 
-test('AIP requires final human review, a verified release and separate activation across restart', async () => {
+test('native executable AIPs require final human review, a verified release and separate activation across restart', async () => {
   const f = fixture();
   const activated: ReleasedSkill[] = [];
-  let service = createAips(
-    f.config,
-    (skill) => {
-      activated.push(skill);
-    },
-    f.fetchImpl,
-  );
+  const activate = (skill: ReleasedSkill) => {
+    activated.push(skill);
+  };
+  let service = createAips(f.config, activate, f.fetchImpl);
   const run = (name: string, args: unknown) =>
     service.execute(`rove_aip_${name}`, args, revision(service), 'web:one');
   try {
-    service.saveSettings({
-      repo: 'example/knowledge',
-      token: 'dummy-github-token',
-    });
-    const created = JSON.parse(await run('stage', draft));
+    service.saveSettings(githubSettings);
+    const nativeDraft = { ...draft, pluginPackage: nativePackage };
+    await assert.rejects(run('stage', oversizedDraft), /16 KB/);
+    assert.equal(service.list('web:one').length, 0);
+    const created = JSON.parse(await run('stage', nativeDraft));
+    await assert.rejects(
+      run('stage', { ...oversizedDraft, action: 'revise', id: created.id }),
+      /16 KB/,
+    );
+    assert.equal(service.list('web:one')[0]?.version, 1);
+    assert.equal(JSON.parse(await run('stage', nativeDraft)).id, created.id);
+    const changed = JSON.parse(
+      await run('stage', {
+        ...nativeDraft,
+        pluginPackage: { ...nativePackage, description: 'Changed package' },
+      }),
+    );
+    assert.notEqual(changed.id, created.id);
+    await run('stage', { ...draft, action: 'revise', id: changed.id });
+    assert.equal(
+      service.list('web:one').find((item) => item.id === changed.id)
+        ?.pluginPackage,
+      undefined,
+    );
     const target = { id: created.id };
     const published = JSON.parse(await run('publish', target));
+    assert.equal(
+      f.state.manifest,
+      `${JSON.stringify(parsePackage(nativePackage))}\n`,
+    );
+    assert.ok(Buffer.byteLength(JSON.stringify(nativeDraft)) < 16000);
     assert.equal(published.status, 'published');
     const pr = f.calls.find((call) => call.path.endsWith('/pulls'));
     assert.equal(pr?.body?.draft, true);
@@ -363,6 +413,23 @@ test('AIP requires final human review, a verified release and separate activatio
     assert.equal(reviewPreview.proposal.skillContent, draft.skillContent);
     assert.equal(reviewPreview.request.headSha, f.state.head);
     await run('review', { ...target, headSha: f.state.head });
+    const reviewedBytes = f.state.manifest;
+    f.state.manifest = reviewedBytes.replace(
+      nativePackage.execution.source,
+      'export function run() { return 2; }',
+    );
+    f.state.head = 'd'.repeat(40);
+    await assert.rejects(
+      run('verify_release', { ...target, tag: 'v1.0.0' }),
+      /differs/,
+    );
+    f.state.manifest = reviewedBytes;
+    await assert.rejects(
+      run('verify_release', { ...target, tag: 'v1.0.0' }),
+      /fresh human review/,
+    );
+    await run('inspect', target);
+    await run('review', { ...target, headSha: f.state.head });
     await assert.rejects(run('activate', target), /Verify a release/);
     f.state.workflow = 'failure';
     await assert.rejects(
@@ -394,13 +461,7 @@ test('AIP requires final human review, a verified release and separate activatio
     assert.equal(verified.status, 'verified');
     assert.equal(activated.length, 0);
     service.close();
-    service = createAips(
-      f.config,
-      (skill) => {
-        activated.push(skill);
-      },
-      f.fetchImpl,
-    );
+    service = createAips(f.config, activate, f.fetchImpl);
     f.state.assetId++;
     await assert.rejects(run('activate', target), /verified release changed/);
     f.state.assetId--;
@@ -436,10 +497,7 @@ test('legacy pending adoption remains blocked and adopted data stays intact thro
   const f = fixture();
   let service = createAips(f.config, undefined, f.fetchImpl);
   try {
-    service.saveSettings({
-      repo: 'example/knowledge',
-      token: 'dummy-github-token',
-    });
+    service.saveSettings(githubSettings);
     const draftRecord = JSON.parse(
       await service.execute(
         'rove_aip_stage',
@@ -521,10 +579,7 @@ test('PR files and final content cannot change outside the reviewed package', as
   const run = (name: string, args: unknown) =>
     service.execute(`rove_aip_${name}`, args, revision(service), 'web:one');
   try {
-    service.saveSettings({
-      repo: 'example/knowledge',
-      token: 'dummy-github-token',
-    });
+    service.saveSettings(githubSettings);
     const created = JSON.parse(await run('stage', draft));
     const target = { id: created.id };
     await run('publish', target);
@@ -544,10 +599,7 @@ test('an unknown GitHub outcome remains blocked after restart and cannot duplica
   const f = fixture();
   let service = createAips(f.config, undefined, f.fetchImpl);
   try {
-    service.saveSettings({
-      repo: 'example/knowledge',
-      token: 'dummy-github-token',
-    });
+    service.saveSettings(githubSettings);
     const created = JSON.parse(
       await service.execute(
         'rove_aip_stage',
@@ -607,10 +659,7 @@ test('AIP skill, scope storage, and GitHub response bounds fail before writes', 
     return new Response('x'.repeat(256001));
   });
   try {
-    service.saveSettings({
-      repo: 'example/knowledge',
-      token: 'dummy-github-token',
-    });
+    service.saveSettings(githubSettings);
     await assert.rejects(
       service.execute(
         'rove_aip_stage',
@@ -620,6 +669,19 @@ test('AIP skill, scope storage, and GitHub response bounds fail before writes', 
       ),
     );
     assert.equal(service.list('web:one').length, 0);
+    for (const pluginPackage of [
+      { ...nativePackage, id: 'wrong' },
+      { ...nativePackage, version: '2.0.0' },
+      { ...nativePackage, execution: { runtime: 'host', source: 'unsafe' } },
+    ])
+      await assert.rejects(
+        service.execute(
+          'rove_aip_stage',
+          { ...draft, pluginPackage },
+          revision(service),
+          'web:one',
+        ),
+      );
     for (let index = 0; index < 100; index++) {
       await service.execute(
         'rove_aip_stage',
@@ -755,15 +817,8 @@ test('conversation approvals activate a real immutable plugin and cannot be bypa
       apiKey: 'dummy-model-key',
       systemPrompt: '',
     });
-    service.saveSettings({
-      repo: 'example/knowledge',
-      token: 'dummy-github-token',
-    });
-    plugins.saveSource({
-      repo: 'example/knowledge',
-      approved: true,
-      token: 'dummy-github-token',
-    });
+    service.saveSettings(githubSettings);
+    plugins.saveSource({ ...githubSettings, approved: true });
     const conversation = chat.create();
     const other = chat.create();
     const scope = `web:${conversation.id}`;
@@ -786,7 +841,26 @@ test('conversation approvals activate a real immutable plugin and cannot be bypa
       assert.equal(result.pending, undefined);
       return result;
     }
-    let pending = await propose('stage', draft);
+    await assert.rejects(
+      propose('stage', oversizedDraft),
+      /model provider did not return a text answer/,
+    );
+    assert.equal(service.list(scope).length, 0);
+    assert.equal(f.calls.length, 0);
+    let pending = await propose('stage', {
+      ...draft,
+      pluginPackage: {
+        ...nativePackage,
+        category: 'agent',
+        execution: undefined,
+        operations: [],
+        capabilities: [],
+        skills: [{ name: draft.skillName, markdown: draft.skillContent }],
+        settings: [
+          { key: 'tone', label: 'Tone', type: 'text', required: true },
+        ],
+      },
+    });
     assert.equal(service.list(scope).length, 0);
     assert.equal(f.calls.length, 0);
     await approve(pending);
@@ -837,6 +911,22 @@ test('conversation approvals activate a real immutable plugin and cannot be bypa
       plugins.activate(dashboardActivation),
       /originating conversation/,
     );
+    await assert.rejects(
+      service.execute(
+        'rove_aip_activate',
+        target,
+        revision(service, scope),
+        scope,
+      ),
+      /required setting/,
+    );
+    assert.equal(plugins.list().installations[0]?.active, null);
+    plugins.configure({
+      ...dashboardActivation,
+      values: { tone: 'Concise' },
+      secrets: {},
+      grants: [],
+    });
     pending = await propose('activate', target);
     assert.equal(plugins.list().installations[0]?.active, null);
     await assert.rejects(

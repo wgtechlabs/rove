@@ -30,7 +30,11 @@ test('an optional channel initialization failure leaves setup, admin and web cha
     DatabaseSync.prototype,
     'exec',
     function (this: DatabaseSync, sql: string) {
-      if (fail && sql.includes('rove_slack_job'))
+      if (
+        fail &&
+        (sql.includes('rove_slack_job') ||
+          sql.includes('rove_plugin_channel_job'))
+      )
         throw new Error(
           'Simulated failure containing private provider details',
         );
@@ -66,6 +70,13 @@ test('an optional channel initialization failure leaves setup, admin and web cha
     health: { state: string; message: string };
   };
   assert.equal(unavailable.health.state, 'failed');
+  const installation = '00000000-0000-4000-8000-000000000001';
+  const installed = await request(`/api/admin/plugins/${installation}/channel`);
+  assert.deepEqual(await installed.json(), { state: 'failed', jobs: [] });
+  assert.equal(
+    (await request(`/api/channels/${installation}/events`, {})).status,
+    503,
+  );
   assert.equal(
     JSON.stringify(unavailable).includes('private provider details'),
     false,

@@ -839,6 +839,16 @@ test('HTTP ingress admits signed large Slack interactions while preserving route
     assert.ok(Buffer.byteLength(raw) < MAX_SLACK_BODY);
     const send = (path: string, body: string, headers: Headers) =>
       fetchHTTP(base + path, { method: 'POST', headers, body });
+    const installedPath =
+      '/api/channels/00000000-0000-4000-8000-000000000001/events';
+    assert.equal(
+      (await send(installedPath, 'x'.repeat(40000), request.headers)).status,
+      404, // Reaches the gateway, which rejects the inactive installation.
+    );
+    assert.equal(
+      (await send(installedPath, 'x'.repeat(65537), request.headers)).status,
+      413,
+    );
     assert.equal(
       (await send('/api/slack/interactivity', raw, request.headers)).status,
       200,

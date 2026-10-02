@@ -442,6 +442,7 @@ export function mountManage(root, api, run, back) {
         field,
         submit,
         api,
+        run,
         selectedVersions,
         change(path, body, message) {
           return run(async () => {
