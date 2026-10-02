@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import { DatabaseSync } from 'node:sqlite';
 import {
   type ConnectOptions,
   type CreateOptions,
@@ -9,7 +8,7 @@ import {
   SandboxNotFoundError,
 } from 'railway';
 import { HttpError } from './auth.js';
-import type { Config } from './config.js';
+import type { RuntimeConfig } from './runtime.js';
 import {
   SANDBOX_COMMAND,
   SANDBOX_OUTPUT_BYTES,
@@ -73,24 +72,19 @@ function abortable<T>(promise: PromiseLike<T>, signal: AbortSignal) {
 }
 
 /** Fresh owned VMs for fixed smoke checks and guarded offline plugin execution. */
-export function createRailwayRuntime(
-  config: Config,
+export async function createRailwayRuntime(
+  config: RuntimeConfig,
   env: NodeJS.ProcessEnv = process.env,
   sdk: Sdk = Sandbox,
   fetchImplementation: typeof fetch = fetch,
 ) {
-  const db = new DatabaseSync(config.databasePath);
-  try {
-    db.exec(`PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;
-      CREATE TABLE IF NOT EXISTS rove_sandbox_run (
-        id TEXT PRIMARY KEY, environment_id TEXT NOT NULL,
-        sandbox_id TEXT, state TEXT NOT NULL, deadline INTEGER NOT NULL,
-        created_at INTEGER NOT NULL, outcome TEXT NOT NULL DEFAULT 'uncertain'
-      )`);
-  } catch (error) {
-    db.close();
-    throw error;
-  }
+  const db = config.db;
+  await db.migrate(`
+    CREATE TABLE IF NOT EXISTS rove_sandbox_run (
+      id TEXT PRIMARY KEY, environment_id TEXT NOT NULL,
+      sandbox_id TEXT, state TEXT NOT NULL, deadline BIGINT NOT NULL,
+      created_at BIGINT NOT NULL, outcome TEXT NOT NULL DEFAULT 'uncertain'
+    )`);
   const environmentId =
     env.ROVE_SANDBOX_ENVIRONMENT_ID || env.RAILWAY_ENVIRONMENT_ID || '';
   const choice = env.ROVE_RAILWAY_AUTH_TYPE;
@@ -111,15 +105,14 @@ export function createRailwayRuntime(
   let closed = false;
   let closing: Promise<void> | undefined;
 
-  function pending() {
-    return db
-      .prepare(
-        "SELECT * FROM rove_sandbox_run WHERE state != 'complete' ORDER BY created_at",
-      )
-      .all() as Run[];
+  async function pending() {
+    return (await db.all(
+      "SELECT * FROM rove_sandbox_run WHERE state != 'complete' ORDER BY created_at",
+      [],
+    )) as Run[];
   }
 
-  function status() {
+  async function status() {
     return {
       provider: 'railway',
       configured,
@@ -134,12 +127,12 @@ export function createRailwayRuntime(
         'Each invocation requires Linux namespaces, delegated cgroup v2 limits, and a minimal Node runtime; missing capabilities reject execution.',
         'Plugins run offline without credentials. External actions use separately approved MCP tools.',
       ],
-      pendingCleanup: pending().map((row) => ({
+      pendingCleanup: (await pending()).map((row) => ({
         id: row.id,
         environmentId: row.environment_id,
         sandboxId: row.sandbox_id,
         state: row.state,
-        deadline: row.deadline,
+        deadline: Number(row.deadline),
       })),
     };
   }
@@ -147,7 +140,7 @@ export function createRailwayRuntime(
   function connection(
     environment: string,
     signal?: AbortSignal,
-    recordId?: string,
+    record?: Run,
   ): ConnectOptions {
     return {
       token,
@@ -164,9 +157,7 @@ export function createRailwayRuntime(
         // create request; guest cgroups independently enforce tighter limits.
         let body = init?.body;
         const creating =
-          recordId &&
-          typeof body === 'string' &&
-          body.includes('sandboxCreate');
+          record && typeof body === 'string' && body.includes('sandboxCreate');
         if (creating) {
           const request = JSON.parse(body as string);
           request.variables.input.resources = { cpu: 1, memoryGB: 2 };
@@ -185,9 +176,11 @@ export function createRailwayRuntime(
           };
           const id = body.data?.sandboxCreate?.id;
           if (typeof id === 'string' && /^[a-zA-Z0-9-]{1,128}$/.test(id)) {
-            db.prepare(
-              'UPDATE rove_sandbox_run SET sandbox_id = ?, state = ? WHERE id = ?',
-            ).run(id, 'cleanup', recordId);
+            record.sandbox_id = id;
+            await db.run(
+              'UPDATE rove_sandbox_run SET sandbox_id = $1, state = $2 WHERE id = $3',
+              [id, 'cleanup', record.id],
+            );
           }
         }
         return response;
@@ -196,15 +189,23 @@ export function createRailwayRuntime(
   }
 
   async function destroy(row: Run) {
+    const recordState = async (state: Run['state']) => {
+      if (config.state.signal.aborted) return;
+      try {
+        await db.run('UPDATE rove_sandbox_run SET state = $1 WHERE id = $2', [
+          state,
+          row.id,
+        ]);
+      } catch (error) {
+        // An old owner may clean up its exact VM, but cannot write deployment state.
+        if (!config.state.signal.aborted) throw error;
+      }
+    };
     if (!row.sandbox_id) {
-      db.prepare(
-        "UPDATE rove_sandbox_run SET state = 'unknown' WHERE id = ?",
-      ).run(row.id);
+      await recordState('unknown');
       return false;
     }
-    db.prepare(
-      "UPDATE rove_sandbox_run SET state = 'cleanup' WHERE id = ?",
-    ).run(row.id);
+    await recordState('cleanup');
     try {
       const vm = await abortable(
         sdk.connect(row.sandbox_id, connection(row.environment_id)),
@@ -221,9 +222,7 @@ export function createRailwayRuntime(
     } catch (error) {
       if (!(error instanceof SandboxNotFoundError)) return false;
     }
-    db.prepare(
-      "UPDATE rove_sandbox_run SET state = 'complete' WHERE id = ?",
-    ).run(row.id);
+    await recordState('complete');
     return true;
   }
 
@@ -232,7 +231,7 @@ export function createRailwayRuntime(
     if (reconciling) return reconciling;
     reconciling = (async () => {
       // Never resume commands: even a failed response may have produced an external effect.
-      for (const row of pending()) await destroy(row);
+      for (const row of await pending()) await destroy(row);
     })();
     try {
       await reconciling;
@@ -244,30 +243,45 @@ export function createRailwayRuntime(
   async function perform(script: string | undefined, signal?: AbortSignal) {
     const runId = randomUUID();
     const deadline = Date.now() + DEADLINE_MS;
+    const record: Run = {
+      id: runId,
+      environment_id: environmentId,
+      sandbox_id: null,
+      state: 'creating',
+      deadline,
+    };
     const bound = AbortSignal.any([
       controller?.signal || AbortSignal.abort(),
       AbortSignal.timeout(DEADLINE_MS),
+      config.state.signal,
       ...(signal ? [signal] : []),
     ]);
     bound.throwIfAborted();
-    db.prepare(
-      'INSERT INTO rove_sandbox_run (id, environment_id, state, deadline, created_at) VALUES (?, ?, ?, ?, ?)',
-    ).run(runId, environmentId, 'creating', deadline, Date.now());
+    await db.run(
+      'INSERT INTO rove_sandbox_run (id, environment_id, state, deadline, created_at) VALUES ($1, $2, $3, $4, $5)',
+      [runId, environmentId, 'creating', deadline, Date.now()],
+    );
     let vm: Instance | undefined;
     let command: Command | undefined;
     let failure: unknown;
     let output = '';
+    let dispatched = false;
     try {
+      await config.state.assertOwned();
+      bound.throwIfAborted();
       // The SDK uses the abort-aware fetch for creation and each readiness poll.
+      dispatched = true;
       vm = await sdk.create({
-        ...connection(environmentId, bound, runId),
+        ...connection(environmentId, bound, record),
         networkIsolation: 'ISOLATED',
         idleTimeoutMinutes: 1,
         env: { ROVE_SMOKE_RUN_ID: runId },
       });
-      db.prepare(
-        "UPDATE rove_sandbox_run SET sandbox_id = ?, state = 'cleanup' WHERE id = ?",
-      ).run(vm.id, runId);
+      record.sandbox_id = vm.id;
+      await db.run(
+        "UPDATE rove_sandbox_run SET sandbox_id = $1, state = 'cleanup' WHERE id = $2",
+        [vm.id, runId],
+      );
       if (vm.networkIsolation !== 'ISOLATED')
         throw new Error('Unexpected network mode.');
       if (script) {
@@ -308,9 +322,10 @@ export function createRailwayRuntime(
             : 'Sandbox smoke failed.',
         );
       if (script) output = sandboxResult(result.stdout);
-      db.prepare(
-        "UPDATE rove_sandbox_run SET outcome = 'passed' WHERE id = ?",
-      ).run(runId);
+      await db.run(
+        "UPDATE rove_sandbox_run SET outcome = 'passed' WHERE id = $1",
+        [runId],
+      );
     } catch (error) {
       failure =
         error instanceof HttpError
@@ -321,15 +336,19 @@ export function createRailwayRuntime(
             );
       if (command) void command.kill('KILL').catch(() => {});
     } finally {
-      const row = db
-        .prepare('SELECT * FROM rove_sandbox_run WHERE id = ?')
-        .get(runId) as Run;
-      // A fresh connection has a separate deadline: cancellation must not cancel cleanup.
-      if (!(await destroy(row)))
-        failure = new HttpError(
-          503,
-          'Sandbox cleanup is pending. No new sandbox will be created until it is resolved.',
+      if (!dispatched)
+        await db.run(
+          "UPDATE rove_sandbox_run SET state = 'complete', outcome = 'cancelled' WHERE id = $1",
+          [runId],
         );
+      else {
+        // A fresh connection has a separate deadline: cancellation must not cancel cleanup.
+        if (!(await destroy(record)))
+          failure = new HttpError(
+            503,
+            'Sandbox cleanup is pending. No new sandbox will be created until it is resolved.',
+          );
+      }
     }
     if (failure) throw failure;
     return { runId, status: 'passed' as const, output };
@@ -343,13 +362,25 @@ export function createRailwayRuntime(
         'Configure a Railway environment and one explicit credential mode first.',
       );
     // ponytail: one lifecycle operation at a time; use per-invocation leases for multiple core instances.
-    if (active || reconciling || pending().length)
+    if (active || reconciling)
       throw new HttpError(
         409,
         'A sandbox operation or cleanup is already pending.',
       );
     controller = new AbortController();
-    active = perform(script, signal);
+    active = (async () => {
+      await config.state.assertOwned();
+      const remaining = await pending();
+      if (closed) throw new HttpError(503, 'Sandbox service is closed.');
+      config.state.signal.throwIfAborted();
+      signal?.throwIfAborted();
+      if (remaining.length)
+        throw new HttpError(
+          409,
+          'A sandbox operation or cleanup is already pending.',
+        );
+      return perform(script, signal);
+    })();
     try {
       return await active;
     } finally {
@@ -372,7 +403,7 @@ export function createRailwayRuntime(
     if (closing) return closing;
     closed = true;
     controller?.abort();
-    closing = Promise.allSettled([active, reconciling]).then(() => db.close());
+    closing = Promise.allSettled([active, reconciling]).then(() => {});
     return closing;
   }
 

@@ -2,7 +2,9 @@ export interface Config {
   baseURL: string;
   authSecret: string;
   setupSecret?: string;
-  databasePath: string;
+  databaseURL: string;
+  redisURL: string;
+  redisPrefix: string;
 }
 
 export function readConfig(env = process.env): Config {
@@ -29,10 +31,28 @@ export function readConfig(env = process.env): Config {
       'Use a separate random ROVE_SETUP_SECRET of at least 32 characters.',
     );
   }
+  function connection(name: string, protocols: string[]) {
+    const value = env[name];
+    try {
+      if (value && protocols.includes(new URL(value).protocol)) return value;
+    } catch {}
+    throw new Error(
+      `Set ${name} to a valid ${protocols.join(' or ')} connection URL.`,
+    );
+  }
+  const databaseURL = connection('DATABASE_URL', ['postgres:', 'postgresql:']);
+  const redisURL = connection('REDIS_URL', ['redis:', 'rediss:']);
+  const redisPrefix = env.ROVE_STATE_KEY_PREFIX || 'rove';
+  if (!/^[a-zA-Z0-9:_-]{1,100}$/.test(redisPrefix))
+    throw new Error(
+      'ROVE_STATE_KEY_PREFIX must contain 1–100 letters, numbers, colons, underscores or hyphens.',
+    );
   return {
     baseURL,
     authSecret,
     setupSecret,
-    databasePath: env.ROVE_DATABASE_PATH || './data/rove.sqlite',
+    databaseURL,
+    redisURL,
+    redisPrefix,
   };
 }

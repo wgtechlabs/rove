@@ -6,12 +6,14 @@
 [Build Flow Action](https://github.com/wgtechlabs/build-flow-action) to run CI,
 Release Build Flow Action and Container Build Flow Action together.
 
-- Pushes and PRs targeting `dev` or `main` run Biome, shell
-  syntax checks, type checking, integration tests, a production build, Gitleaks, and the Docker
-  smoke test (including persistent login and graceful shutdown).
+- Pushes and PRs targeting `dev` or `main` run Biome,
+  type checking, integration tests, a production build, Gitleaks, and the Docker
+  smoke test. CI starts PostgreSQL 17 with pgvector and Redis 7 before integration
+  tests. The isolated three-service smoke test verifies pgvector availability,
+  saved login and chat after storage restarts, and graceful shutdown.
 - Only pushes to `main` can publish. Clean Commit history determines the release
   version. The flow updates `package.json` and `CHANGELOG.md` and creates the tag,
-  builds and publishes `wgtechlabs/rove` to Docker Hub for Linux AMD64 and ARM64,
+  builds and publishes `wgtechlabs/rove` to Docker Hub and GHCR for Linux AMD64 and ARM64,
   then publishes the GitHub Release after the image succeeds. A failed image
   build or push can leave the version commit and tag without a GitHub Release.
 - PR, `dev` and manual runs validate without publishing. npm publishing

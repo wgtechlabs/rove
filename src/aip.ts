@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { DatabaseSync } from 'node:sqlite';
 import { z } from 'zod';
 import {
   decodedFile,
@@ -11,8 +10,9 @@ import {
   workflowPathSchema,
 } from './aip-release.js';
 import { HttpError } from './auth.js';
-import type { Config } from './config.js';
+import type { Sql } from './database.js';
 import { parsePackage, pluginPackage } from './plugin-manifest.js';
+import type { RuntimeConfig } from './runtime.js';
 import { createSecrets } from './secrets.js';
 
 const proposal = z
@@ -144,45 +144,31 @@ function parseStage(value: unknown) {
 }
 
 /** Keep source-scoped proposals and require separate final review, release verification and activation. */
-export function createAips(
-  config: Config,
+export async function createAips(
+  config: RuntimeConfig,
   onActivate?: (skill: ReleasedSkill) => void | Promise<void>,
   fetchImpl: typeof fetch = fetch,
 ) {
   const secrets = createSecrets(config.authSecret);
-  const db = new DatabaseSync(config.databasePath);
-  try {
-    db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;
-      CREATE TABLE IF NOT EXISTS rove_github (
-        singleton INTEGER PRIMARY KEY CHECK(singleton=1), repo TEXT NOT NULL, token TEXT NOT NULL, version TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS rove_aip (
-        id TEXT PRIMARY KEY, scope TEXT NOT NULL, data TEXT NOT NULL
-      );`);
-    if (
-      !db
-        .prepare('PRAGMA table_info(rove_github)')
-        .all()
-        .some((column) => column.name === 'workflow_path')
-    ) {
-      db.exec(
-        "ALTER TABLE rove_github ADD COLUMN workflow_path TEXT NOT NULL DEFAULT '.github/workflows/plugin-release.yml'",
-      );
-    }
-  } catch (error) {
-    db.close();
-    throw error;
-  }
+  const db = config.db;
+  await db.migrate(`
+    CREATE TABLE IF NOT EXISTS rove_github (
+      singleton INTEGER PRIMARY KEY CHECK(singleton=1), repo TEXT NOT NULL, token TEXT NOT NULL, version TEXT NOT NULL,
+      workflow_path TEXT NOT NULL DEFAULT '.github/workflows/plugin-release.yml'
+    );
+    CREATE TABLE IF NOT EXISTS rove_aip (
+      id TEXT PRIMARY KEY, scope TEXT NOT NULL, data TEXT NOT NULL, sequence BIGINT GENERATED ALWAYS AS IDENTITY
+    );`);
   // ponytail: one in-flight AIP operation per process; use durable worker leases before multiple replicas.
   let busy = false;
   let closed = false;
   let active: AbortController | undefined;
 
-  function saved() {
-    return db.prepare('SELECT * FROM rove_github WHERE singleton=1').get();
+  async function saved() {
+    return await db.get('SELECT * FROM rove_github WHERE singleton=1', []);
   }
-  function settings() {
-    const row = saved();
+  async function settings() {
+    const row = await saved();
     return {
       repo: row ? String(row.repo) : '',
       configured: Boolean(row?.token),
@@ -191,54 +177,67 @@ export function createAips(
         : '.github/workflows/plugin-release.yml',
     };
   }
-  function saveSettings(body: unknown) {
+  async function saveSettings(body: unknown) {
     if (busy)
       throw new HttpError(
         409,
         'Wait for the active AIP operation before changing GitHub settings.',
       );
-    const input = parse(settingsInput, body);
-    const existing = saved();
-    if (
-      /[\r\n]/.test(input.token ?? '') ||
-      (!input.token && (!existing?.token || existing.repo !== input.repo))
-    ) {
-      throw new HttpError(
-        400,
-        'Enter a GitHub token. Changing the repository requires a new token.',
+    busy = true;
+    try {
+      const input = parse(settingsInput, body);
+      const existing = await saved();
+      if (
+        /[\r\n]/.test(input.token ?? '') ||
+        (!input.token && (!existing?.token || existing.repo !== input.repo))
+      ) {
+        throw new HttpError(
+          400,
+          'Enter a GitHub token. Changing the repository requires a new token.',
+        );
+      }
+      await db.run(
+        `INSERT INTO rove_github(singleton,repo,token,version,workflow_path) VALUES(1,$1,$2,$3,$4) ON CONFLICT(singleton) DO UPDATE SET
+      repo=excluded.repo, token=excluded.token, version=excluded.version, workflow_path=excluded.workflow_path`,
+        [
+          input.repo,
+          input.token ? secrets.encrypt(input.token) : String(existing?.token),
+          randomUUID(),
+          input.workflowPath ??
+            String(
+              existing?.workflow_path ?? '.github/workflows/plugin-release.yml',
+            ),
+        ],
       );
+      return await settings();
+    } finally {
+      busy = false;
     }
-    db.prepare(`INSERT INTO rove_github(singleton,repo,token,version,workflow_path) VALUES(1,?,?,?,?) ON CONFLICT(singleton) DO UPDATE SET
-      repo=excluded.repo, token=excluded.token, version=excluded.version, workflow_path=excluded.workflow_path`).run(
-      input.repo,
-      input.token ? secrets.encrypt(input.token) : String(existing?.token),
-      randomUUID(),
-      input.workflowPath ??
-        String(
-          existing?.workflow_path ?? '.github/workflows/plugin-release.yml',
-        ),
+  }
+  async function list(scope: string): Promise<Aip[]> {
+    return (
+      await db.all(
+        'SELECT data FROM rove_aip WHERE scope=$1 ORDER BY sequence DESC',
+        [scope],
+      )
+    ).map((row) => JSON.parse(String(row.data)) as Aip);
+  }
+  async function write(record: Aip) {
+    await db.run(
+      'INSERT INTO rove_aip(id,scope,data) VALUES($1,$2,$3) ON CONFLICT(id) DO UPDATE SET data=excluded.data',
+      [record.id, record.scope, JSON.stringify(record)],
     );
-    return settings();
   }
-  function list(scope: string): Aip[] {
-    return db
-      .prepare('SELECT data FROM rove_aip WHERE scope=? ORDER BY rowid DESC')
-      .all(scope)
-      .map((row) => JSON.parse(String(row.data)) as Aip);
-  }
-  function write(record: Aip) {
-    db.prepare(
-      'INSERT INTO rove_aip VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data',
-    ).run(record.id, record.scope, JSON.stringify(record));
-  }
-  function revision(scope: string) {
+  async function revision(scope: string) {
     return createHash('sha256')
-      .update(JSON.stringify([saved()?.version ?? '', list(scope)]))
+      .update(
+        JSON.stringify([(await saved())?.version ?? '', await list(scope)]),
+      )
       .digest('hex');
   }
-  function tools(scope: string, _actor?: string) {
-    if (!settings().configured) return [];
-    const current = revision(scope);
+  async function tools(scope: string, _actor?: string) {
+    if (!(await settings()).configured) return [];
+    const current = await revision(scope);
     return [
       {
         name: 'rove_aip_stage',
@@ -294,22 +293,26 @@ export function createAips(
       })),
     ];
   }
-  function get(scope: string, id: string) {
-    const record = list(scope).find((item) => item.id === id);
+  async function get(scope: string, id: string) {
+    const record = (await list(scope)).find((item) => item.id === id);
     if (!record)
       throw new HttpError(404, 'AIP not found in this conversation.');
     return record;
   }
 
-  function preview(name: string, args: unknown, scope: string): string {
+  async function preview(
+    name: string,
+    args: unknown,
+    scope: string,
+  ): Promise<string> {
     if (name === 'rove_aip_stage')
       return JSON.stringify({ tool: name, ...parseStage(args) });
     const input = target(name, args);
     return JSON.stringify({
       action: name,
-      destination: settings().repo,
+      destination: (await settings()).repo,
       request: input,
-      proposal: get(scope, input.id),
+      proposal: await get(scope, input.id),
     });
   }
   function target(name: string, args: unknown) {
@@ -340,201 +343,207 @@ export function createAips(
         409,
         'Another AIP operation is running. Try again after it finishes.',
       );
-    if (signal?.aborted)
-      throw new HttpError(409, 'The AIP operation was cancelled.');
-    if (!settings().configured || expectedRevision !== revision(scope)) {
-      throw new HttpError(
-        409,
-        'The proposal or GitHub settings changed. Review it and approve a new tool call.',
-      );
-    }
-    if (name === 'rove_aip_stage') {
-      const input = parseStage(args);
-      if (input.action === 'draft') {
-        const { action: _action, ...content } = input;
-        const existing = list(scope).find(
-          (item) =>
-            item.status === 'draft' &&
-            item.skillName === content.skillName &&
-            item.packageVersion === content.packageVersion &&
-            item.skillContent === content.skillContent &&
-            JSON.stringify(item.pluginPackage) ===
-              JSON.stringify(content.pluginPackage),
+    busy = true;
+    try {
+      if (signal?.aborted)
+        throw new HttpError(409, 'The AIP operation was cancelled.');
+      if (
+        !(await settings()).configured ||
+        expectedRevision !== (await revision(scope))
+      ) {
+        throw new HttpError(
+          409,
+          'The proposal or GitHub settings changed. Review it and approve a new tool call.',
         );
-        if (existing)
-          return JSON.stringify({ ...existing, alreadyExists: true });
-        if (list(scope).length >= 100)
+      }
+      if (name === 'rove_aip_stage') {
+        const input = parseStage(args);
+        if (input.action === 'draft') {
+          const { action: _action, ...content } = input;
+          const existing = (await list(scope)).find(
+            (item) =>
+              item.status === 'draft' &&
+              item.skillName === content.skillName &&
+              item.packageVersion === content.packageVersion &&
+              item.skillContent === content.skillContent &&
+              JSON.stringify(item.pluginPackage) ===
+                JSON.stringify(content.pluginPackage),
+          );
+          if (existing)
+            return JSON.stringify({ ...existing, alreadyExists: true });
+          if ((await list(scope)).length >= 100)
+            throw new HttpError(
+              409,
+              'This conversation has reached 100 AIPs. Start a new conversation.',
+            );
+          const record: Aip = {
+            ...content,
+            id: randomUUID(),
+            scope,
+            version: 1,
+            status: 'draft',
+            updatedAt: Date.now(),
+          };
+          await write(record);
+          return JSON.stringify(record);
+        }
+        const record = await get(scope, input.id);
+        if (record.status !== 'draft')
           throw new HttpError(
             409,
-            'This conversation has reached 100 AIPs. Start a new conversation.',
+            'Only an unpublished draft can be revised or cancelled.',
           );
-        const record: Aip = {
-          ...content,
-          id: randomUUID(),
-          scope,
-          version: 1,
-          status: 'draft',
-          updatedAt: Date.now(),
-        };
-        write(record);
+        if (input.action === 'cancel') record.status = 'cancelled';
+        else {
+          const { action: _action, id: _id, ...content } = input;
+          delete record.pluginPackage;
+          Object.assign(record, content);
+        }
+        record.version++;
+        record.updatedAt = Date.now();
+        await write(record);
         return JSON.stringify(record);
       }
-      const record = get(scope, input.id);
-      if (record.status !== 'draft')
+      const input = target(name, args);
+      const record = await get(scope, input.id);
+      const row = await saved();
+      const repo = String(row?.repo);
+      const token = secrets.decrypt(String(row?.token));
+      if (record.repo && record.repo !== repo)
         throw new HttpError(
           409,
-          'Only an unpublished draft can be revised or cancelled.',
+          'Restore this AIP’s GitHub repository settings before continuing.',
         );
-      if (input.action === 'cancel') record.status = 'cancelled';
-      else {
-        const { action: _action, id: _id, ...content } = input;
-        delete record.pluginPackage;
-        Object.assign(record, content);
-      }
-      record.version++;
-      record.updatedAt = Date.now();
-      write(record);
-      return JSON.stringify(record);
-    }
-    const input = target(name, args);
-    const record = get(scope, input.id);
-    const row = saved();
-    const repo = String(row?.repo);
-    const token = secrets.decrypt(String(row?.token));
-    if (record.repo && record.repo !== repo)
-      throw new HttpError(
-        409,
-        'Restore this AIP’s GitHub repository settings before continuing.',
-      );
-    busy = true;
-    active = new AbortController();
-    const combined = AbortSignal.any([
-      active.signal,
-      AbortSignal.timeout(60000),
-      ...(signal ? [signal] : []),
-    ]);
-    const client = githubClient(repo, token, combined, fetchImpl);
-    const github = client.object;
-    try {
-      if (name === 'rove_aip_publish')
-        return JSON.stringify(await publish(record, repo, github));
-      if (record.status === 'adopted' || record.status === 'activated') {
-        if (name === 'rove_aip_activate') return JSON.stringify(record);
-        throw new HttpError(
-          409,
-          'This proposal is already active. Create a new proposal to change it.',
-        );
-      }
-      if (
-        ![
-          'published',
-          'adopting',
-          'reviewed',
-          'verified',
-          'activating',
-        ].includes(record.status)
-      )
-        throw new HttpError(
-          409,
-          'Publish this AIP before reviewing its release.',
-        );
-      const head = await inspect(record, client);
-      if (name === 'rove_aip_inspect') {
-        if (record.candidateHead !== head.sha) {
-          record.candidateHead = head.sha;
-          delete record.review;
-          delete record.release;
-          record.status = 'published';
+      active = new AbortController();
+      const combined = AbortSignal.any([
+        active.signal,
+        config.state.signal,
+        AbortSignal.timeout(60000),
+        ...(signal ? [signal] : []),
+      ]);
+      const client = githubClient(repo, token, combined, fetchImpl);
+      const github = client.object;
+      try {
+        if (name === 'rove_aip_publish')
+          return JSON.stringify(await publish(record, repo, github));
+        if (record.status === 'adopted' || record.status === 'activated') {
+          if (name === 'rove_aip_activate') return JSON.stringify(record);
+          throw new HttpError(
+            409,
+            'This proposal is already active. Create a new proposal to change it.',
+          );
         }
-      } else if (name === 'rove_aip_review') {
-        const requested = parse(reviewInput, input);
         if (
-          requested.headSha !== record.candidateHead ||
-          requested.headSha !== head.sha
+          ![
+            'published',
+            'adopting',
+            'reviewed',
+            'verified',
+            'activating',
+          ].includes(record.status)
         )
           throw new HttpError(
             409,
-            'Inspect the current PR head before reviewing its exact revision.',
+            'Publish this AIP before reviewing its release.',
           );
-        record.review = { headSha: head.sha, reviewedAt: Date.now() };
-        delete record.release;
-        record.status = 'reviewed';
-      } else {
-        if (!record.review || record.review.headSha !== head.sha)
-          throw new HttpError(
-            409,
-            'The final PR revision needs fresh human review before release verification or activation.',
-          );
-        if (!head.mergeCommit)
-          throw new HttpError(
-            409,
-            'The reviewed pull request is not verified as merged.',
-          );
-        const tag =
-          name === 'rove_aip_verify_release'
-            ? parse(releaseInput, input).tag
-            : record.release?.tag;
-        if (!tag)
-          throw new HttpError(
-            409,
-            'Verify a release before requesting separate activation.',
-          );
-        const release = await loadRelease(
-          {
-            repo,
-            token,
-            tag,
-            expectedCommit: head.mergeCommit,
-            workflowPath: settings().workflowPath,
-            signal: combined,
-          },
-          fetchImpl,
-        );
-        if (release.bytes !== packageBytes(record))
-          throw new HttpError(
-            409,
-            'The released package differs from the human-reviewed proposal.',
-          );
-        if (name === 'rove_aip_verify_release') {
-          const { manifest: _manifest, bytes: _bytes, ...identity } = release;
-          record.release = identity;
-          record.mergeCommit = release.commit;
-          record.status = 'verified';
-        } else {
+        const head = await inspect(record, client);
+        if (name === 'rove_aip_inspect') {
+          if (record.candidateHead !== head.sha) {
+            record.candidateHead = head.sha;
+            delete record.review;
+            delete record.release;
+            record.status = 'published';
+          }
+        } else if (name === 'rove_aip_review') {
+          const requested = parse(reviewInput, input);
           if (
-            !record.release ||
-            !['verified', 'activating'].includes(record.status) ||
-            release.digest !== record.release.digest ||
-            release.assetId !== record.release.assetId ||
-            release.commit !== record.release.commit
+            requested.headSha !== record.candidateHead ||
+            requested.headSha !== head.sha
           )
             throw new HttpError(
               409,
-              'The verified release changed. Verify it again and approve a new activation.',
+              'Inspect the current PR head before reviewing its exact revision.',
             );
-          if (!onActivate)
-            throw new HttpError(503, 'Release activation is not available.');
-          record.status = 'activating';
-          write(record);
-          // The registry must make this idempotent by pinned release identity across crash recovery.
-          await onActivate({
-            id: record.id,
-            name: record.skillName,
-            content: record.skillContent,
-            enabled: true,
-            release,
-          });
-          record.status = 'activated';
+          record.review = { headSha: head.sha, reviewedAt: Date.now() };
+          delete record.release;
+          record.status = 'reviewed';
+        } else {
+          if (!record.review || record.review.headSha !== head.sha)
+            throw new HttpError(
+              409,
+              'The final PR revision needs fresh human review before release verification or activation.',
+            );
+          if (!head.mergeCommit)
+            throw new HttpError(
+              409,
+              'The reviewed pull request is not verified as merged.',
+            );
+          const tag =
+            name === 'rove_aip_verify_release'
+              ? parse(releaseInput, input).tag
+              : record.release?.tag;
+          if (!tag)
+            throw new HttpError(
+              409,
+              'Verify a release before requesting separate activation.',
+            );
+          const release = await loadRelease(
+            {
+              repo,
+              token,
+              tag,
+              expectedCommit: head.mergeCommit,
+              workflowPath: (await settings()).workflowPath,
+              signal: combined,
+            },
+            fetchImpl,
+          );
+          if (release.bytes !== packageBytes(record))
+            throw new HttpError(
+              409,
+              'The released package differs from the human-reviewed proposal.',
+            );
+          if (name === 'rove_aip_verify_release') {
+            const { manifest: _manifest, bytes: _bytes, ...identity } = release;
+            record.release = identity;
+            record.mergeCommit = release.commit;
+            record.status = 'verified';
+          } else {
+            if (
+              !record.release ||
+              !['verified', 'activating'].includes(record.status) ||
+              release.digest !== record.release.digest ||
+              release.assetId !== record.release.assetId ||
+              release.commit !== record.release.commit
+            )
+              throw new HttpError(
+                409,
+                'The verified release changed. Verify it again and approve a new activation.',
+              );
+            if (!onActivate)
+              throw new HttpError(503, 'Release activation is not available.');
+            record.status = 'activating';
+            await write(record);
+            // The registry must make this idempotent by pinned release identity across crash recovery.
+            await onActivate({
+              id: record.id,
+              name: record.skillName,
+              content: record.skillContent,
+              enabled: true,
+              release,
+            });
+            record.status = 'activated';
+          }
         }
+        record.updatedAt = Date.now();
+        record.version++;
+        await write(record);
+        return JSON.stringify(record);
+      } finally {
+        active = undefined;
       }
-      record.updatedAt = Date.now();
-      record.version++;
-      write(record);
-      return JSON.stringify(record);
     } finally {
       busy = false;
-      active = undefined;
-      if (closed) db.close();
     }
   }
 
@@ -580,7 +589,7 @@ export function createAips(
     record.branch = `rove/aip-${record.id}`;
     record.status = 'publishing';
     record.updatedAt = Date.now();
-    write(record); // Persist the identity before the first remote mutation; ambiguous failures never auto-replay.
+    await write(record); // Persist the identity before the first remote mutation; ambiguous failures never auto-replay.
     try {
       const blob = await github('/git/blobs', {
         content: record.skillContent,
@@ -638,12 +647,12 @@ export function createAips(
       record.url = url;
       record.status = 'published';
       record.updatedAt = Date.now();
-      write(record);
+      await write(record);
       return record;
     } catch (failure) {
       record.status = 'uncertain';
       record.updatedAt = Date.now();
-      write(record);
+      await write(record);
       throw failure;
     }
   }
@@ -741,7 +750,56 @@ export function createAips(
       if (closed) return;
       closed = true;
       active?.abort();
-      if (!busy) db.close();
     },
   };
+}
+
+export async function requireAipRelease(
+  db: Sql,
+  release: VerifiedRelease,
+  aipId?: string,
+) {
+  if (
+    !(await db.get(
+      "SELECT 1 FROM information_schema.tables WHERE table_schema=current_schema() AND table_name='rove_aip'",
+      [],
+    ))
+  )
+    return;
+  const related = await db.all(
+    `SELECT data FROM rove_aip WHERE lower(data::jsonb->>'repo')=$1
+    AND data::jsonb->>'skillName'=$2 AND coalesce(data::jsonb->>'packageVersion','1.0.0')=$3`,
+    [release.repo.toLowerCase(), release.manifest.id, release.manifest.version],
+  );
+  if (!related.length) return;
+  const proposals = related.map(
+    (row) =>
+      JSON.parse(String(row.data)) as {
+        id: string;
+        status: string;
+        review?: { headSha: string };
+        candidateHead?: string;
+        release?: { digest: string; commit: string; assetId: number };
+      },
+  );
+  const permitted = proposals.some((proposal) => {
+    const pinned =
+      proposal.release?.digest === release.digest &&
+      proposal.release.commit === release.commit &&
+      proposal.release.assetId === release.assetId;
+    return (
+      pinned &&
+      (aipId
+        ? aipId === proposal.id &&
+          proposal.status === 'activating' &&
+          typeof proposal.candidateHead === 'string' &&
+          proposal.review?.headSha === proposal.candidateHead
+        : proposal.status === 'activated')
+    );
+  });
+  if (!permitted)
+    throw new HttpError(
+      409,
+      'This package belongs to an AIP. Complete its final review, release verification and activation in the originating conversation.',
+    );
 }

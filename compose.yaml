@@ -1,0 +1,48 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: rove
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rove}
+      POSTGRES_DB: rove
+    ports:
+      - "127.0.0.1:54329:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U rove -d rove"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "127.0.0.1:6389:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  rove:
+    build: .
+    profiles: [app]
+    environment:
+      ROVE_URL: ${ROVE_URL:-http://localhost:3000}
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-}
+      ROVE_SETUP_SECRET: ${ROVE_SETUP_SECRET:-}
+      DATABASE_URL: postgres://rove:${POSTGRES_PASSWORD:-rove}@postgres:5432/rove
+      REDIS_URL: redis://redis:6379
+      ROVE_STATE_KEY_PREFIX: ${ROVE_STATE_KEY_PREFIX:-rove}
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+volumes:
+  postgres-data:
+  redis-data:

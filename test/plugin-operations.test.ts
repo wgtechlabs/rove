@@ -1,15 +1,12 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
 import { type TestContext, test } from 'node:test';
 import { createChat } from '../src/chat.js';
 import { createExtensions } from '../src/extensions.js';
 import { parsePackage } from '../src/plugin-manifest.js';
 import type { PluginRuntime } from '../src/plugin-operations.js';
 import { createPlugins } from '../src/plugins.js';
+import { testRuntime } from './storage.js';
 
 const repo = 'example/company-operations';
 const signal = () => AbortSignal.timeout(5000);
@@ -60,12 +57,11 @@ const packageInput = (version = '1.0.0') => ({
   capabilities: ['execute:offline'],
 });
 
-function fixture(t: TestContext) {
-  const dir = mkdtempSync(join(tmpdir(), 'rove-operations-'));
+async function fixture(t: TestContext) {
   const config = {
+    ...(await testRuntime(t)),
     baseURL: 'http://localhost:3000',
     authSecret: 'test-operation-auth-secret-'.repeat(3),
-    databasePath: join(dir, 'rove.sqlite'),
   };
   const calls: Parameters<PluginRuntime['execute']>[0][] = [];
   const state = {
@@ -118,34 +114,39 @@ function fixture(t: TestContext) {
       return new Response(state.bytes);
     assert.fail(`Unexpected request ${url}`);
   };
-  let extensions = createExtensions(config);
-  let plugins = createPlugins(config, extensions, fetchImpl, env, runtime);
-  const makeChat = () =>
-    createChat(config, {
-      instructions: () => extensions.instructions(),
+  let extensions = await createExtensions(config);
+  let plugins = await createPlugins(
+    config,
+    extensions,
+    fetchImpl,
+    env,
+    runtime,
+  );
+  const makeChat = async () =>
+    await createChat(config, {
+      instructions: async () => await extensions.instructions(),
       tools: (_scope, signal) => plugins.tools(signal),
-      preview: (name, args) => plugins.preview(name, args),
+      preview: async (name, args) => await plugins.preview(name, args),
       execute: (name, args, revision, _scope, signal) =>
         plugins.execute(name, args, revision, signal),
     });
-  let chat = makeChat();
+  let chat = await makeChat();
   t.after(() => {
     chat.close();
     plugins.close();
     extensions.close();
-    rmSync(dir, { recursive: true, force: true });
   });
-  const current = () => {
-    const item = plugins.list().installations[0];
+  const current = async () => {
+    const item = (await plugins.list()).installations[0];
     assert.ok(item);
     return item;
   };
-  function configure(
+  async function configure(
     values: Record<string, string | boolean> = {},
     grants = ['execute:offline'],
   ) {
-    const item = current();
-    plugins.configure({
+    const item = await current();
+    await plugins.configure({
       id: item.id,
       revision: item.revision,
       digest: item.versions[0]?.digest,
@@ -177,42 +178,52 @@ function fixture(t: TestContext) {
     configure,
     async install(pkg: unknown = packageInput()) {
       state.bytes = JSON.stringify(pkg);
-      plugins.saveSource({ repo, approved: true });
+      await plugins.saveSource({ repo, approved: true });
       await plugins.install({
         repo,
         tag: `v${(pkg as { version: string }).version}`,
       });
     },
-    async activate(digest = current().versions[0]?.digest) {
-      const item = current();
-      await plugins.activate({ id: item.id, revision: item.revision, digest });
+    async activate(digest?: string) {
+      const item = await current();
+      await plugins.activate({
+        id: item.id,
+        revision: item.revision,
+        digest: digest ?? item.versions[0]?.digest,
+      });
     },
-    restart() {
+    async restart() {
       chat.close();
       plugins.close();
       extensions.close();
-      extensions = createExtensions(config);
-      plugins = createPlugins(config, extensions, fetchImpl, env, runtime);
-      chat = makeChat();
+      extensions = await createExtensions(config);
+      plugins = await createPlugins(
+        config,
+        extensions,
+        fetchImpl,
+        env,
+        runtime,
+      );
+      chat = await makeChat();
     },
   };
 }
 
 test('released actions execute once through persisted chat approval without a model and pass no credentials', async (t) => {
-  const f = fixture(t);
+  const f = await fixture(t);
   await f.install();
   await assert.rejects(f.activate(), /Grant/);
-  f.configure();
+  await f.configure();
   await f.activate();
   const tool = (await f.plugins.tools(signal()))[0];
   assert.ok(tool);
   assert.match(tool.name, /^rove_plugin_[a-f0-9]{40}$/);
   assert.deepEqual(tool.surfaces, ['tool', 'action', 'step']);
-  const contribution = f.plugins.contributions().plugins[0];
+  const contribution = (await f.plugins.contributions()).plugins[0];
   assert.equal(contribution?.actions[0]?.name, tool.name);
   assert.deepEqual(contribution?.pages[0]?.actions, [tool.name]);
-  assert.equal(f.chat.settings().configured, false);
-  const conversation = f.chat.create();
+  assert.equal((await f.chat.settings()).configured, false);
+  const conversation = await f.chat.create();
   const request = {
     name: tool.name,
     revision: tool.revision,
@@ -223,7 +234,7 @@ test('released actions execute once through persisted chat approval without a mo
   assert.equal(f.calls.length, 0);
   assert.equal(waiting.pending?.status, 'waiting');
   assert.match(waiting.pending?.detail ?? '', /Offline custom code/);
-  f.restart();
+  await f.restart();
   const decision = { approvalId: waiting.pending?.id, decision: 'approve' };
   const done = await f.chat.decide(conversation.id, decision);
   assert.match(done.messages.at(-1)?.content ?? '', /Approved data/);
@@ -243,17 +254,17 @@ test('released actions execute once through persisted chat approval without a mo
 });
 
 test('schema, runtime configuration and lifecycle revisions prevent stale or unauthorized dispatch', async (t) => {
-  const f = fixture(t);
+  const f = await fixture(t);
   await f.install();
-  f.configure();
+  await f.configure();
   f.state.configured = false;
   await assert.rejects(f.activate(), /Configure Railway/);
-  assert.equal(f.plugins.list().executable.available, false);
+  assert.equal((await f.plugins.list()).executable.available, false);
   f.state.configured = true;
   await f.activate();
   const original = (await f.plugins.tools(signal()))[0];
   assert.ok(original);
-  const oldDigest = f.current().active;
+  const oldDigest = (await f.current()).active;
   assert.ok(oldDigest);
   for (const input of [{ text: 4 }, { text: 'ok', extra: true }, {}])
     await assert.rejects(
@@ -261,7 +272,7 @@ test('schema, runtime configuration and lifecycle revisions prevent stale or una
       /input schema/,
     );
   assert.equal(f.calls.length, 0);
-  const conversation = f.chat.create();
+  const conversation = await f.chat.create();
   const pending = await f.chat.requestAction(conversation.id, {
     name: original.name,
     revision: original.revision,
@@ -269,7 +280,7 @@ test('schema, runtime configuration and lifecycle revisions prevent stale or una
     requestId: randomUUID(),
   });
   f.state.environmentId = 'different-environment';
-  f.restart();
+  await f.restart();
   await assert.rejects(
     f.chat.decide(conversation.id, {
       approvalId: pending.pending?.id,
@@ -279,8 +290,8 @@ test('schema, runtime configuration and lifecycle revisions prevent stale or una
   );
   assert.equal(f.calls.length, 0);
   f.state.environmentId = 'first-environment';
-  f.restart();
-  f.configure({ tone: 'detailed' });
+  await f.restart();
+  await f.configure({ tone: 'detailed' });
   await f.activate();
   await assert.rejects(
     f.chat.decide(conversation.id, {
@@ -313,7 +324,7 @@ test('schema, runtime configuration and lifecycle revisions prevent stale or una
   );
   assert.equal(f.calls.at(-1)?.source, packageInput('2.0.0').execution.source);
   await f.activate(oldDigest);
-  f.restart();
+  await f.restart();
   const restored = (await f.plugins.tools(signal()))[0];
   assert.ok(restored);
   await f.plugins.execute(
@@ -329,19 +340,19 @@ test('schema, runtime configuration and lifecycle revisions prevent stale or una
     f.plugins.execute(restored.name, {}, restored.revision, signal()),
     /no longer enabled/,
   );
-  f.restart();
-  assert.equal(f.current().active, null);
+  await f.restart();
+  assert.equal((await f.current()).active, null);
   await f.activate();
-  f.plugins.saveSource({ repo, approved: false });
-  assert.deepEqual(f.plugins.contributions(), { plugins: [] });
+  await f.plugins.saveSource({ repo, approved: false });
+  assert.deepEqual(await f.plugins.contributions(), { plugins: [] });
   assert.deepEqual(await f.plugins.tools(signal()), []);
   assert.equal(f.calls.length, 2);
 });
 
 test('in-flight calls block configuration, release and source changes, and shutdown aborts dispatch', async (t) => {
-  const f = fixture(t);
+  const f = await fixture(t);
   await f.install();
-  f.configure();
+  await f.configure();
   await f.activate();
   const tool = (await f.plugins.tools(signal()))[0];
   assert.ok(tool);
@@ -367,16 +378,16 @@ test('in-flight calls block configuration, release and source changes, and shutd
     signal(),
   );
   await begun;
-  assert.throws(() => f.configure(), /current plugin call/);
-  assert.throws(
-    () => f.plugins.saveSource({ repo, approved: false }),
+  await assert.rejects(async () => await f.configure(), /current plugin call/);
+  await assert.rejects(
+    async () => await f.plugins.saveSource({ repo, approved: false }),
     /current plugin call/,
   );
-  assert.throws(
-    () =>
-      f.plugins.deactivate({
-        id: f.current().id,
-        revision: f.current().revision,
+  await assert.rejects(
+    async () =>
+      await f.plugins.deactivate({
+        id: (await f.current()).id,
+        revision: (await f.current()).revision,
       }),
     /current plugin call/,
   );
@@ -395,7 +406,7 @@ test('in-flight calls block configuration, release and source changes, and shutd
 });
 
 test('static pages need no runtime and plugin operations share the MCP tool ceiling', async (t) => {
-  const f = fixture(t);
+  const f = await fixture(t);
   const staticPage = {
     ...packageInput(),
     execution: undefined,
@@ -409,57 +420,55 @@ test('static pages need no runtime and plugin operations share the MCP tool ceil
   f.state.configured = false;
   await f.install(staticPage);
   await f.activate();
-  assert.equal(f.plugins.contributions().plugins[0]?.pages[0]?.title, 'Policy');
+  assert.equal(
+    (await f.plugins.contributions()).plugins[0]?.pages[0]?.title,
+    'Policy',
+  );
   assert.deepEqual(await f.plugins.tools(signal()), []);
   f.state.configured = true;
   await f.install(packageInput('2.0.0'));
-  f.configure();
-  const server = f.extensions.save({
-    kind: 'server',
-    name: 'Configured MCP',
-    url: 'https://tools.example/mcp',
-    enabled: false,
-  }).servers[0];
+  await f.configure();
+  const server = (
+    await f.extensions.save({
+      kind: 'server',
+      name: 'Configured MCP',
+      url: 'https://tools.example/mcp',
+      enabled: false,
+    })
+  ).servers[0];
   assert.ok(server);
-  const db = new DatabaseSync(f.config.databasePath);
-  try {
-    const row = db
-      .prepare('SELECT data FROM rove_extension WHERE id=?')
-      .get(server.id);
-    assert.ok(row);
-    db.prepare('UPDATE rove_extension SET data=?,tools=? WHERE id=?').run(
-      JSON.stringify({ ...JSON.parse(String(row.data)), enabled: true }),
-      JSON.stringify(
-        Array.from({ length: 32 }, (_, index) => ({
-          name: `tool_${index}`,
-          inputSchema: { type: 'object' },
-        })),
-      ),
-      server.id,
-    );
-    await assert.rejects(f.activate(), /at most 32 MCP and plugin/);
-    assert.equal(f.current().active, null);
-    db.prepare('UPDATE rove_extension SET tools=? WHERE id=?').run(
-      '[]',
-      server.id,
-    );
-    await f.activate();
-    assert.equal((await f.plugins.tools(signal())).length, 1);
-    db.prepare('UPDATE rove_extension SET tools=? WHERE id=?').run(
-      JSON.stringify(
-        Array.from({ length: 32 }, (_, index) => ({
-          name: `tool_${index}`,
-          inputSchema: { type: 'object' },
-        })),
-      ),
-      server.id,
-    );
-    await assert.rejects(
-      f.plugins.tools(signal()),
-      /at most 32 MCP and plugin/,
-    );
-  } finally {
-    db.close();
-  }
+  const db = f.config.db;
+  const row = await db.get('SELECT data FROM rove_extension WHERE id=$1', [
+    server.id,
+  ]);
+  assert.ok(row);
+  await db.run('UPDATE rove_extension SET data=$1,tools=$2 WHERE id=$3', [
+    JSON.stringify({ ...JSON.parse(String(row.data)), enabled: true }),
+    JSON.stringify(
+      Array.from({ length: 32 }, (_, index) => ({
+        name: `tool_${index}`,
+        inputSchema: { type: 'object' },
+      })),
+    ),
+    server.id,
+  ]);
+  await assert.rejects(f.activate(), /at most 32 MCP and plugin/);
+  assert.equal((await f.current()).active, null);
+  await db.run('UPDATE rove_extension SET tools=$1 WHERE id=$2', [
+    '[]',
+    server.id,
+  ]);
+  await f.activate();
+  assert.equal((await f.plugins.tools(signal())).length, 1);
+  await db.run('UPDATE rove_extension SET tools=$1 WHERE id=$2', [
+    JSON.stringify(
+      Array.from({ length: 32 }, (_, index) => ({
+        name: `tool_${index}`,
+        inputSchema: { type: 'object' },
+      })),
+    ),
+    server.id,
+  ]);
+  await assert.rejects(f.plugins.tools(signal()), /at most 32 MCP and plugin/);
   assert.equal(parsePackage(staticPage).operations.length, 0);
 });

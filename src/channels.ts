@@ -1,16 +1,17 @@
 import { HttpError } from './auth.js';
-import type { Config } from './config.js';
+import type { RuntimeConfig } from './runtime.js';
 import { createSlack } from './slack.js';
 
 // Version 1 admits only core-bundled, provider-verified HTTP ingress. It does
 // not load downloaded adapters or accept caller-supplied actors/scopes.
 export const CHANNEL_API_VERSION = 1;
 
-export function createChannels(
-  config: Config,
+export async function createChannels(
+  config: RuntimeConfig,
   chat: Parameters<typeof createSlack>[1],
 ) {
-  let slack: ReturnType<typeof createSlack> | undefined;
+  let slack: Awaited<ReturnType<typeof createSlack>> | undefined;
+  let initializing: Promise<void> | undefined;
   let retiring: Promise<void> | undefined;
   let failed = false;
   let stopping = false;
@@ -48,15 +49,29 @@ export function createChannels(
         retiring = undefined;
       });
   }
-  function initialize() {
-    if (stopping || slack || retiring) return;
+  async function initialize() {
+    if (stopping || retiring) return;
+    if (initializing) return initializing;
+    if (slack) return;
+    initializing = (async () => {
+      try {
+        const next = await createSlack(config, chat, fail);
+        if (stopping) {
+          await next.close();
+          return;
+        }
+        slack = next;
+        await slack.settings();
+        if (started) slack.start();
+        failed = false;
+      } catch {
+        fail();
+      }
+    })();
     try {
-      slack = createSlack(config, chat, fail);
-      slack.settings();
-      if (started) slack.start();
-      failed = false;
-    } catch {
-      fail();
+      await initializing;
+    } finally {
+      initializing = undefined;
     }
   }
   function requireChannel(channel: string) {
@@ -68,10 +83,10 @@ export function createChannels(
       throw new HttpError(503, 'Slack is temporarily unavailable.');
     return slack;
   }
-  function settings(channel = 'slack') {
+  async function settings(channel = 'slack') {
     requireChannel(channel);
     try {
-      if (slack) return { ...slack.settings(), health: status() };
+      if (slack) return { ...(await slack.settings()), health: status() };
     } catch {
       fail();
     }
@@ -88,11 +103,10 @@ export function createChannels(
       health: status(),
     };
   }
-  initialize();
+  await initialize();
   return {
     start() {
       started = true;
-      initialize();
       slack?.start();
     },
     status,
@@ -100,10 +114,10 @@ export function createChannels(
     async save(body: Record<string, unknown>, channel = 'slack') {
       requireChannel(channel);
       await retiring;
-      initialize();
+      await initialize();
       try {
         await available().save(body);
-        return settings(channel);
+        return await settings(channel);
       } catch (error) {
         if (error instanceof HttpError) throw error;
         fail();
@@ -135,6 +149,7 @@ export function createChannels(
     },
     async close() {
       stopping = true;
+      await initializing;
       const previous = slack;
       slack = undefined;
       await previous?.close().catch(() => {

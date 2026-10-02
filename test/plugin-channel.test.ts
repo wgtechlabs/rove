@@ -1,13 +1,9 @@
 import assert from 'node:assert/strict';
 import { createHmac, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
-import { mkdtempSync, rmSync } from 'node:fs';
 import { createServer, request as httpRequest } from 'node:http';
 import https from 'node:https';
 import { syncBuiltinESMExports } from 'node:module';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
 import { type TestContext, test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { HttpError } from '../src/auth.js';
@@ -18,6 +14,7 @@ import {
   channelSpec,
   createPluginChannels,
 } from '../src/plugin-channel.js';
+import { testRuntime } from './storage.js';
 
 const origin = 'https://rove.example';
 const spec = channelSpec.parse({
@@ -88,20 +85,17 @@ function signed(
     body: raw,
   });
 }
-async function until(predicate: () => boolean) {
+async function until(predicate: () => boolean | Promise<boolean>) {
   for (let n = 0; n < 120; n++) {
-    if (predicate()) return;
+    if (await predicate()) return;
     await delay(20);
   }
   assert.fail('Timed out waiting for installed channel processing.');
 }
 async function fixture(t: TestContext, realChat = false) {
-  const dir = mkdtempSync(join(tmpdir(), 'rove-plugin-channel-'));
-  const config = {
-    baseURL: origin,
-    authSecret: 'local-test-auth-secret-at-least-32-characters',
-    databasePath: join(dir, 'rove.sqlite'),
-  };
+  let cleanup: (() => Promise<void>) | undefined;
+  t.after(() => cleanup?.());
+  const config = await testRuntime(t);
   const posts: Record<string, unknown>[] = [];
   let deliveryStatus = 200;
   let dropDelivery = false;
@@ -194,8 +188,8 @@ async function fixture(t: TestContext, realChat = false) {
     ['one', structuredClone(initial)],
     ['two', structuredClone(initial)],
   ]);
-  type Conversation = ReturnType<
-    Parameters<typeof createPluginChannels>[1]['get']
+  type Conversation = Awaited<
+    ReturnType<Parameters<typeof createPluginChannels>[1]['get']>
   >;
   const conversations = new Map<string, Conversation>();
   const scopes = new Map<string, string>();
@@ -205,13 +199,13 @@ async function fixture(t: TestContext, realChat = false) {
   let releaseSend: (() => void) | undefined;
   let blockedSend: Promise<void> | undefined;
   const fakeChat = {
-    create(scope = 'web') {
+    async create(scope = 'web') {
       const id = randomUUID();
       scopes.set(id, scope);
       conversations.set(id, { messages: [] });
       return { id };
     },
-    get(id: string, scope = 'web') {
+    async get(id: string, scope = 'web') {
       assert.equal(scopes.get(id), scope);
       const value = conversations.get(id);
       assert.ok(value);
@@ -220,7 +214,7 @@ async function fixture(t: TestContext, realChat = false) {
     async send(id: string, body: Record<string, unknown>, scope = 'web') {
       sends.push({ scope, content: body.content });
       await blockedSend;
-      const conversation = fakeChat.get(id, scope);
+      const conversation = await fakeChat.get(id, scope);
       conversation.messages.push({
         role: 'assistant',
         content: 'Controlled answer.',
@@ -239,7 +233,7 @@ async function fixture(t: TestContext, realChat = false) {
       body: { approvalId: string; decision: 'approve' | 'deny' },
       scope = 'web',
     ) {
-      const conversation = fakeChat.get(id, scope);
+      const conversation = await fakeChat.get(id, scope);
       assert.equal(body.approvalId, conversation.pending?.id);
       decisions.push(body.decision);
       delete conversation.pending;
@@ -247,7 +241,7 @@ async function fixture(t: TestContext, realChat = false) {
     },
   };
   const actualChat = realChat
-    ? createChat(config, {
+    ? await createChat(config, {
         instructions: () => '',
         tools: async () =>
           modelTools
@@ -270,32 +264,30 @@ async function fixture(t: TestContext, realChat = false) {
         },
       })
     : undefined;
-  actualChat?.saveSettings({
+  await actualChat?.saveSettings({
     baseURL: `${providerURL}/v1`,
     model: 'local-model',
     apiKey: 'fake-model-key',
     systemPrompt: '',
   });
   const makeGateway = () =>
-    createPluginChannels(config, actualChat || fakeChat, (id) =>
+    createPluginChannels(config, actualChat || fakeChat, async (id) =>
       snapshots.get(id),
     );
-  let gateway = makeGateway();
-  const database = new DatabaseSync(config.databasePath);
-  t.after(async () => {
+  let gateway = await makeGateway();
+  const database = config.db;
+  cleanup = async () => {
     releaseSend?.();
     releaseDelivery?.();
     releaseModel?.();
     actualChat?.cancelPending();
     await gateway.close();
     actualChat?.close();
-    database.close();
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     t.mock.restoreAll();
     syncBuiltinESMExports();
-    rmSync(dir, { recursive: true, force: true });
-  });
+  };
   return {
     get gateway() {
       return gateway;
@@ -328,10 +320,10 @@ async function fixture(t: TestContext, realChat = false) {
     get toolExecutions() {
       return toolExecutions;
     },
-    jobs() {
-      return database
-        .prepare('SELECT * FROM rove_plugin_channel_job ORDER BY sequence')
-        .all();
+    async jobs() {
+      return await database.all(
+        'SELECT * FROM rove_plugin_channel_job ORDER BY sequence',
+      );
     },
     setPending() {
       pending = true;
@@ -360,14 +352,14 @@ async function fixture(t: TestContext, realChat = false) {
     },
     async restart() {
       await gateway.close();
-      gateway = makeGateway();
+      gateway = await makeGateway();
     },
     async simulateCrashPhase(phase: string) {
       await gateway.close();
-      database
-        .prepare('UPDATE rove_plugin_channel_job SET status=?')
-        .run(phase);
-      gateway = makeGateway();
+      await database.run('UPDATE rove_plugin_channel_job SET status=$1', [
+        phase,
+      ]);
+      gateway = await makeGateway();
     },
   };
 }
@@ -424,32 +416,40 @@ test('channel manifests admit only bounded data bindings and dashboard access ru
 test('signed messages use the actual core chat and local model, deduplicate, and isolate installations', async (t) => {
   const f = await fixture(t, true);
   const input = event({ scope: 'web', verified: true, role: 'admin' });
-  assert.equal((await f.gateway.handle(signed(input), 'one')).status, 202);
-  assert.equal((await f.gateway.handle(signed(input), 'one')).status, 200);
+  const admissions = await Promise.all(
+    Array.from({ length: 8 }, () => f.gateway.handle(signed(input), 'one')),
+  );
+  assert.deepEqual(
+    admissions.map((response) => response.status).sort(),
+    [200, 200, 200, 200, 200, 200, 200, 202],
+  );
   assert.equal(
     f.modelCalls,
     0,
     'ingress must acknowledge without running the model',
   );
   f.gateway.start();
-  await until(() => f.jobs()[0]?.status === 'sent');
+  await until(async () => (await f.jobs())[0]?.status === 'sent');
   assert.deepEqual(f.posts[0], {
     room: 'room',
     thread: 'thread',
     text: 'Local model answer 1.',
   });
   assert.equal(f.modelCalls, 1);
-  assert.equal(f.actualChat?.list().length, 0);
+  assert.equal((await f.actualChat?.list())?.length, 0);
   assert.equal((await f.gateway.handle(signed(input), 'two')).status, 202);
-  await until(() => f.jobs()[1]?.status === 'sent');
-  assert.notEqual(f.jobs()[0]?.scope, f.jobs()[1]?.scope);
-  assert.notEqual(f.jobs()[0]?.conversation, f.jobs()[1]?.conversation);
-  assert.throws(
-    () =>
-      f.actualChat?.get(
-        String(f.jobs()[0]?.conversation),
-        String(f.jobs()[1]?.scope),
-      ),
+  await until(async () => (await f.jobs())[1]?.status === 'sent');
+  assert.notEqual((await f.jobs())[0]?.scope, (await f.jobs())[1]?.scope);
+  assert.notEqual(
+    (await f.jobs())[0]?.conversation,
+    (await f.jobs())[1]?.conversation,
+  );
+  assert.ok(f.actualChat);
+  await assert.rejects(
+    f.actualChat.get(
+      String((await f.jobs())[0]?.conversation),
+      String((await f.jobs())[1]?.scope),
+    ),
     status(404),
   );
   await f.restart();
@@ -462,25 +462,28 @@ test('accepted channel messages wait for a busy web model call and then deliver 
   const f = await fixture(t, true);
   assert.ok(f.actualChat);
   f.blockModel();
-  const web = f.actualChat.create();
+  const web = await f.actualChat.create();
   const webReply = f.actualChat.send(web.id, {
     content: 'Hold the shared model while a channel message arrives.',
     requestId: randomUUID(),
   });
-  await until(() => f.modelCalls === 1);
+  await until(async () => f.modelCalls === 1);
   const input = event();
   assert.equal((await f.gateway.handle(signed(input), 'one')).status, 202);
   f.gateway.start();
-  await until(() => Boolean(f.jobs()[0]?.conversation));
-  assert.equal(f.jobs()[0]?.status, 'pending');
-  assert.equal(f.jobs()[0]?.content, input.text);
-  assert.ok(f.jobs()[0]?.snapshot);
+  let queued: Record<string, unknown> | undefined;
+  await until(async () => {
+    queued = (await f.jobs())[0];
+    return Boolean(queued?.conversation) && queued?.status === 'pending';
+  });
+  assert.equal(queued?.content, input.text);
+  assert.ok(queued?.snapshot);
   assert.equal(f.modelCalls, 1);
   assert.equal(f.posts.length, 0);
 
   f.releaseModel();
   await webReply;
-  await until(() => f.jobs()[0]?.status === 'sent');
+  await until(async () => (await f.jobs())[0]?.status === 'sent');
   assert.equal(f.modelCalls, 2);
   assert.equal(f.posts.length, 1);
   assert.equal(f.posts[0]?.text, 'Local model answer 2.');
@@ -521,7 +524,7 @@ test('forged signatures, timestamps, tenant, actor, destinations and administrat
     f.gateway.handle(signed(event()), 'unknown'),
     status(404),
   );
-  assert.equal(f.jobs().length, 0);
+  assert.equal((await f.jobs()).length, 0);
 });
 
 test('only dashboard administrators can decide approvals in their installation and thread', async (t) => {
@@ -529,8 +532,10 @@ test('only dashboard administrators can decide approvals in their installation a
   f.setPending();
   f.gateway.start();
   await f.gateway.handle(signed(event()), 'one');
-  await until(() => f.jobs()[0]?.status === 'sent');
-  const conversation = f.conversations.get(String(f.jobs()[0]?.conversation));
+  await until(async () => (await f.jobs())[0]?.status === 'sent');
+  const conversation = f.conversations.get(
+    String((await f.jobs())[0]?.conversation),
+  );
   assert.ok(conversation?.pending);
   const approval = conversation.pending.id;
   await assert.rejects(
@@ -555,18 +560,17 @@ test('only dashboard administrators can decide approvals in their installation a
     ),
     'one',
   );
-  await until(
-    () =>
-      f.jobs().length === 3 &&
-      f
-        .jobs()
-        .slice(1)
-        .every((job) => job.status === 'cancelled'),
-  );
+  await until(async () => {
+    const jobs = await f.jobs();
+    return (
+      jobs.length === 3 &&
+      jobs.slice(1).every((job) => job.status === 'cancelled')
+    );
+  });
   assert.deepEqual(f.decisions, []);
   const decision = event({ actor: 'admin', approval, decision: 'approve' });
   await f.gateway.handle(signed(decision), 'one');
-  await until(() => f.jobs()[3]?.status === 'sent');
+  await until(async () => (await f.jobs())[3]?.status === 'sent');
   assert.deepEqual(f.decisions, ['approve']);
   assert.equal((await f.gateway.handle(signed(decision), 'one')).status, 200);
   assert.deepEqual(f.decisions, ['approve']);
@@ -579,14 +583,14 @@ test('configuration snapshots cancel queued work and revoke delivery after a run
   assert.ok(first);
   first.revision = randomUUID();
   f.gateway.start();
-  await until(() => f.jobs()[0]?.status === 'cancelled');
+  await until(async () => (await f.jobs())[0]?.status === 'cancelled');
   assert.equal(f.sends.length, 0);
   f.blockSend();
   await f.gateway.handle(signed(event()), 'one');
-  await until(() => f.sends.length === 1);
+  await until(async () => f.sends.length === 1);
   f.snapshots.delete('one');
   f.releaseSend();
-  await until(() => f.jobs()[1]?.status === 'cancelled');
+  await until(async () => (await f.jobs())[1]?.status === 'cancelled');
   assert.equal(f.posts.length, 0);
 });
 
@@ -596,7 +600,7 @@ test('uncertain dispatch is durable and neither webhook retries nor restarts rep
   f.gateway.start();
   const input = event();
   await f.gateway.handle(signed(input), 'one');
-  await until(() => f.jobs()[0]?.status === 'uncertain');
+  await until(async () => (await f.jobs())[0]?.status === 'uncertain');
   assert.equal(f.posts.length, 1);
   await f.restart();
   f.gateway.start();
@@ -604,7 +608,7 @@ test('uncertain dispatch is durable and neither webhook retries nor restarts rep
   await delay(150);
   assert.equal(f.posts.length, 1);
   assert.equal(f.sends.length, 1);
-  assert.equal(f.jobs()[0]?.snapshot, '');
+  assert.equal((await f.jobs())[0]?.snapshot, '');
 });
 
 test('restart seals both unfinished core execution and unfinished delivery as uncertain', async (t) => {
@@ -612,10 +616,10 @@ test('restart seals both unfinished core execution and unfinished delivery as un
   const input = event();
   await f.gateway.handle(signed(input), 'one');
   await f.simulateCrashPhase('processing');
-  assert.equal(f.jobs()[0]?.status, 'uncertain');
+  assert.equal((await f.jobs())[0]?.status, 'uncertain');
   await f.simulateCrashPhase('delivering');
   f.gateway.start();
-  assert.equal(f.jobs()[0]?.status, 'uncertain');
+  assert.equal((await f.jobs())[0]?.status, 'uncertain');
   assert.equal((await f.gateway.handle(signed(input), 'one')).status, 200);
   await delay(150);
   assert.equal(f.sends.length, 0);
@@ -629,12 +633,12 @@ test('private endpoints are rejected and delivery redirects are never followed',
   assert.ok(state);
   state.spec.outgoing.url = 'https://127.0.0.1/private';
   await f.gateway.handle(signed(event(), state), 'one');
-  await until(() => f.jobs()[0]?.status === 'failed');
+  await until(async () => (await f.jobs())[0]?.status === 'failed');
   assert.equal(f.posts.length, 0);
   state.spec.outgoing.url = spec.outgoing.url;
   f.setDeliveryStatus(302);
   await f.gateway.handle(signed(event(), state), 'one');
-  await until(() => f.jobs()[1]?.status === 'uncertain');
+  await until(async () => (await f.jobs())[1]?.status === 'uncertain');
   assert.equal(f.posts.length, 1);
 });
 
@@ -643,10 +647,10 @@ test('shutdown aborts in-flight delivery and closes without replaying its uncert
   f.blockDelivery();
   f.gateway.start();
   await f.gateway.handle(signed(event()), 'one');
-  await until(() => f.posts.length === 1);
+  await until(async () => f.posts.length === 1);
   await f.gateway.close();
   f.releaseDelivery();
-  assert.equal(f.jobs()[0]?.status, 'uncertain');
+  assert.equal((await f.jobs())[0]?.status, 'uncertain');
   await assert.rejects(f.gateway.handle(signed(event()), 'one'), status(503));
 });
 
@@ -655,10 +659,10 @@ test('actual core approvals execute once and administrator continuation does not
   f.setModelTools();
   f.gateway.start();
   await f.gateway.handle(signed(event()), 'one');
-  await until(() => f.jobs()[0]?.status === 'sent');
-  const job = f.jobs()[0];
+  await until(async () => (await f.jobs())[0]?.status === 'sent');
+  const job = (await f.jobs())[0];
   assert.ok(job);
-  const conversation = f.actualChat?.get(
+  const conversation = await f.actualChat?.get(
     String(job.conversation),
     String(job.scope),
   );
@@ -675,14 +679,14 @@ test('actual core approvals execute once and administrator continuation does not
   f.failContinuation();
   const approved = event({ approval, decision: 'approve', actor: 'admin' });
   await f.gateway.handle(signed(approved), 'one');
-  await until(() => f.jobs()[1]?.status === 'sent');
+  await until(async () => (await f.jobs())[1]?.status === 'sent');
   assert.match(String(f.posts[1]?.text), /Tool outcome saved/);
   assert.match(String(f.posts[1]?.text), new RegExp(approval));
   assert.match(String(f.posts[1]?.text), /decision resume/);
   assert.equal(f.toolExecutions, 1);
   assert.equal(
-    f.actualChat?.get(String(job.conversation), String(job.scope)).pending
-      ?.status,
+    (await f.actualChat?.get(String(job.conversation), String(job.scope)))
+      ?.pending?.status,
     'ready',
   );
   assert.equal((await f.gateway.handle(signed(approved), 'one')).status, 200);
@@ -690,10 +694,11 @@ test('actual core approvals execute once and administrator continuation does not
     signed(event({ approval, decision: 'resume', actor: 'admin' })),
     'one',
   );
-  await until(() => f.jobs()[2]?.status === 'sent');
+  await until(async () => (await f.jobs())[2]?.status === 'sent');
   assert.equal(f.toolExecutions, 1);
   assert.equal(
-    f.actualChat?.get(String(job.conversation), String(job.scope)).pending,
+    (await f.actualChat?.get(String(job.conversation), String(job.scope)))
+      ?.pending,
     undefined,
   );
 });
@@ -718,30 +723,26 @@ test('revocation while the signed body is arriving rejects the event before pers
   finish?.enqueue(Buffer.from(raw));
   finish?.close();
   await assert.rejects(pending, status(409));
-  assert.equal(f.jobs().length, 0);
+  assert.equal((await f.jobs()).length, 0);
 });
 
 test('a worker storage failure stops installed ingress while core web conversations remain usable', async (t) => {
   const f = await fixture(t, true);
-  const prepare = DatabaseSync.prototype.prepare;
-  t.mock.method(
-    DatabaseSync.prototype,
-    'prepare',
-    function (this: DatabaseSync, sql: string) {
-      if (sql.includes('SELECT * FROM rove_plugin_channel_job WHERE status IN'))
-        throw new Error('Private internal storage details');
-      return prepare.call(this, sql);
-    },
-  );
+  const get = f.config.db.get;
+  t.mock.method(f.config.db, 'get', async (sql: string, params?: unknown[]) => {
+    if (sql.includes('SELECT * FROM rove_plugin_channel_job WHERE status IN'))
+      throw new Error('Private internal storage details');
+    return get(sql, params);
+  });
   const logged: unknown[][] = [];
   t.mock.method(console, 'error', (...args: unknown[]) => {
     logged.push(args);
   });
   f.gateway.start();
-  await until(() => f.gateway.status('one').state === 'failed');
+  await until(async () => (await f.gateway.status('one')).state === 'failed');
   assert.equal(JSON.stringify(logged).includes('Private'), false);
   await assert.rejects(f.gateway.handle(signed(event()), 'one'), status(503));
-  const web = f.actualChat?.create();
+  const web = await f.actualChat?.create();
   assert.ok(web);
-  assert.equal(f.actualChat?.get(web.id).id, web.id);
+  assert.equal((await f.actualChat?.get(web.id))?.id, web.id);
 });

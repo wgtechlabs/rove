@@ -9,6 +9,7 @@ import { createExtensions } from './extensions.js';
 import { createPluginChannels } from './plugin-channel.js';
 import { createPlugins } from './plugins.js';
 import { createRailwayRuntime } from './railway.js';
+import { closeRuntime, openRuntime } from './runtime.js';
 
 export const MAX_BODY = 32768;
 // Plugin settings, secret bindings and channel allowlists can exceed the chat
@@ -33,36 +34,46 @@ const assets: Record<string, [string, string]> = {
 };
 
 export async function createApplication(
-  config: Config,
+  settings: Config,
   publicPath = resolve('public'),
 ) {
-  const identity = await createIdentity(config);
-  const cleanup: (() => void | Promise<void>)[] = [() => identity.close()];
-  let extensions: ReturnType<typeof createExtensions>;
-  let aips: ReturnType<typeof createAips>;
-  let chat: ReturnType<typeof createChat>;
-  let slack: ReturnType<typeof createChannels>;
-  let plugins: ReturnType<typeof createPlugins>;
-  let runtime: ReturnType<typeof createRailwayRuntime>;
-  let installedChannels: ReturnType<typeof createPluginChannels> | undefined;
+  const config = await openRuntime(settings);
+  const cleanup: (() => void | Promise<void>)[] = [];
+  let identity: Awaited<ReturnType<typeof createIdentity>>;
+  let extensions: Awaited<ReturnType<typeof createExtensions>>;
+  let aips: Awaited<ReturnType<typeof createAips>>;
+  let chat: Awaited<ReturnType<typeof createChat>>;
+  let slack: Awaited<ReturnType<typeof createChannels>>;
+  let plugins: Awaited<ReturnType<typeof createPlugins>>;
+  let runtime: Awaited<ReturnType<typeof createRailwayRuntime>>;
+  let installedChannels:
+    | Awaited<ReturnType<typeof createPluginChannels>>
+    | undefined;
   try {
-    extensions = createExtensions(config);
+    identity = await createIdentity(config);
+    cleanup.push(() => identity.close());
+    extensions = await createExtensions(config);
     cleanup.push(() => extensions.close());
-    runtime = createRailwayRuntime(config);
+    runtime = await createRailwayRuntime(config);
     cleanup.push(() => runtime.close());
-    plugins = createPlugins(config, extensions, fetch, process.env, runtime);
+    plugins = await createPlugins(
+      config,
+      extensions,
+      fetch,
+      process.env,
+      runtime,
+    );
     cleanup.push(() => plugins.close());
     void runtime
       .reconcile()
       .catch(() => console.error('Sandbox cleanup needs attention.'));
-    aips = createAips(config, (skill) => plugins.activateRelease(skill));
+    aips = await createAips(config, (skill) => plugins.activateRelease(skill));
     cleanup.push(() => aips.close());
-    chat = createChat(config, {
-      instructions(scope) {
+    chat = await createChat(config, {
+      async instructions(scope) {
         return [
-          extensions.instructions(),
-          ...aips
-            .list(scope)
+          await extensions.instructions(),
+          ...(await aips.list(scope))
             .slice(0, 10)
             .map(
               (aip) =>
@@ -88,7 +99,7 @@ export async function createApplication(
             409,
             'Enable at most 32 MCP and plugin operations.',
           );
-        return [...tools, ...aips.tools(scope)];
+        return [...tools, ...(await aips.tools(scope))];
       },
       execute(name, args, revision, scope, signal) {
         if (name.startsWith('rove_aip_'))
@@ -99,11 +110,11 @@ export async function createApplication(
       },
     });
     cleanup.push(() => chat.close());
-    slack = createChannels(config, chat);
+    slack = await createChannels(config, chat);
     cleanup.push(() => slack.close());
     slack.start();
     try {
-      installedChannels = createPluginChannels(
+      installedChannels = await createPluginChannels(
         config,
         chat,
         plugins.activeChannel,
@@ -114,12 +125,17 @@ export async function createApplication(
       console.error('Installed channels are unavailable.');
     }
   } catch (error) {
-    await Promise.allSettled(cleanup.reverse().map(async (close) => close()));
+    for (const close of cleanup.reverse())
+      await Promise.resolve()
+        .then(close)
+        .catch(() => {});
+    await closeRuntime(config);
     throw error;
   }
   const json = (body: unknown, status = 200) => Response.json(body, { status });
   async function route(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
+    if (path.startsWith('/api/')) await config.state.assertOwned();
     const channelRoute = /^\/api\/channels\/([a-f0-9-]{36})\/events$/.exec(
       path,
     );
@@ -133,10 +149,17 @@ export async function createApplication(
       ['/api/slack/events', '/api/slack/interactivity'].includes(path)
     )
       return slack.handle(request);
-    if (request.method === 'GET' && path === '/health')
-      return json({ status: 'ok' });
+    if (request.method === 'GET' && path === '/health') {
+      try {
+        await config.state.health();
+        await config.db.exec('SELECT 1');
+        return json({ status: 'ok' });
+      } catch {
+        return json({ status: 'unavailable' }, 503);
+      }
+    }
     if (request.method === 'GET' && path === '/api/setup')
-      return json({ required: !identity.hasAdmin() });
+      return json({ required: !(await identity.hasAdmin()) });
     if (path.startsWith('/api/admin/')) {
       const admin = await identity.requireAdmin(request);
       if (request.method === 'GET' && path === '/api/admin/me')
@@ -147,36 +170,37 @@ export async function createApplication(
             path,
           );
         if (releaseRoute?.[1] && releaseRoute[2])
-          return json(plugins.detail(releaseRoute[1], releaseRoute[2]));
+          return json(await plugins.detail(releaseRoute[1], releaseRoute[2]));
         const channelStatus =
           /^\/api\/admin\/plugins\/([a-f0-9-]{36})\/channel$/.exec(path);
         if (channelStatus?.[1])
           return json(
-            installedChannels?.status(channelStatus[1]) ?? {
+            (await installedChannels?.status(channelStatus[1])) ?? {
               state: 'failed',
               jobs: [],
             },
           );
-        if (path === '/api/admin/extensions') return json(extensions.list());
-        if (path === '/api/admin/plugins') return json(plugins.list());
+        if (path === '/api/admin/extensions')
+          return json(await extensions.list());
+        if (path === '/api/admin/plugins') return json(await plugins.list());
         if (path === '/api/admin/plugins/contributions')
-          return json(plugins.contributions());
-        if (path === '/api/admin/runtime') return json(runtime.status());
-        if (path === '/api/admin/channels') return json(slack.status());
-        if (path === '/api/admin/slack') return json(slack.settings());
-        if (path === '/api/admin/github') return json(aips.settings());
+          return json(await plugins.contributions());
+        if (path === '/api/admin/runtime') return json(await runtime.status());
+        if (path === '/api/admin/channels') return json(await slack.status());
+        if (path === '/api/admin/slack') return json(await slack.settings());
+        if (path === '/api/admin/github') return json(await aips.settings());
         const aipRoute = /^\/api\/admin\/aips\/([a-f0-9-]{36})$/.exec(path);
         if (aipRoute?.[1]) {
-          chat.get(aipRoute[1]);
-          return json({ aips: aips.list(`web:${aipRoute[1]}`) });
+          await chat.get(aipRoute[1]);
+          return json({ aips: await aips.list(`web:${aipRoute[1]}`) });
         }
-        if (path === '/api/admin/settings') return json(chat.settings());
+        if (path === '/api/admin/settings') return json(await chat.settings());
         if (path === '/api/admin/conversations')
-          return json({ conversations: chat.list() });
+          return json({ conversations: await chat.list() });
         const match = /^\/api\/admin\/conversations\/([a-f0-9-]{36})$/.exec(
           path,
         );
-        if (match?.[1]) return json(chat.get(match[1]));
+        if (match?.[1]) return json(await chat.get(match[1]));
       }
     }
     if (request.method === 'POST') {
@@ -203,17 +227,17 @@ export async function createApplication(
         throw new HttpError(400, 'Send a JSON object.');
       const values = body as Record<string, unknown>;
       if (path === '/api/admin/plugins/sources')
-        return json(plugins.saveSource(values));
+        return json(await plugins.saveSource(values));
       if (path === '/api/admin/plugins/install')
         return json(await plugins.install(values));
       if (path === '/api/admin/plugins/configure')
-        return json(plugins.configure(values));
+        return json(await plugins.configure(values));
       if (path === '/api/admin/plugins/activate')
         return json(await plugins.activate(values));
       if (path === '/api/admin/plugins/deactivate')
-        return json(plugins.deactivate(values));
+        return json(await plugins.deactivate(values));
       if (path === '/api/admin/extensions')
-        return json(extensions.save(values));
+        return json(await extensions.save(values));
       if (path === '/api/admin/extensions/probe') {
         if (typeof values.id !== 'string')
           throw new HttpError(400, 'Choose a connection.');
@@ -222,7 +246,8 @@ export async function createApplication(
         );
       }
       if (path === '/api/admin/slack') return json(await slack.save(values));
-      if (path === '/api/admin/github') return json(aips.saveSettings(values));
+      if (path === '/api/admin/github')
+        return json(await aips.saveSettings(values));
       const approvalRoute =
         /^\/api\/admin\/conversations\/([a-f0-9-]{36})\/approval$/.exec(path);
       if (approvalRoute?.[1])
@@ -232,10 +257,11 @@ export async function createApplication(
       if (actionRoute?.[1])
         return json(await chat.requestAction(actionRoute[1], values));
       if (path === '/api/admin/settings')
-        return json(chat.saveSettings(body as Record<string, unknown>));
+        return json(await chat.saveSettings(body as Record<string, unknown>));
       if (path === '/api/admin/settings/disconnect')
-        return json(chat.disconnect());
-      if (path === '/api/admin/conversations') return json(chat.create(), 201);
+        return json(await chat.disconnect());
+      if (path === '/api/admin/conversations')
+        return json(await chat.create(), 201);
       const messageRoute =
         /^\/api\/admin\/conversations\/([a-f0-9-]{36})\/messages$/.exec(path);
       if (messageRoute?.[1])
@@ -247,7 +273,7 @@ export async function createApplication(
         path === '/api/recover' ||
         path === '/api/auth/sign-in/email'
       )
-        identity.limit(path);
+        await identity.limit(path);
       if (path === '/api/setup')
         return json(
           await identity.bootstrap(body as Record<string, unknown>),
@@ -277,26 +303,26 @@ export async function createApplication(
     }
     throw new HttpError(404, 'Not found.');
   }
+  function cancelPending() {
+    installedChannels?.cancelPending();
+    slack.cancelPending();
+    chat.cancelPending();
+  }
+  config.state.signal.addEventListener('abort', cancelPending, { once: true });
+  let closing: Promise<void> | undefined;
   return {
-    cancelPending() {
-      installedChannels?.cancelPending();
-      slack.cancelPending();
-      chat.cancelPending();
-    },
-    async close() {
-      installedChannels?.cancelPending();
-      slack.cancelPending();
-      chat.cancelPending();
-      await installedChannels?.close().catch(() => {
-        console.error('Installed channel cleanup failed.');
-      });
-      await slack.close();
-      chat.close();
-      aips.close();
-      plugins.close();
-      await runtime.close();
-      extensions.close();
-      identity.close();
+    cancelPending,
+    close() {
+      closing ??= (async () => {
+        cancelPending();
+        config.state.signal.removeEventListener('abort', cancelPending);
+        for (const close of cleanup.reverse())
+          await Promise.resolve()
+            .then(close)
+            .catch(() => console.error('Runtime cleanup failed.'));
+        await closeRuntime(config);
+      })();
+      return closing;
     },
     async fetch(request: Request): Promise<Response> {
       let response: Response;

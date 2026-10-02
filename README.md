@@ -31,7 +31,7 @@ supplies the knowledge, policies and workflows.
 | --- | --- |
 | Web interface with Rove’s cyan identity | Available |
 | Protected first-admin setup, sign-in and account recovery | Available |
-| Persistent SQLite storage and Docker/Railway configuration | Available |
+| PostgreSQL storage, pgvector readiness, Redis runtime state and Docker configuration | Available |
 | AI web chat with saved conversations | Available |
 | Web configuration for model connection and system instructions | Available |
 | Optional Slack channel, activated from the web interface | Implemented |
@@ -49,13 +49,15 @@ are outside the MVP. See [PRODUCT.md](PRODUCT.md) for the product direction.
 ## Quick start
 
 Install **Node.js 24** and **Bun 1.3.10**. Bun manages dependencies and scripts;
-Node runs the server and integration tests, including its built-in SQLite API.
+Node runs the server and integration tests. Run **PostgreSQL 17 with pgvector**
+and **Redis 7** locally using Docker Compose:
 
 ```sh
 git clone https://github.com/wgtechlabs/rove.git
 cd rove
 bun install --frozen-lockfile
 cp .env.example .env
+docker compose up -d --wait postgres redis
 ```
 
 Generate **two different secrets**, each at least 32 characters, and save them as
@@ -65,6 +67,10 @@ this command once for each value:
 ```sh
 node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
 ```
+
+The example connects to PostgreSQL on `127.0.0.1:54329` and Redis on
+`127.0.0.1:6389`. Compose keeps both services in named volumes. The local database
+password is for development only; use generated credentials on a deployment host.
 
 Build and start Rove:
 
@@ -83,38 +89,58 @@ keeps setup closed. Keep `BETTER_AUTH_SECRET` stable across restarts. Then
 
 ## Deploy on Railway
 
-1. Connect this repository to a Railway service. The included
-   [configuration](railway.json) builds the [Dockerfile](Dockerfile).
-2. Attach a persistent volume at **`/data`** before first setup. Use
-   `ROVE_DATABASE_PATH=/data/rove.sqlite`.
+Use three services: **Rove**, **PostgreSQL 17 with pgvector**, and **Redis 7**.
+PostgreSQL and Redis need persistent volumes; Rove does not need a volume.
+
+1. Provision PostgreSQL from `pgvector/pgvector:pg17` and Redis from `redis:7-alpine`.
+   Enable Redis AOF persistence with `redis-server --appendonly yes`.
+2. Use a versioned Rove image containing this storage change when released.
+   Until then, build this source revision with its [Dockerfile](Dockerfile) and
+   [configuration](railway.json). Set
+   `DATABASE_URL` and `REDIS_URL` to the data services' private connection URLs.
 3. Generate a public domain. Set `ROVE_URL` to its exact HTTPS origin, with no
    trailing slash. Set separate random `BETTER_AUTH_SECRET` and
-   `ROVE_SETUP_SECRET` values in the service variables.
+   `ROVE_SETUP_SECRET` values in the Rove service variables.
 4. Deploy, open the domain and create your administrator account. Save the
-   recovery key, remove `ROVE_SETUP_SECRET` and redeploy.
+   recovery key, remove `ROVE_SETUP_SECRET`, stop the old Rove deployment, then
+   start its replacement.
 
-For the template-editor settings and generated secrets, see [Railway template configuration](docs/railway-template.md). Template publication and a live installation still need verification.
+See [Railway template configuration](docs/railway-template.md) for volumes,
+reference variables and generated secrets. The saved Railway template still uses
+v0.2.0; its update to this three-service configuration must follow a release of
+the new image. A fresh live template installation still needs verification.
 
-Run **one replica with its own volume**. Rove listens on the assigned `PORT`,
-serves `/health` after database initialization and cancels pending model requests
-before draining connections on shutdown.
-The entrypoint prepares the mounted data directory and runs the server as the
-non-root `node` user.
+Run **one Rove replica**. Redis coordinates core ownership, active turns and
+credential attempt limits. Rove refuses to start without PostgreSQL, pgvector or
+Redis; loss of Redis ownership stops new work. This does not enable multiple
+active replicas. Rove listens on the assigned `PORT`, serves `/health` only while
+its dependencies are available, and drains work before releasing its connections.
+The image runs as the non-root `node` user.
+
+For each Railway update or redeploy, stop the old Rove deployment before starting
+its replacement; allow up to 30 seconds for ownership expiry after a crash. Set
+`RAILWAY_DEPLOYMENT_DRAINING_SECONDS=15` for graceful shutdown. This requires a
+short outage: Railway rolling deployment waits for the new healthcheck while
+Rove requires exclusive ownership. See the [update procedure](docs/railway-template.md#restarts-and-updates).
+
+This version starts with a **fresh PostgreSQL database**. It does not import an
+existing SQLite database or read `ROVE_DATABASE_PATH`. Keep any old data files,
+backups and matching authentication secret for recovery with their old image.
+The vector extension is enabled for future use; semantic retrieval is not included.
 
 ### Run with Docker locally
 
-Prepare `.env` using the quick start above, then build from source:
+Prepare `.env` using the quick start above, then run all three services:
 
 ```sh
-docker build -t rove:local .
-docker run --rm -p 3000:3000 --env-file .env \
-  -e ROVE_DATABASE_PATH=/data/rove.sqlite \
-  -v rove-data:/data rove:local
+docker compose --profile app up -d --build --wait
 ```
 
-This uses the default local URL and port from `.env.example`. The database path
-is overridden so data survives in the named volume. Secrets and local databases
-are excluded from the image. A published image is not required.
+Open [localhost:3000](http://localhost:3000). The app uses private Compose service
+addresses; PostgreSQL and Redis data survive app recreation in named volumes.
+`docker compose down` stops the stack and retains those volumes. Removing volumes
+with `docker compose down -v` deletes the stored data. Secrets and old local
+databases are excluded from the image. A published image is not required.
 
 ## Connect a model
 
@@ -133,7 +159,7 @@ The endpoint must support OpenAI-compatible Chat Completions with text messages,
 models come from your own account. Connected tools also require compatible
 function calling. Native Anthropic, file uploads and streaming are outside this MVP.
 
-Your API key stays on the server, encrypted in SQLite using a key derived from
+Your API key stays on the server, encrypted in PostgreSQL using a key derived from
 `BETTER_AUTH_SECRET`; it is never returned by the settings API. Leave the key
 field blank to retain it. Changing the endpoint requires a new key. **Disconnect
 model** removes the active key while keeping conversations. If the authentication
@@ -141,7 +167,7 @@ secret changes, re-enter the provider key. Protect database backups and the
 application secret together; conversations themselves are stored as plain text.
 
 Messages and system instructions are sent to your chosen provider. Completed
-exchanges are saved locally and survive restarts. A failed reply leaves the draft
+exchanges are saved in PostgreSQL and survive restarts. A failed reply leaves the draft
 available to retry. Pending actions and completed tool results are persisted so
 approvals survive reloads and interrupted replies can continue without repeating actions. Rove waits up to 60
 seconds for a reply and cancels pending requests on shutdown with a retryable
@@ -177,7 +203,7 @@ or proposal changes. Rove permits at most six tool calls per message. A failed
 model continuation can resume from its saved tool result. An uncertain external
 outcome is never silently retried; check the external system before requesting
 another action. Conversation messages, proposal drafts, approval arguments and
-tool results are stored locally as plaintext; integration credentials are encrypted.
+tool results are stored in PostgreSQL as plaintext; integration credentials are encrypted.
 
 MCP limits: eight servers, 32 combined MCP tools and plugin operations, four catalog pages, and
 text/JSON results up to 16 KB. Public HTTPS endpoints are required; loopback HTTP
@@ -265,7 +291,9 @@ your deployment host.
 | `ROVE_URL` | Exact public origin, without a trailing slash. HTTPS required except on loopback. |
 | `BETTER_AUTH_SECRET` | Random authentication secret, at least 32 characters. Keep stable. |
 | `ROVE_SETUP_SECRET` | Different random secret, at least 32 characters. Required until the first administrator is created. |
-| `ROVE_DATABASE_PATH` | SQLite file. Defaults to `./data/rove.sqlite` locally and `/data/rove.sqlite` in the image. |
+| `DATABASE_URL` | Required PostgreSQL connection URL. The server must have pgvector installed; the database role must be able to enable the extension and create tables. |
+| `REDIS_URL` | Required Redis connection URL. Use persistent Redis with AOF enabled. |
+| `ROVE_STATE_KEY_PREFIX` | Optional Redis key namespace; defaults to `rove`. All processes for one deployment must use the same value. Use a separate namespace for an independent deployment sharing Redis. |
 | `PORT` | Server port; defaults to `3000`. |
 | `RAILWAY_ENVIRONMENT_ID` | Automatically supplied on Railway; optional for web use. |
 | `RAILWAY_API_TOKEN` / `RAILWAY_TOKEN` | Optional sandbox administration credentials; see [auth modes](docs/railway-sandbox.md). |
@@ -284,12 +312,15 @@ your deployment host.
   Recovery revokes existing sessions and replaces the key. Save the new key;
   the previous key cannot be reused. The setup secret cannot recover an account.
 - Credential endpoints allow 10 attempts per minute per action across the
-  deployment, persisted across restarts. This limit is shared by all callers.
+  deployment in Redis. This limit is shared by all callers and survives application
+  restarts. Redis persistence controls its recovery after a Redis restart.
 
-Back up the SQLite database with the service stopped, or use SQLite’s backup
-mechanism. Copying only a live `.sqlite` file can miss data in its WAL. Losing the
-volume loses the account and recovery state; restoring an old backup can restore
-old passwords, sessions and recovery keys.
+Back up PostgreSQL using its supported backup tools and retain the matching
+`BETTER_AUTH_SECRET` securely. Accounts, sessions, recovery state, conversations,
+plugin releases and durable jobs live in PostgreSQL. Redis holds temporary runtime
+ownership, turn state and credential attempt limits; keep its AOF volume persistent.
+Restoring an old PostgreSQL backup can restore old passwords, sessions and recovery
+keys. Verify recovery using the matching application version before relying on a backup.
 
 If both the password and recovery key are lost, use your company’s backup
 recovery procedure. This build has no authentication bypass.
@@ -303,7 +334,9 @@ bun run typecheck
 bun run test
 ```
 
-Tests use real Better Auth sessions and SQLite with dummy credentials, covering
+Start the local dependencies with `docker compose up -d --wait postgres redis`
+before running tests. Tests use real PostgreSQL with pgvector, Redis and Better Auth
+sessions with dummy credentials, covering
 setup races, authorization, recovery, session revocation, restarts and limits.
 Chat tests exercise a local HTTP provider to verify request compatibility,
 encrypted configuration, saved history, retries and failure handling. They do not
@@ -312,9 +345,15 @@ restart/crash recovery and approval replay. MCP tests use real local HTTP/SSE
 servers; Slack and GitHub tests use controlled API boundaries. These do not prove
 your live Slack installation, GitHub token, or hosted MCP server configuration.
 Plugin tests cover immutable installs, source revocation, separate activation,
-rollback, encrypted bindings and additive migrations. Railway tests use a fake
+rollback, encrypted bindings and transaction rollback. Railway tests use a fake
 provider boundary and the pinned SDK transport; live containment remains unverified.
-To check container persistence and shutdown:
+Each integration test uses an isolated database and Redis namespace. The test
+PostgreSQL role needs permission to create and drop databases. To use other local
+services, set `TEST_DATABASE_URL` (defaults to
+`postgres://rove:rove@127.0.0.1:54329/postgres`) and `TEST_REDIS_URL` (defaults to
+`redis://127.0.0.1:6389`). Tests must use disposable development services.
+
+To check container persistence and shutdown across the three-service stack:
 
 ```sh
 docker build -t rove:foundation .

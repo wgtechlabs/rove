@@ -1,18 +1,21 @@
 import { randomUUID } from 'node:crypto';
-import { DatabaseSync } from 'node:sqlite';
 import { isDeepStrictEqual } from 'node:util';
 import { HttpError } from './auth.js';
-import type { Config } from './config.js';
 import {
   complete,
   type ProviderSettings,
   type ToolDefinition,
   type WireMessage,
 } from './provider.js';
+import type { RuntimeConfig } from './runtime.js';
 
 export interface AgentTools {
-  instructions(scope: string): string;
-  preview?(name: string, args: Record<string, unknown>, scope: string): string;
+  instructions(scope: string): string | Promise<string>;
+  preview?(
+    name: string,
+    args: Record<string, unknown>,
+    scope: string,
+  ): string | Promise<string>;
   tools(scope: string, signal: AbortSignal): Promise<ToolDefinition[]>;
   execute(
     name: string,
@@ -43,29 +46,43 @@ interface Run {
     description: string;
   };
 }
-export function createAgent(config: Config, tools: AgentTools) {
-  const db = new DatabaseSync(config.databasePath);
-  try {
-    db.exec(`PRAGMA busy_timeout=5000;
-    CREATE TABLE IF NOT EXISTS rove_run(id TEXT PRIMARY KEY,conversation TEXT NOT NULL,scope TEXT NOT NULL,data TEXT NOT NULL);`);
-  } catch (error) {
-    db.close();
-    throw error;
-  }
-  const read = (id: string): Run | undefined => {
-    const row = db.prepare('SELECT data FROM rove_run WHERE id=?').get(id);
+export async function createAgent(config: RuntimeConfig, tools: AgentTools) {
+  const { db, state } = config;
+  await state.assertOwned();
+  await db.migrate(`CREATE TABLE IF NOT EXISTS rove_run(
+    sequence BIGINT GENERATED ALWAYS AS IDENTITY UNIQUE,
+    id TEXT PRIMARY KEY, conversation TEXT NOT NULL, scope TEXT NOT NULL, data TEXT NOT NULL
+  )`);
+  const read = async (id: string): Promise<Run | undefined> => {
+    const row = await db.get('SELECT data FROM rove_run WHERE id=$1', [id]);
     return row ? JSON.parse(String(row.data)) : undefined;
   };
-  function save(run: Run) {
-    db.prepare(
-      'INSERT INTO rove_run VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data',
-    ).run(run.id, run.conversation, run.scope, JSON.stringify(run));
+  async function save(run: Run, expected?: string) {
+    await state.assertOwned();
+    const data = JSON.stringify(run);
+    const changed =
+      expected === undefined
+        ? await db.run(
+            'INSERT INTO rove_run(id,conversation,scope,data) VALUES($1,$2,$3,$4) ON CONFLICT(id) DO NOTHING',
+            [run.id, run.conversation, run.scope, data],
+          )
+        : await db.run('UPDATE rove_run SET data=$1 WHERE id=$2 AND data=$3', [
+            data,
+            run.id,
+            expected,
+          ]);
+    if (!changed)
+      throw new HttpError(
+        409,
+        'The saved action changed. Reload this conversation.',
+      );
   }
-  function toolResult(run: Run, result: string) {
+  async function toolResult(run: Run, result: string) {
+    const expected = JSON.stringify(run);
     if (run.direct) {
       run.answer = result.slice(0, 24000);
       run.status = 'done';
-      save(run);
+      await save(run, expected);
       return;
     }
     const last = run.history.at(-1);
@@ -77,26 +94,21 @@ export function createAgent(config: Config, tools: AgentTools) {
       content: result.slice(0, 24000),
     });
     run.status = 'ready';
-    save(run);
+    await save(run, expected);
   }
-  // A process exit after dispatch cannot prove whether an external action succeeded.
-  try {
-    for (const row of db.prepare('SELECT data FROM rove_run').all()) {
-      const run: Run = JSON.parse(String(row.data));
-      if (run.status === 'executing')
-        toolResult(
-          run,
-          'Action outcome unknown after restart. Check the external system before proposing another action. This call will not be repeated.',
-        );
-    }
-  } catch (error) {
-    db.close();
-    throw error;
+  for (const row of await db.all('SELECT data FROM rove_run', [])) {
+    const run: Run = JSON.parse(String(row.data));
+    if (run.status === 'executing')
+      await toolResult(
+        run,
+        'Action outcome unknown after restart. Check the external system before proposing another action. This call will not be repeated.',
+      );
   }
-  function active(conversation: string, scope: string) {
-    for (const row of db
-      .prepare('SELECT data FROM rove_run WHERE conversation=? AND scope=?')
-      .all(conversation, scope)) {
+  async function active(conversation: string, scope: string) {
+    for (const row of await db.all(
+      'SELECT data FROM rove_run WHERE conversation=$1 AND scope=$2',
+      [conversation, scope],
+    )) {
       const run: Run = JSON.parse(String(row.data));
       if (run.status !== 'done') return run;
     }
@@ -111,12 +123,16 @@ export function createAgent(config: Config, tools: AgentTools) {
     run: Run,
     provider: ProviderSettings,
     signal: AbortSignal,
+    initial = false,
   ) {
     if (run.status === 'waiting' || run.status === 'done') return run;
     const available = (await tools.tools(run.scope, signal)).filter((tool) =>
       (tool.surfaces ?? ['tool']).some((surface) => surface !== 'action'),
     );
-    const instructions = tools.instructions(run.scope);
+    const expected = JSON.stringify(run);
+    const instructions = await tools.instructions(run.scope);
+    await state.assertOwned();
+    signal.throwIfAborted();
     const result = await complete(
       {
         ...provider,
@@ -158,11 +174,11 @@ export function createAgent(config: Config, tools: AgentTools) {
         revision: definition.revision,
         created: Date.now(),
         detail:
-          tools.preview?.(
+          (await tools.preview?.(
             definition.name,
             args as Record<string, unknown>,
             run.scope,
-          ) || JSON.stringify(args, null, 2),
+          )) || JSON.stringify(args, null, 2),
         description: definition.description,
       };
       run.steps++;
@@ -171,15 +187,19 @@ export function createAgent(config: Config, tools: AgentTools) {
       run.answer = result.content;
       run.status = 'done';
     }
-    save(run);
+    await save(run, initial ? undefined : expected);
     return run;
   }
-  function completed(conversation: string, scope: string): Run[] {
-    return db
-      .prepare(
-        'SELECT data FROM rove_run WHERE conversation=? AND scope=? ORDER BY rowid',
+  async function completed(
+    conversation: string,
+    scope: string,
+  ): Promise<Run[]> {
+    return (
+      await db.all(
+        'SELECT data FROM rove_run WHERE conversation=$1 AND scope=$2 ORDER BY sequence',
+        [conversation, scope],
       )
-      .all(conversation, scope)
+    )
       .map((row) => JSON.parse(String(row.data)) as Run)
       .filter((run) => run.status === 'done');
   }
@@ -217,7 +237,7 @@ export function createAgent(config: Config, tools: AgentTools) {
           'Action arguments must be a JSON object within 16 KB.',
         );
       }
-      const previous = read(id);
+      const previous = await read(id);
       if (previous) {
         if (
           !previous.direct ||
@@ -234,7 +254,7 @@ export function createAgent(config: Config, tools: AgentTools) {
           );
         return previous;
       }
-      if (active(conversation, scope))
+      if (await active(conversation, scope))
         throw new HttpError(
           409,
           'Review the pending action before requesting another action.',
@@ -273,16 +293,16 @@ export function createAgent(config: Config, tools: AgentTools) {
           revision: definition.revision,
           created: Date.now(),
           detail:
-            tools.preview?.(name, argumentsSnapshot, scope) ||
+            (await tools.preview?.(name, argumentsSnapshot, scope)) ||
             JSON.stringify(argumentsSnapshot, null, 2),
           description: definition.description,
         },
       };
-      save(run);
+      await save(run);
       return run;
     },
-    pending(conversation: string, scope: string) {
-      const run = active(conversation, scope);
+    async pending(conversation: string, scope: string) {
+      const run = await active(conversation, scope);
       return run ? view(run) : undefined;
     },
     async start(
@@ -294,7 +314,7 @@ export function createAgent(config: Config, tools: AgentTools) {
       provider: ProviderSettings,
       signal: AbortSignal,
     ) {
-      const previous = read(id);
+      const previous = await read(id);
       if (
         previous &&
         (previous.direct ||
@@ -306,7 +326,7 @@ export function createAgent(config: Config, tools: AgentTools) {
           409,
           'This request ID was already used for another message.',
         );
-      const pending = active(conversation, scope);
+      const pending = await active(conversation, scope);
       if (pending && pending.id !== id)
         throw new HttpError(
           409,
@@ -321,27 +341,27 @@ export function createAgent(config: Config, tools: AgentTools) {
         status: 'ready' as const,
         steps: 0,
       };
-      return advance(run, provider, signal);
+      return advance(run, provider, signal, !previous);
     },
     async decide(
       conversation: string,
       scope: string,
       approvalId: string,
       decision: string,
-      provider: () => ProviderSettings,
+      provider: () => Promise<ProviderSettings>,
       signal: AbortSignal,
     ) {
-      const done = completed(conversation, scope).find(
+      const done = (await completed(conversation, scope)).find(
         (run) => run.pending?.id === approvalId,
       );
       if (done) {
-        if (!done.direct) provider();
+        if (!done.direct) await provider();
         return done;
       }
-      const run = active(conversation, scope);
+      const run = await active(conversation, scope);
       if (!run || run.pending?.id !== approvalId)
         throw new HttpError(409, 'This approval is no longer pending.');
-      const model = run.direct ? undefined : provider();
+      const model = run.direct ? undefined : await provider();
       if (!['approve', 'deny'].includes(decision))
         throw new HttpError(400, 'Choose approve or deny.');
       if (run.status === 'executing')
@@ -349,7 +369,7 @@ export function createAgent(config: Config, tools: AgentTools) {
       if (run.status === 'waiting') {
         const pending = run.pending;
         if (decision === 'deny')
-          toolResult(
+          await toolResult(
             run,
             'Administrator denied this action. Do not repeat it without a new explicit request.',
           );
@@ -376,10 +396,13 @@ export function createAgent(config: Config, tools: AgentTools) {
               409,
               'The tool or proposal changed. Deny this action and request a new one.',
             );
+          const expected = JSON.stringify(run);
           run.status = 'executing';
-          save(run); // Consume the approval before the first external side effect.
+          await save(run, expected); // Consume the approval before the first external side effect.
           let result: string;
           try {
+            await state.assertOwned();
+            signal.throwIfAborted();
             result = await tools.execute(
               pending.name,
               pending.arguments,
@@ -394,15 +417,12 @@ export function createAgent(config: Config, tools: AgentTools) {
                 ? `${error.message} Check the recorded state before requesting another approval. This approved call will not be repeated.`
                 : 'Action failed or its outcome could not be confirmed. Check the external system before trying again. This approved call will not be repeated.';
           }
-          toolResult(run, result);
+          await toolResult(run, result);
         }
       }
       if (!model) return run;
       // A failed model continuation resumes from the saved result, never from the action.
       return advance(run, model, signal);
-    },
-    close() {
-      db.close();
     },
   };
 }

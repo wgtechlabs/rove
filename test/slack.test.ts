@@ -2,17 +2,15 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHmac } from 'node:crypto';
 import { once } from 'node:events';
-import { mkdtempSync, rmSync } from 'node:fs';
 import { createServer } from 'node:http';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
 import { type TestContext, test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
+import { Client, Pool } from 'pg';
 import { createApplication } from '../src/app.js';
 import { HttpError } from '../src/auth.js';
 import { createChannels } from '../src/channels.js';
 import { MAX_SLACK_BODY } from '../src/slack.js';
+import { testConfig, testRuntime } from './storage.js';
 
 const nativeFetch = globalThis.fetch;
 const secret = 'fake-slack-signing-secret';
@@ -77,20 +75,17 @@ function event(id: string, overrides: Record<string, unknown> = {}) {
     },
   };
 }
-async function until(predicate: () => boolean) {
+async function until(predicate: () => boolean | Promise<boolean>) {
   for (let n = 0; n < 100; n++) {
-    if (predicate()) return;
+    if (await predicate()) return;
     await delay(25);
   }
   assert.fail('Timed out waiting for local Slack processing.');
 }
 async function fixture(t: TestContext) {
-  const dir = mkdtempSync(join(tmpdir(), 'rove-slack-'));
-  const config = {
-    baseURL: origin,
-    authSecret: 'local-test-auth-secret-at-least-32-characters',
-    databasePath: join(dir, 'rove.sqlite'),
-  };
+  let slack: Awaited<ReturnType<typeof createChannels>>;
+  t.after(() => slack?.close());
+  const config = await testRuntime(t);
   const conversations = new Map<string, Conversation>();
   const scopes = new Map<string, string>();
   const sends: { id: string; body: Record<string, unknown>; scope?: string }[] =
@@ -100,20 +95,20 @@ async function fixture(t: TestContext) {
   let needsApproval = false;
   let approvalDetail: string | undefined;
   const chat = {
-    create(scope = 'web') {
+    async create(scope = 'web') {
       const id = `conversation-${conversations.size}`;
       conversations.set(id, { messages: [] });
       scopes.set(id, scope);
       return { id };
     },
-    get(id: string, scope = 'web') {
+    async get(id: string, scope = 'web') {
       assert.equal(scopes.get(id), scope);
       return conversations.get(id) as Conversation;
     },
     async send(id: string, body: Record<string, unknown>, scope?: string) {
       sends.push({ id, body, scope });
       await wait;
-      const result = chat.get(id, scope);
+      const result = await chat.get(id, scope);
       result.messages.push({
         role: 'assistant',
         content: 'Local fake Slack reply.',
@@ -134,7 +129,7 @@ async function fixture(t: TestContext) {
       scope?: string,
     ) {
       decisions.push(body);
-      const result = chat.get(id, scope);
+      const result = await chat.get(id, scope);
       delete result.pending;
       result.messages.push({
         role: 'assistant',
@@ -176,12 +171,10 @@ async function fixture(t: TestContext) {
       return Response.json({ ok: true, ts: '1001.000001' });
     },
   );
-  let slack = createChannels(config, chat);
+  slack = await createChannels(config, chat);
   await slack.save(settings);
-  t.after(async () => {
-    await slack.close();
+  t.after(() => {
     globalThis.fetch = originalFetch;
-    rmSync(dir, { recursive: true, force: true });
   });
   return {
     config,
@@ -194,8 +187,8 @@ async function fixture(t: TestContext) {
       return slack;
     },
     async restart() {
-      await slack.close();
-      slack = createChannels(config, chat);
+      await slack?.close();
+      slack = await createChannels(config, chat);
     },
     hold(value: Promise<void> | undefined) {
       wait = value;
@@ -212,14 +205,13 @@ async function fixture(t: TestContext) {
 
 test('Slack configuration encrypts credentials and validates signed challenges without browser Origin', async (t) => {
   const f = await fixture(t);
-  const visible = f.slack.settings();
+  const visible = await f.slack.settings();
   assert.equal(visible.teamId, 'TTEAM');
   assert.equal(JSON.stringify(visible).includes(token), false);
-  const db = new DatabaseSync(f.config.databasePath);
+  const db = f.config.db;
   const saved = String(
-    db.prepare('SELECT value FROM rove_slack_settings').get()?.value,
+    (await db.get('SELECT value FROM rove_slack_settings'))?.value,
   );
-  db.close();
   assert.equal(saved.includes(token), false);
   assert.equal(saved.includes(secret), false);
   const response = await f.slack.handle(
@@ -240,8 +232,10 @@ test('Slack configuration encrypts credentials and validates signed challenges w
 
 test('Slack acknowledges before execution, deduplicates and restarts a durable inbox', async (t) => {
   const f = await fixture(t);
-  assert.equal((await f.slack.handle(signed(event('EONE')))).status, 200);
-  await f.slack.handle(signed(event('EONE')));
+  const admissions = await Promise.all(
+    Array.from({ length: 8 }, () => f.slack.handle(signed(event('EONE')))),
+  );
+  assert.ok(admissions.every((response) => response.status === 200));
   assert.equal(f.sends.length, 0);
   await f.restart();
   let release!: () => void;
@@ -354,8 +348,10 @@ test('Slack retains an uncertain outgoing delivery without blindly resending on 
   f.fail('network');
   await f.slack.handle(signed(event('EUNCERTAIN')));
   f.slack.start();
-  await until(() =>
-    f.slack.settings().failures.some((row) => row.status === 'uncertain'),
+  await until(async () =>
+    (await f.slack.settings()).failures.some(
+      (row) => row.status === 'uncertain',
+    ),
   );
   await f.restart();
   f.fail(undefined);
@@ -452,13 +448,9 @@ test('Slack approval shows immutable detailed previews in full and only offers d
 });
 
 test('real application routes a signed Slack event through shared chat without exposing it in web history', async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), 'rove-slack-app-'));
-  const config = {
-    baseURL: origin,
-    authSecret: 'local-test-auth-secret-at-least-32-characters',
-    setupSecret: 'local-test-setup-secret-at-least-32-characters',
-    databasePath: join(dir, 'rove.sqlite'),
-  };
+  let app: Awaited<ReturnType<typeof createApplication>>;
+  t.after(() => app?.close());
+  const config = { ...(await testConfig(t)), baseURL: origin };
   const posts: Record<string, unknown>[] = [];
   let modelCalls = 0;
   t.mock.method(
@@ -490,11 +482,7 @@ test('real application routes a signed Slack event through shared chat without e
       });
     },
   );
-  const app = await createApplication(config);
-  t.after(async () => {
-    await app.close();
-    rmSync(dir, { recursive: true, force: true });
-  });
+  app = await createApplication(config);
   const account = {
     name: 'Local admin',
     email: 'admin@example.com',
@@ -564,7 +552,7 @@ test('Slack offers a durable Continue reply action after an approved tool finish
   let continuations = 0;
   const decide = f.chat.decide;
   f.chat.decide = async (id, body, scope) => {
-    const current = f.chat.get(id, scope);
+    const current = await f.chat.get(id, scope);
     if (current.pending?.status === 'waiting') {
       executions++;
       current.pending.status = 'ready';
@@ -700,19 +688,18 @@ test('Slack scrubs delivered payloads and expires terminal retry records without
   f.slack.start();
   await until(() => f.posts.length === 1);
   await f.restart();
-  const db = new DatabaseSync(f.config.databasePath);
-  t.after(() => db.close());
+  const db = f.config.db;
   assert.deepEqual(
     {
-      ...db
-        .prepare("SELECT content,reply FROM rove_slack_job WHERE id='ERETAIN'")
-        .get(),
+      ...(await db.get(
+        "SELECT content,reply FROM rove_slack_job WHERE id='ERETAIN'",
+      )),
     },
     { content: '', reply: '' },
   );
   await f.slack.handle(signed(event('ERETAIN')));
   assert.equal(
-    db.prepare('SELECT COUNT(*) AS n FROM rove_slack_job').get()?.n,
+    (await db.get('SELECT COUNT(*) AS n FROM rove_slack_job'))?.n,
     1,
   );
   for (const status of [
@@ -722,63 +709,68 @@ test('Slack scrubs delivered payloads and expires terminal retry records without
     'pending',
     'ready',
   ]) {
-    db.prepare(`INSERT INTO rove_slack_job(id,scope,channel,thread,user,content,status,finished_at)
-      VALUES(?, 'test', 'CROOM', '1000.000001', 'UALICE', 'saved input', ?, ?)`).run(
-      status,
-      status,
-      Date.now(),
+    await db.run(
+      "INSERT INTO rove_slack_job(id,scope,channel,thread,\"user\",content,status,finished_at)\n      VALUES($1, 'test', 'CROOM', '1000.000001', 'UALICE', 'saved input', $2, $3)",
+      [status, status, Date.now()],
     );
   }
   const later = Date.now() + 8 * 86400000;
   t.mock.method(Date, 'now', () => later);
   await f.slack.handle(signed(event('EFRESH')));
   assert.deepEqual(
-    db
-      .prepare('SELECT id FROM rove_slack_job ORDER BY id')
-      .all()
-      .map((row) => row.id),
+    (await db.all('SELECT id FROM rove_slack_job ORDER BY id')).map(
+      (row) => row.id,
+    ),
     ['EFRESH', 'pending', 'ready'],
   );
 });
 
-test('application startup rolls back every opened database when a service fails to initialize', async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), 'rove-startup-'));
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const exec = DatabaseSync.prototype.exec;
-  const close = DatabaseSync.prototype.close;
-  const open = new Set<DatabaseSync>();
+test('application startup closes the shared database when a service fails to initialize', async (t) => {
+  const query = Client.prototype.query;
+  const connect = Pool.prototype.connect;
+  const end = Pool.prototype.end;
+  const open = new Set<Pool>();
   let failure = '';
   t.mock.method(
-    DatabaseSync.prototype,
-    'exec',
-    function (this: DatabaseSync, sql: string) {
-      open.add(this);
-      if (sql.includes(failure))
+    Client.prototype,
+    'query',
+    function (this: Client, ...args: unknown[]) {
+      const sql = typeof args[0] === 'string' ? args[0] : '';
+      if (failure && sql.includes(failure))
         throw new Error('Simulated initialization failure');
-      return exec.call(this, sql);
+      return Reflect.apply(query, this, args);
     },
   );
-  t.mock.method(DatabaseSync.prototype, 'close', function (this: DatabaseSync) {
-    open.delete(this);
-    return close.call(this);
-  });
+  t.mock.method(
+    Pool.prototype,
+    'connect',
+    function (this: Pool, ...args: unknown[]) {
+      open.add(this);
+      return Reflect.apply(connect, this, args);
+    },
+  );
+  t.mock.method(
+    Pool.prototype,
+    'end',
+    function (this: Pool, ...args: unknown[]) {
+      open.delete(this);
+      return Reflect.apply(end, this, args);
+    },
+  );
   for (const stage of [
     'rove_extension',
     'rove_aip',
-    'ALTER TABLE rove_conversation',
+    'rove_conversation',
     'rove_run',
   ]) {
+    const config = await testConfig(t);
     failure = stage;
     await assert.rejects(
-      createApplication({
-        baseURL: origin,
-        authSecret: 'local-test-auth-secret-at-least-32-characters',
-        setupSecret: 'local-test-setup-secret-at-least-32-characters',
-        databasePath: join(dir, `${stage.replaceAll(' ', '-')}.sqlite`),
-      }),
+      createApplication(config),
       /Simulated initialization failure/,
     );
     assert.equal(open.size, 0, stage);
+    failure = '';
   }
 });
 
@@ -791,13 +783,17 @@ test('HTTP ingress admits signed large Slack interactions while preserving route
   const address = socket.address();
   assert.ok(address && typeof address !== 'string');
   await new Promise<void>((resolve) => socket.close(() => resolve()));
+  await f.slack.close();
+  await f.config.state.close();
   const child = spawn(process.execPath, ['dist/src/server.js'], {
     env: {
       ...process.env,
       PORT: String(address.port),
       ROVE_URL: origin,
       BETTER_AUTH_SECRET: f.config.authSecret,
-      ROVE_DATABASE_PATH: f.config.databasePath,
+      DATABASE_URL: f.config.databaseURL,
+      REDIS_URL: f.config.redisURL,
+      ROVE_STATE_KEY_PREFIX: f.config.redisPrefix,
       ROVE_SETUP_SECRET: 'local-http-test-setup-secret-at-least-32',
     },
     stdio: 'ignore',
