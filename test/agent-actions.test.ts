@@ -5,12 +5,16 @@ import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
 import { type TestContext, test } from 'node:test';
 import type { AgentTools } from '../src/agent.js';
 import { createChat } from '../src/chat.js';
-import type { Config } from '../src/config.js';
 import type { ToolDefinition } from '../src/provider.js';
+import {
+  closeRuntime,
+  openRuntime,
+  type RuntimeConfig,
+} from '../src/runtime.js';
+import { testConfig, testRuntime } from './storage.js';
 
 const action: ToolDefinition = {
   name: 'company_summary',
@@ -21,13 +25,19 @@ const action: ToolDefinition = {
   surfaces: ['action'],
 };
 
-function fixture(t: TestContext) {
+async function fixture(t: TestContext) {
   const directory = mkdtempSync(join(tmpdir(), 'rove-actions-'));
-  const config: Config = {
-    databasePath: join(directory, 'rove.sqlite'),
-    baseURL: 'http://localhost:3000',
-    authSecret: 'test-only-auth-secret-'.repeat(3),
-  };
+  let config!: RuntimeConfig;
+  let chat!: Awaited<ReturnType<typeof createChat>>;
+  let runtimeOpen = false;
+  let open = false;
+  t.after(async () => {
+    if (open) await chat.close();
+    if (runtimeOpen) await closeRuntime(config);
+  });
+  const connection = await testConfig(t);
+  config = await openRuntime(connection);
+  runtimeOpen = true;
   let catalog: ToolDefinition[] = [{ ...action }];
   const executions: Array<{
     name: string;
@@ -43,14 +53,16 @@ function fixture(t: TestContext) {
       return `Result: ${JSON.stringify(args)}`;
     },
   };
-  let chat = createChat(config, tools);
-  let open = true;
-  t.after(() => {
-    if (open) chat.close();
+  chat = await createChat(config, tools);
+  open = true;
+  t.after(async () => {
     rmSync(directory, { recursive: true, force: true });
   });
   return {
-    config,
+    get config() {
+      return config;
+    },
+    connection,
     directory,
     executions,
     get chat() {
@@ -59,13 +71,19 @@ function fixture(t: TestContext) {
     catalog(value: ToolDefinition[]) {
       catalog = value;
     },
-    stop() {
-      chat.close();
+    async stop() {
+      await chat.close();
       open = false;
+      await closeRuntime(config);
+      runtimeOpen = false;
     },
-    restart() {
-      if (open) chat.close();
-      chat = createChat(config, tools);
+    async restart() {
+      if (open) await chat.close();
+      if (!runtimeOpen) {
+        config = await openRuntime(connection);
+        runtimeOpen = true;
+      }
+      chat = await createChat(config, tools);
       open = true;
     },
   };
@@ -77,12 +95,98 @@ const request = (args: Record<string, unknown> = { text: 'Handbook' }) => ({
   requestId: randomUUID(),
 });
 
+test('a stale tool completion cannot overwrite a recovered durable result', async (t) => {
+  const config = await testRuntime(t);
+  let dispatched!: () => void;
+  let finish!: () => void;
+  const started = new Promise<void>((resolve) => {
+    dispatched = resolve;
+  });
+  let executions = 0;
+  const chat = await createChat(config, {
+    instructions: () => '',
+    tools: async () => [action],
+    execute: async () => {
+      executions++;
+      dispatched();
+      await new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      return 'Stale completion';
+    },
+  });
+  t.after(() => chat.close());
+  const conversation = await chat.create();
+  const body = request();
+  const waiting = await chat.requestAction(conversation.id, body);
+  const approval = { approvalId: waiting.pending?.id, decision: 'approve' };
+  const pending = chat.decide(conversation.id, approval);
+  const rejected = assert.rejects(pending, /saved action changed/);
+  await started;
+  const row = await config.db.get('SELECT data FROM rove_run WHERE id=$1', [
+    body.requestId,
+  ]);
+  const run = JSON.parse(String(row?.data));
+  run.status = 'done';
+  run.answer = 'Recovered outcome';
+  await config.db.run('UPDATE rove_run SET data=$1 WHERE id=$2', [
+    JSON.stringify(run),
+    body.requestId,
+  ]);
+  finish();
+  await rejected;
+  const recovered = await chat.decide(conversation.id, approval);
+  assert.equal(recovered.messages.at(-1)?.content, 'Recovered outcome');
+  assert.equal(executions, 1);
+});
+
+test('chat shutdown drains an admitted action before shared storage can close', async (t) => {
+  const config = await testRuntime(t);
+  let dispatched!: () => void;
+  let finish!: () => void;
+  const started = new Promise<void>((resolve) => {
+    dispatched = resolve;
+  });
+  const chat = await createChat(config, {
+    instructions: () => '',
+    tools: async () => [action],
+    execute: async () => {
+      dispatched();
+      await new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      return 'Confirmed outcome';
+    },
+  });
+  const conversation = await chat.create();
+  const waiting = await chat.requestAction(conversation.id, request());
+  const active = chat.decide(conversation.id, {
+    approvalId: waiting.pending?.id,
+    decision: 'approve',
+  });
+  await started;
+  let drained = false;
+  const closing = chat.close().then(() => {
+    drained = true;
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(drained, false);
+  await assert.rejects(
+    chat.requestAction(conversation.id, request()),
+    /restarting/,
+  );
+  finish();
+  assert.equal((await active).messages.at(-1)?.content, 'Confirmed outcome');
+  await closing;
+  assert.equal(drained, true);
+});
+
 test('dashboard actions share durable approval and execute once without model configuration', async (t) => {
-  const f = fixture(t);
-  const conversation = f.chat.create();
+  const f = await fixture(t);
+  const conversation = await f.chat.create();
   const body = request({ text: 'Handbook', limit: 2 });
   const waiting = await f.chat.requestAction(conversation.id, body);
-  assert.equal(f.chat.settings().configured, false);
+  assert.equal((await f.chat.settings()).configured, false);
   assert.equal(waiting.pending?.status, 'waiting');
   assert.equal(waiting.pending?.label, 'Company summary');
   assert.equal(waiting.pending?.prompt, 'Run action: Company summary');
@@ -98,15 +202,14 @@ test('dashboard actions share durable approval and execute once without model co
     waiting.pending?.id,
   );
   body.arguments.text = 'Changed after request';
-  f.restart();
-  const db = new DatabaseSync(f.config.databasePath);
-  db.prepare('INSERT INTO rove_model VALUES(1,?,?,?,?)').run(
+  await f.restart();
+  const db = f.config.db;
+  await db.run('INSERT INTO rove_model VALUES(1,$1,$2,$3,$4)', [
     'http://localhost:1/v1',
     'unusable',
     '',
     'corrupt-credential',
-  );
-  db.close();
+  ]);
   const approval = {
     approvalId: waiting.pending?.id,
     decision: 'approve',
@@ -138,11 +241,11 @@ test('dashboard actions share durable approval and execute once without model co
 });
 
 test('dashboard requests bind the displayed revision and retain retry identity', async (t) => {
-  const f = fixture(t);
-  const conversation = f.chat.create();
+  const f = await fixture(t);
+  const conversation = await f.chat.create();
   const body = { ...request(), revision: 'old' };
   await assert.rejects(f.chat.requestAction(conversation.id, body), /changed/);
-  assert.equal(f.chat.get(conversation.id).pending, undefined);
+  assert.equal((await f.chat.get(conversation.id)).pending, undefined);
   body.revision = 'v1';
   const waiting = await f.chat.requestAction(conversation.id, body);
   await assert.rejects(
@@ -162,8 +265,8 @@ test('dashboard requests bind the displayed revision and retain retry identity',
 });
 
 test('denial, changed revisions and removed action permissions never execute an action', async (t) => {
-  const f = fixture(t);
-  const conversation = f.chat.create();
+  const f = await fixture(t);
+  const conversation = await f.chat.create();
   let waiting = await f.chat.requestAction(conversation.id, request());
   f.catalog([{ ...action, revision: 'v2' }]);
   await assert.rejects(
@@ -202,10 +305,10 @@ test('denial, changed revisions and removed action permissions never execute an 
 });
 
 test('actions reject changed request identities, invalid input and cross-channel ownership', async (t) => {
-  const f = fixture(t);
-  const conversation = f.chat.create();
-  const other = f.chat.create();
-  const slack = f.chat.create('slack:team:channel:thread');
+  const f = await fixture(t);
+  const conversation = await f.chat.create();
+  const other = await f.chat.create();
+  const slack = await f.chat.create('slack:team:channel:thread');
   const body = request();
   const admitting = f.chat.requestAction(conversation.id, body);
   await assert.rejects(f.chat.requestAction(other.id, request()), /busy/);
@@ -258,8 +361,8 @@ test('actions reject changed request identities, invalid input and cross-channel
 });
 
 test('dashboard actions obey conversation and shutdown limits while completed retries stay safe', async (t) => {
-  const f = fixture(t);
-  const conversation = f.chat.create();
+  const f = await fixture(t);
+  const conversation = await f.chat.create();
   let last = request();
   for (let index = 0; index < 100; index++) {
     last = request();
@@ -286,16 +389,18 @@ test('dashboard actions obey conversation and shutdown limits while completed re
 });
 
 test('restart during a dashboard action records its uncertain outcome without replay', async (t) => {
-  const f = fixture(t);
-  const conversation = f.chat.create();
+  const f = await fixture(t);
+  const conversation = await f.chat.create();
   const body = request();
   const waiting = await f.chat.requestAction(conversation.id, body);
   const approval = { approvalId: waiting.pending?.id, decision: 'approve' };
   const marker = join(f.directory, 'effect');
-  f.stop();
+  await f.stop();
   const source = `import {writeFileSync} from 'node:fs';
     import {createChat} from ${JSON.stringify(new URL('../src/chat.js', import.meta.url).href)};
-    const chat=createChat(${JSON.stringify(f.config)}, {instructions:()=>'',tools:async()=>[${JSON.stringify(action)}],execute:async()=>{writeFileSync(${JSON.stringify(marker)},'executed');process.exit(42);}});
+    import {openRuntime} from ${JSON.stringify(new URL('../src/runtime.js', import.meta.url).href)};
+    const runtime = await openRuntime(${JSON.stringify(f.connection)});
+    const chat=await createChat(runtime, {instructions:()=>'',tools:async()=>[${JSON.stringify(action)}],execute:async()=>{writeFileSync(${JSON.stringify(marker)},'executed');await runtime.state.close();process.exit(42);}});
     await chat.decide(${JSON.stringify(conversation.id)},${JSON.stringify(approval)});`;
   const child = spawn(process.execPath, ['--input-type=module', '-e', source], {
     stdio: 'ignore',
@@ -306,8 +411,8 @@ test('restart during a dashboard action records its uncertain outcome without re
   });
   assert.equal(code, 42);
   assert.equal(existsSync(marker), true);
-  f.restart();
-  const recovered = f.chat.get(conversation.id);
+  await f.restart();
+  const recovered = await f.chat.get(conversation.id);
   assert.equal(recovered.pending, undefined);
   assert.match(
     recovered.messages.at(-1)?.content ?? '',
@@ -319,7 +424,7 @@ test('restart during a dashboard action records its uncertain outcome without re
 });
 
 test('model calls see default tools and workflow steps while dashboard-only actions stay hidden', async (t) => {
-  const f = fixture(t);
+  const f = await fixture(t);
   f.catalog([
     action,
     { ...action, name: 'legacy', surfaces: undefined },
@@ -350,13 +455,13 @@ test('model calls see default tools and workflow steps while dashboard-only acti
   );
   const address = server.address();
   assert.ok(address && typeof address !== 'string');
-  f.chat.saveSettings({
+  await f.chat.saveSettings({
     baseURL: `http://127.0.0.1:${address.port}/v1`,
     apiKey: 'dummy-key',
     model: 'fixture',
     systemPrompt: '',
   });
-  const conversation = f.chat.create();
+  const conversation = await f.chat.create();
   const directBody = request({ text: 'UNTRUSTED_ACTION_RESULT' });
   const direct = await f.chat.requestAction(conversation.id, directBody);
   await f.chat.decide(conversation.id, {
@@ -381,7 +486,7 @@ test('model calls see default tools and workflow steps while dashboard-only acti
     /UNTRUSTED_ACTION_RESULT|Run action:/,
   );
   assert.match(
-    JSON.stringify(f.chat.get(conversation.id).messages),
+    JSON.stringify((await f.chat.get(conversation.id)).messages),
     /UNTRUSTED_ACTION_RESULT/,
   );
   await assert.rejects(

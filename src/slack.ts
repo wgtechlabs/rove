@@ -1,7 +1,7 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
-import { DatabaseSync } from 'node:sqlite';
 import { HttpError } from './auth.js';
-import type { Config } from './config.js';
+import type { Sql } from './database.js';
+import type { RuntimeConfig } from './runtime.js';
 import { createSecrets } from './secrets.js';
 
 interface Conversation {
@@ -17,8 +17,8 @@ interface Conversation {
   };
 }
 interface Chat {
-  create(scope?: string): { id: string };
-  get(id: string, scope?: string): Conversation;
+  create(scope?: string): Promise<{ id: string }>;
+  get(id: string, scope?: string): Promise<Conversation>;
   send(
     id: string,
     body: Record<string, unknown>,
@@ -76,54 +76,44 @@ const string = (value: unknown) => (typeof value === 'string' ? value : '');
 const slackId = (value: string) => /^[A-Z][A-Z0-9]{1,30}$/.test(value);
 const timestamp = (value: string) => /^\d{1,20}\.\d{1,10}$/.test(value);
 
-export function createSlack(
-  config: Config,
+export async function createSlack(
+  config: RuntimeConfig,
   chat: Chat,
   onFailure?: () => void,
 ) {
-  const db = new DatabaseSync(config.databasePath);
+  const db = config.db;
   let nextCleanup = 0;
-  try {
-    db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1000;
+  await config.state.assertOwned();
+  await db.migrate(`
     CREATE TABLE IF NOT EXISTS rove_slack_settings (singleton INTEGER PRIMARY KEY CHECK(singleton=1), value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS rove_slack_thread (scope TEXT PRIMARY KEY, conversation TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS rove_slack_job (
-      sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, scope TEXT NOT NULL,
-      channel TEXT NOT NULL, thread TEXT NOT NULL, user TEXT NOT NULL, content TEXT NOT NULL,
-      conversation TEXT NOT NULL DEFAULT '', approvalId TEXT NOT NULL DEFAULT '', decision TEXT NOT NULL DEFAULT '',
+      sequence BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, id TEXT NOT NULL UNIQUE, scope TEXT NOT NULL,
+      channel TEXT NOT NULL, thread TEXT NOT NULL, "user" TEXT NOT NULL, content TEXT NOT NULL,
+      conversation TEXT NOT NULL DEFAULT '', "approvalId" TEXT NOT NULL DEFAULT '', decision TEXT NOT NULL DEFAULT '',
       reply TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
-      next_at INTEGER NOT NULL DEFAULT 0);
-    UPDATE rove_slack_job SET status='pending' WHERE status='processing';
+      next_at BIGINT NOT NULL DEFAULT 0, finished_at BIGINT NOT NULL DEFAULT 0);
+    CREATE INDEX IF NOT EXISTS rove_slack_job_queue ON rove_slack_job(scope,sequence) WHERE status IN ('pending','processing','ready','delivering');
+    CREATE INDEX IF NOT EXISTS rove_slack_job_retention ON rove_slack_job(status,finished_at);`);
+  await config.state.assertOwned();
+  await db.exec(`UPDATE rove_slack_job SET status='pending' WHERE status='processing';
     UPDATE rove_slack_job SET status='uncertain' WHERE status='delivering';`);
-    if (
-      !db
-        .prepare('PRAGMA table_info(rove_slack_job)')
-        .all()
-        .some((column) => column.name === 'finished_at')
-    )
-      db.exec(
-        'ALTER TABLE rove_slack_job ADD COLUMN finished_at INTEGER NOT NULL DEFAULT 0',
-      );
-    db.exec(`CREATE INDEX IF NOT EXISTS rove_slack_job_queue ON rove_slack_job(scope,sequence) WHERE status IN ('pending','processing','ready','delivering');
-      CREATE INDEX IF NOT EXISTS rove_slack_job_retention ON rove_slack_job(status,finished_at);`);
-    prune();
-  } catch (error) {
-    db.close();
-    throw error;
-  }
-  function prune() {
+  await prune();
+  async function prune() {
     const now = Date.now();
     if (now < nextCleanup) return;
     // Keep seven days of retry IDs and button origins; active work is never pruned.
-    db.prepare(
-      `UPDATE rove_slack_job SET finished_at=? WHERE finished_at=0 AND status IN ('sent','failed','uncertain','cancelled')`,
-    ).run(now);
-    db.exec(
+    await db.run(
+      "UPDATE rove_slack_job SET finished_at=$1 WHERE finished_at=0 AND status IN ('sent','failed','uncertain','cancelled')",
+      [now],
+    );
+    await db.exec(
       "UPDATE rove_slack_job SET content='', reply='' WHERE status='sent' AND (content<>'' OR reply<>'')",
     );
-    db.prepare(
-      "DELETE FROM rove_slack_job WHERE status IN ('sent','failed','uncertain','cancelled') AND finished_at < ?",
-    ).run(now - 7 * 86400000);
+    await db.run(
+      "DELETE FROM rove_slack_job WHERE status IN ('sent','failed','uncertain','cancelled') AND finished_at < $1",
+      [now - 7 * 86400000],
+    );
     nextCleanup = now + 60000;
   }
   const secrets = createSecrets(config.authSecret);
@@ -134,19 +124,17 @@ export function createSlack(
   let running: Promise<void> | undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
 
-  function saved(): Settings {
-    const row = db
-      .prepare('SELECT value FROM rove_slack_settings WHERE singleton=1')
-      .get();
+  async function saved(sql: Sql = db): Promise<Settings> {
+    const row = await sql.get(
+      'SELECT value FROM rove_slack_settings WHERE singleton=1',
+    );
     return row ? (JSON.parse(String(row.value)) as Settings) : { ...empty };
   }
-  function settings() {
-    const { botToken, signingSecret, ...visible } = saved();
-    const failures = db
-      .prepare(
-        "SELECT status, COUNT(*) AS count FROM rove_slack_job WHERE status IN ('failed','uncertain') GROUP BY status",
-      )
-      .all();
+  async function settings() {
+    const { botToken, signingSecret, ...visible } = await saved();
+    const failures = await db.all(
+      "SELECT status, COUNT(*) AS count FROM rove_slack_job WHERE status IN ('failed','uncertain') GROUP BY status",
+    );
     return {
       ...visible,
       configured: Boolean(botToken && signingSecret),
@@ -167,7 +155,10 @@ export function createSlack(
     token: string,
     body: Record<string, unknown>,
   ) {
+    await config.state.assertOwned();
+    if (stopping) throw new HttpError(503, 'Rove is restarting.');
     const signal = AbortSignal.any([
+      config.state.signal,
       AbortSignal.timeout(10000),
       ...(active ? [active.signal] : []),
     ]);
@@ -213,48 +204,6 @@ export function createSlack(
   async function save(body: Record<string, unknown>) {
     if (stopping || saving || running)
       throw new HttpError(409, 'Wait for Slack processing to finish.');
-    const previous = saved();
-    const lists = ['allowedUsers', 'allowedChannels', 'adminUsers'] as const;
-    if (typeof body.enabled !== 'boolean' || typeof body.allowDM !== 'boolean')
-      throw new HttpError(
-        400,
-        'Choose whether Slack and direct messages are enabled.',
-      );
-    const next = { ...previous, enabled: body.enabled, allowDM: body.allowDM };
-    for (const field of lists) {
-      const value = body[field];
-      if (
-        !Array.isArray(value) ||
-        value.length > 100 ||
-        value.some((item) => typeof item !== 'string' || !slackId(item))
-      )
-        throw new HttpError(
-          400,
-          'Enter up to 100 valid Slack IDs in each allowlist.',
-        );
-      next[field] = [...new Set(value as string[])];
-    }
-    if (next.adminUsers.some((user) => !next.allowedUsers.includes(user)))
-      throw new HttpError(
-        400,
-        'Slack administrators must also be allowed users.',
-      );
-    for (const field of ['botToken', 'signingSecret'] as const) {
-      if (body[field] !== undefined && typeof body[field] !== 'string')
-        throw new HttpError(400, 'Enter valid Slack credentials.');
-      const value = string(body[field]).trim();
-      if (value.length > 1000 || /\s/.test(value))
-        throw new HttpError(400, 'Enter valid Slack credentials.');
-      if (value) next[field] = secrets.encrypt(value);
-    }
-    if (
-      next.enabled &&
-      (!next.botToken || !next.signingSecret || !next.allowedUsers.length)
-    )
-      throw new HttpError(
-        400,
-        'Add both Slack credentials and an allowed user before enabling Slack.',
-      );
     saving = true;
     active = new AbortController();
     let finishSave!: () => void;
@@ -262,6 +211,56 @@ export function createSlack(
       finishSave = resolve;
     });
     try {
+      await config.state.assertOwned();
+      const previous = await saved();
+      const lists = ['allowedUsers', 'allowedChannels', 'adminUsers'] as const;
+      if (
+        typeof body.enabled !== 'boolean' ||
+        typeof body.allowDM !== 'boolean'
+      )
+        throw new HttpError(
+          400,
+          'Choose whether Slack and direct messages are enabled.',
+        );
+      const next = {
+        ...previous,
+        enabled: body.enabled,
+        allowDM: body.allowDM,
+      };
+      for (const field of lists) {
+        const value = body[field];
+        if (
+          !Array.isArray(value) ||
+          value.length > 100 ||
+          value.some((item) => typeof item !== 'string' || !slackId(item))
+        )
+          throw new HttpError(
+            400,
+            'Enter up to 100 valid Slack IDs in each allowlist.',
+          );
+        next[field] = [...new Set(value as string[])];
+      }
+      if (next.adminUsers.some((user) => !next.allowedUsers.includes(user)))
+        throw new HttpError(
+          400,
+          'Slack administrators must also be allowed users.',
+        );
+      for (const field of ['botToken', 'signingSecret'] as const) {
+        if (body[field] !== undefined && typeof body[field] !== 'string')
+          throw new HttpError(400, 'Enter valid Slack credentials.');
+        const value = string(body[field]).trim();
+        if (value.length > 1000 || /\s/.test(value))
+          throw new HttpError(400, 'Enter valid Slack credentials.');
+        if (value) next[field] = secrets.encrypt(value);
+      }
+      if (
+        next.enabled &&
+        (!next.botToken || !next.signingSecret || !next.allowedUsers.length)
+      )
+        throw new HttpError(
+          400,
+          'Add both Slack credentials and an allowed user before enabling Slack.',
+        );
       if (next.enabled) {
         const identity = await api(
           'auth.test',
@@ -278,21 +277,19 @@ export function createSlack(
         next.botUserId = string(identity.user_id);
       }
       if (stopping) throw new HttpError(503, 'Rove is restarting.');
-      db.exec('BEGIN IMMEDIATE');
-      try {
-        db.prepare(
-          'INSERT INTO rove_slack_settings VALUES(1, ?) ON CONFLICT(singleton) DO UPDATE SET value=excluded.value',
-        ).run(JSON.stringify(next));
+      await config.state.assertOwned();
+      await db.transaction(async (tx) => {
+        await tx.exec('LOCK TABLE rove_slack_job IN EXCLUSIVE MODE');
+        await tx.run(
+          'INSERT INTO rove_slack_settings VALUES(1, $1) ON CONFLICT(singleton) DO UPDATE SET value=excluded.value',
+          [JSON.stringify(next)],
+        );
         // Configuration changes revoke outstanding deliveries and approval buttons.
-        db.prepare(
+        await tx.run(
           "UPDATE rove_slack_job SET status='cancelled' WHERE status NOT IN ('failed','uncertain','cancelled')",
-        ).run();
-        db.exec('COMMIT');
-      } catch (error) {
-        db.exec('ROLLBACK');
-        throw error;
-      }
-      return settings();
+        );
+      });
+      return await settings();
     } catch (error) {
       if (error instanceof HttpError) throw error;
       throw new HttpError(
@@ -325,47 +322,60 @@ export function createSlack(
       throw new HttpError(401, 'Invalid Slack signature.');
     return raw.toString('utf8');
   }
-  function enqueue(
+  async function enqueue(
     job: Omit<
       Job,
       'conversation' | 'reply' | 'status' | 'attempts' | 'next_at'
     > & { conversation?: string },
+    state: Settings,
   ) {
-    prune();
-    if (
-      job.approvalId &&
-      db
-        .prepare(
-          "SELECT id FROM rove_slack_job WHERE approvalId=? AND status IN ('pending','processing','ready','delivering')",
-        )
-        .get(job.approvalId)
-    )
-      return;
-    if (db.prepare('SELECT id FROM rove_slack_job WHERE id=?').get(job.id))
-      return;
-    if (
-      Number(
-        db
-          .prepare(
-            "SELECT COUNT(*) AS n FROM rove_slack_job WHERE status IN ('pending','processing','ready','delivering')",
-          )
-          .get()?.n,
-      ) >= 100
-    )
-      throw new HttpError(503, 'Slack queue is full. Retry later.');
-    db.prepare(
-      'INSERT INTO rove_slack_job(id,scope,channel,thread,user,content,conversation,approvalId,decision) VALUES(?,?,?,?,?,?,?,?,?)',
-    ).run(
-      job.id,
-      job.scope,
-      job.channel,
-      job.thread,
-      job.user,
-      job.content,
-      job.conversation || '',
-      job.approvalId,
-      job.decision,
-    );
+    await prune();
+    await db.transaction(async (tx) => {
+      await tx.exec('LOCK TABLE rove_slack_job IN EXCLUSIVE MODE');
+      if (
+        stopping ||
+        saving ||
+        JSON.stringify(await saved(tx)) !== JSON.stringify(state)
+      )
+        throw new HttpError(
+          503,
+          'Slack configuration changed. Retry the event.',
+        );
+      if (
+        job.approvalId &&
+        (await tx.get(
+          "SELECT id FROM rove_slack_job WHERE \"approvalId\"=$1 AND status IN ('pending','processing','ready','delivering')",
+          [job.approvalId],
+        ))
+      )
+        return;
+      if (await tx.get('SELECT id FROM rove_slack_job WHERE id=$1', [job.id]))
+        return;
+      if (
+        Number(
+          (
+            await tx.get(
+              "SELECT COUNT(*) AS n FROM rove_slack_job WHERE status IN ('pending','processing','ready','delivering')",
+            )
+          )?.n,
+        ) >= 100
+      )
+        throw new HttpError(503, 'Slack queue is full. Retry later.');
+      await tx.run(
+        'INSERT INTO rove_slack_job(id,scope,channel,thread,"user",content,conversation,"approvalId",decision) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)',
+        [
+          job.id,
+          job.scope,
+          job.channel,
+          job.thread,
+          job.user,
+          job.content,
+          job.conversation || '',
+          job.approvalId,
+          job.decision,
+        ],
+      );
+    });
   }
   async function handle(request: Request): Promise<Response> {
     if (stopping || saving)
@@ -384,7 +394,7 @@ export function createSlack(
         : 'application/x-www-form-urlencoded')
     )
       throw new HttpError(415, 'Invalid Slack content type.');
-    const state = saved();
+    const state = await saved();
     const raw = await verify(request, state);
     let body: Record<string, unknown>;
     try {
@@ -430,9 +440,10 @@ export function createSlack(
       } catch {
         return new Response(null, { status: 200 });
       }
-      const origin = db
-        .prepare("SELECT * FROM rove_slack_job WHERE id=? AND status='sent'")
-        .get(string(value.job)) as unknown as Job | undefined;
+      const origin = await db.get<Job>(
+        "SELECT * FROM rove_slack_job WHERE id=$1 AND status='sent'",
+        [string(value.job)],
+      );
       if (
         !decision ||
         !origin ||
@@ -441,7 +452,8 @@ export function createSlack(
         !permitted(state, origin.user, channel)
       )
         return new Response(null, { status: 200 });
-      const pending = chat.get(origin.conversation, origin.scope).pending;
+      const pending = (await chat.get(origin.conversation, origin.scope))
+        .pending;
       if (
         !pending ||
         pending.id !== value.approval ||
@@ -454,20 +466,23 @@ export function createSlack(
         )
       )
         return new Response(null, { status: 200 });
-      enqueue({
-        id:
-          pending.status === 'ready'
-            ? `resume:${pending.id}:${string(action.action_ts)}`
-            : `approval:${pending.id}`,
-        scope: origin.scope,
-        channel,
-        thread: origin.thread,
-        user,
-        content: '',
-        conversation: origin.conversation,
-        approvalId: pending.id,
-        decision,
-      });
+      await enqueue(
+        {
+          id:
+            pending.status === 'ready'
+              ? `resume:${pending.id}:${string(action.action_ts)}`
+              : `approval:${pending.id}`,
+          scope: origin.scope,
+          channel,
+          thread: origin.thread,
+          user,
+          content: '',
+          conversation: origin.conversation,
+          approvalId: pending.id,
+          decision,
+        },
+        state,
+      );
     } else if (
       path === '/api/slack/events' &&
       body.type === 'event_callback' &&
@@ -505,16 +520,19 @@ export function createSlack(
         !/^[A-Za-z0-9_-]{1,100}$/.test(string(body.event_id))
       )
         return new Response(null, { status: 200 });
-      enqueue({
-        id: string(body.event_id),
-        scope: `slack:${state.teamId}:${channel}:${thread}`,
-        channel,
-        thread,
-        user,
-        content,
-        approvalId: '',
-        decision: '',
-      });
+      await enqueue(
+        {
+          id: string(body.event_id),
+          scope: `slack:${state.teamId}:${channel}:${thread}`,
+          channel,
+          thread,
+          user,
+          content,
+          approvalId: '',
+          decision: '',
+        },
+        state,
+      );
     }
     // The interval processes the durable inbox after this acknowledgement.
     return new Response(null, { status: 200 });
@@ -589,50 +607,50 @@ export function createSlack(
   }
   async function processJob() {
     if (stopping || saving) return;
-    prune();
-    const job = db
-      .prepare(`SELECT job.* FROM rove_slack_job AS job
-        WHERE job.status IN ('pending','ready') AND job.next_at <= ?
-          AND NOT EXISTS (
-            SELECT 1 FROM rove_slack_job AS earlier
-            WHERE earlier.scope = job.scope AND earlier.sequence < job.sequence
-              AND earlier.status IN ('pending','processing','ready','delivering')
-          )
-        ORDER BY job.sequence LIMIT 1`)
-      .get(Date.now()) as unknown as Job | undefined;
+    await config.state.assertOwned();
+    await prune();
+    const job = await db.get<Job>(
+      "SELECT job.* FROM rove_slack_job AS job\n        WHERE job.status IN ('pending','ready') AND job.next_at <= $1\n          AND NOT EXISTS (\n            SELECT 1 FROM rove_slack_job AS earlier\n            WHERE earlier.scope = job.scope AND earlier.sequence < job.sequence\n              AND earlier.status IN ('pending','processing','ready','delivering')\n          )\n        ORDER BY job.sequence LIMIT 1",
+      [Date.now()],
+    );
     if (!job) return;
-    const state = saved();
+    const state = await saved();
+    if (stopping || saving) return;
     if (
       !permitted(state, job.user, job.channel) ||
       (job.decision && !state.adminUsers.includes(job.user))
     ) {
-      db.prepare("UPDATE rove_slack_job SET status='cancelled' WHERE id=?").run(
+      await db.run("UPDATE rove_slack_job SET status='cancelled' WHERE id=$1", [
         job.id,
-      );
+      ]);
       return;
     }
     active = new AbortController();
     try {
       if (job.status === 'pending') {
-        db.prepare(
-          "UPDATE rove_slack_job SET status='processing' WHERE id=?",
-        ).run(job.id);
+        await db.run(
+          "UPDATE rove_slack_job SET status='processing' WHERE id=$1",
+          [job.id],
+        );
         if (!job.conversation) {
-          const existing = db
-            .prepare('SELECT conversation FROM rove_slack_thread WHERE scope=?')
-            .get(job.scope);
+          const existing = await db.get(
+            'SELECT conversation FROM rove_slack_thread WHERE scope=$1',
+            [job.scope],
+          );
           job.conversation = existing
             ? String(existing.conversation)
-            : chat.create(job.scope).id;
-          db.prepare('INSERT OR IGNORE INTO rove_slack_thread VALUES(?,?)').run(
-            job.scope,
-            job.conversation,
+            : (await chat.create(job.scope)).id;
+          await db.run(
+            'INSERT INTO rove_slack_thread VALUES($1,$2) ON CONFLICT DO NOTHING',
+            [job.scope, job.conversation],
           );
-          db.prepare('UPDATE rove_slack_job SET conversation=? WHERE id=?').run(
-            job.conversation,
-            job.id,
+          await db.run(
+            'UPDATE rove_slack_job SET conversation=$1 WHERE id=$2',
+            [job.conversation, job.id],
           );
         }
+        await config.state.assertOwned();
+        if (stopping) return;
         const requestId = job.decision ? '' : requestUUID(job.id);
         const conversation = job.decision
           ? await chat.decide(
@@ -646,53 +664,63 @@ export function createSlack(
               job.scope,
             );
         job.reply = delivery(job, conversation);
-        db.prepare(
-          "UPDATE rove_slack_job SET status='ready', reply=? WHERE id=?",
-        ).run(job.reply, job.id);
+        await db.run(
+          "UPDATE rove_slack_job SET status='ready', reply=$1 WHERE id=$2",
+          [job.reply, job.id],
+        );
       }
       if (stopping) return;
-      db.prepare(
-        "UPDATE rove_slack_job SET status='delivering' WHERE id=?",
-      ).run(job.id);
+      await db.run(
+        "UPDATE rove_slack_job SET status='delivering' WHERE id=$1",
+        [job.id],
+      );
       await api(
         'chat.postMessage',
         secrets.decrypt(state.botToken),
         JSON.parse(job.reply),
       );
-      db.prepare(
-        "UPDATE rove_slack_job SET status='sent', content='', reply='', finished_at=? WHERE id=?",
-      ).run(Date.now(), job.id);
+      await db.run(
+        "UPDATE rove_slack_job SET status='sent', content='', reply='', finished_at=$1 WHERE id=$2",
+        [Date.now(), job.id],
+      );
     } catch (error) {
+      config.state.signal.throwIfAborted();
       const phase = String(
-        db.prepare('SELECT status FROM rove_slack_job WHERE id=?').get(job.id)
-          ?.status,
+        (
+          await db.get('SELECT status FROM rove_slack_job WHERE id=$1', [
+            job.id,
+          ])
+        )?.status,
       );
       const continuation =
         phase === 'processing' && job.conversation
-          ? chat.get(job.conversation, job.scope)
+          ? await chat.get(job.conversation, job.scope)
           : undefined;
       if (!stopping && continuation?.pending?.status === 'ready') {
-        db.prepare(
-          "UPDATE rove_slack_job SET status='ready', reply=? WHERE id=?",
-        ).run(delivery(job, continuation), job.id);
+        await db.run(
+          "UPDATE rove_slack_job SET status='ready', reply=$1 WHERE id=$2",
+          [delivery(job, continuation), job.id],
+        );
       } else if (error instanceof SlackRateLimit) {
-        db.prepare(
-          "UPDATE rove_slack_job SET status='ready', next_at=? WHERE id=?",
-        ).run(Date.now() + error.seconds * 1000, job.id);
+        await db.run(
+          "UPDATE rove_slack_job SET status='ready', next_at=$1 WHERE id=$2",
+          [Date.now() + error.seconds * 1000, job.id],
+        );
       } else if (phase === 'delivering') {
-        db.prepare('UPDATE rove_slack_job SET status=? WHERE id=?').run(
+        await db.run('UPDATE rove_slack_job SET status=$1 WHERE id=$2', [
           error instanceof SlackRejected ? 'failed' : 'uncertain',
           job.id,
-        );
+        ]);
       } else if (
         stopping ||
         (error instanceof HttpError &&
           (error.status === 409 || error.status === 503) &&
           job.attempts < 10)
       ) {
-        db.prepare(
-          "UPDATE rove_slack_job SET status='pending', attempts=attempts+1, next_at=? WHERE id=?",
-        ).run(Date.now() + 3000, job.id);
+        await db.run(
+          "UPDATE rove_slack_job SET status='pending', attempts=attempts+1, next_at=$1 WHERE id=$2",
+          [Date.now() + 3000, job.id],
+        );
       } else {
         const reply = delivery(job, {
           messages: [
@@ -703,9 +731,10 @@ export function createSlack(
             },
           ],
         });
-        db.prepare(
-          "UPDATE rove_slack_job SET status='ready', reply=? WHERE id=?",
-        ).run(reply, job.id);
+        await db.run(
+          "UPDATE rove_slack_job SET status='ready', reply=$1 WHERE id=$2",
+          [reply, job.id],
+        );
       }
     } finally {
       active = undefined;
@@ -743,7 +772,6 @@ export function createSlack(
       cancelPending();
       await running;
       await saveDone;
-      db.close();
     },
   };
 }

@@ -1,11 +1,10 @@
 import { createHash, createHmac, randomUUID } from 'node:crypto';
-import { DatabaseSync } from 'node:sqlite';
 import { z } from 'zod';
 import { agentFormat, importAgentRelease } from './agent-import.js';
-import type { ReleasedSkill } from './aip.js';
+import { type ReleasedSkill, requireAipRelease } from './aip.js';
 import { loadRelease, tagSchema, type VerifiedRelease } from './aip-release.js';
 import { HttpError } from './auth.js';
-import type { Config } from './config.js';
+import type { Sql } from './database.js';
 import {
   type createExtensions,
   discoverTools,
@@ -24,6 +23,7 @@ import {
   operationDefinition,
   type PluginRuntime,
 } from './plugin-operations.js';
+import type { RuntimeConfig } from './runtime.js';
 import { createSecrets } from './secrets.js';
 
 const digestSchema = z.string().regex(/^[a-f0-9]{64}$/);
@@ -94,41 +94,30 @@ function parse<T>(schema: z.ZodType<T>, value: unknown): T {
 }
 
 /** Immutable releases and dashboard-owned configuration. Downloaded JavaScript never enters the host. */
-export function createPlugins(
-  config: Config,
-  extensions: ReturnType<typeof createExtensions>,
+export async function createPlugins(
+  config: RuntimeConfig,
+  extensions: Awaited<ReturnType<typeof createExtensions>>,
   fetchImpl: typeof fetch = fetch,
   env: NodeJS.ProcessEnv = process.env,
   runtime?: PluginRuntime,
 ) {
-  const db = new DatabaseSync(config.databasePath);
+  const db = config.db;
   const secrets = createSecrets(config.authSecret);
-  try {
-    db.exec(`PRAGMA busy_timeout=5000;
-      CREATE TABLE IF NOT EXISTS rove_plugin_source(repo TEXT PRIMARY KEY, token TEXT NOT NULL, approved INTEGER NOT NULL, revision TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS rove_plugin_installation(id TEXT PRIMARY KEY, repo TEXT NOT NULL, plugin_id TEXT NOT NULL, data TEXT NOT NULL, UNIQUE(repo,plugin_id));
-      CREATE TABLE IF NOT EXISTS rove_plugin_artifact(digest TEXT PRIMARY KEY, repo TEXT NOT NULL, plugin_id TEXT NOT NULL, version TEXT NOT NULL, data TEXT NOT NULL, summary TEXT, UNIQUE(repo,plugin_id,version));
-      CREATE TABLE IF NOT EXISTS rove_plugin_audit(id INTEGER PRIMARY KEY, installation TEXT NOT NULL, event TEXT NOT NULL, digest TEXT, at INTEGER NOT NULL);`);
-    if (
-      !db
-        .prepare('PRAGMA table_info(rove_plugin_artifact)')
-        .all()
-        .some((column) => column.name === 'summary')
-    )
-      db.exec('ALTER TABLE rove_plugin_artifact ADD COLUMN summary TEXT');
-    // Display metadata is stored once; only selected review and execution read verified artifact bytes.
-    db.exec(`UPDATE rove_plugin_artifact SET summary=json_object(
-      'name',json_extract(data,'$.manifest.name'),
-      'description',json_extract(data,'$.manifest.description'),
-      'category',json_extract(data,'$.manifest.category'),
-      'version',version,'tag',json_extract(data,'$.tag')) WHERE summary IS NULL`);
-  } catch (error) {
-    db.close();
-    throw error;
-  }
+  await db.migrate(`
+    CREATE TABLE IF NOT EXISTS rove_plugin_source(repo TEXT PRIMARY KEY, token TEXT NOT NULL, approved INTEGER NOT NULL, revision TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS rove_plugin_installation(id TEXT PRIMARY KEY, repo TEXT NOT NULL, plugin_id TEXT NOT NULL, data TEXT NOT NULL, sequence BIGINT GENERATED ALWAYS AS IDENTITY, UNIQUE(repo,plugin_id));
+    CREATE TABLE IF NOT EXISTS rove_plugin_artifact(digest TEXT PRIMARY KEY, repo TEXT NOT NULL, plugin_id TEXT NOT NULL, version TEXT NOT NULL, data TEXT NOT NULL, summary TEXT, sequence BIGINT GENERATED ALWAYS AS IDENTITY, UNIQUE(repo,plugin_id,version));
+    CREATE TABLE IF NOT EXISTS rove_plugin_audit(id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, installation TEXT NOT NULL, event TEXT NOT NULL, digest TEXT, at BIGINT NOT NULL);
+    UPDATE rove_plugin_artifact SET summary=jsonb_build_object(
+      'name',data::jsonb->'manifest'->>'name',
+      'description',data::jsonb->'manifest'->>'description',
+      'category',data::jsonb->'manifest'->>'category',
+      'version',version,'tag',data::jsonb->>'tag')::text WHERE summary IS NULL;`);
   const lifetime = new AbortController();
+  const shutdown = AbortSignal.any([lifetime.signal, config.state.signal]);
   let closed = false;
   let busy = false;
+  let changing = false;
   // ponytail: one executable plugin call per deployment; add per-installation leases if throughput requires them.
   let executing = false;
   function mutable() {
@@ -139,21 +128,36 @@ export function createPlugins(
         'Wait for the current plugin call before changing plugins.',
       );
   }
-  const source = (repo: string) =>
-    db.prepare('SELECT * FROM rove_plugin_source WHERE repo=?').get(repo);
-  function installations(): Installation[] {
-    return db
-      .prepare('SELECT data FROM rove_plugin_installation ORDER BY rowid')
-      .all()
-      .map((row) => JSON.parse(String(row.data)));
+  async function change<T>(action: () => Promise<T>) {
+    if (changing)
+      throw new HttpError(
+        409,
+        'Plugin settings changed. Reload and review them again.',
+      );
+    changing = true;
+    try {
+      return await action();
+    } finally {
+      changing = false;
+    }
   }
-  function get(id: string) {
-    const item = installations().find((entry) => entry.id === id);
+  const source = async (repo: string) =>
+    await db.get('SELECT * FROM rove_plugin_source WHERE repo=$1', [repo]);
+  async function installations(): Promise<Installation[]> {
+    return (
+      await db.all(
+        'SELECT data FROM rove_plugin_installation ORDER BY sequence',
+        [],
+      )
+    ).map((row) => JSON.parse(String(row.data)));
+  }
+  async function get(id: string) {
+    const item = (await installations()).find((entry) => entry.id === id);
     if (!item) throw new HttpError(404, 'Plugin installation not found.');
     return item;
   }
-  function current(id: string, revision: string) {
-    const item = get(id);
+  async function current(id: string, revision: string) {
+    const item = await get(id);
     if (item.revision !== revision)
       throw new HttpError(
         409,
@@ -161,28 +165,33 @@ export function createPlugins(
       );
     return item;
   }
-  function write(
-    connection: DatabaseSync,
+  async function write(
+    connection: Sql,
     item: Installation,
     event: string,
     digest: string | null = item.active,
   ) {
+    const revision = item.revision;
     item.revision = randomUUID();
-    connection
-      .prepare(
-        'INSERT INTO rove_plugin_installation VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data',
-      )
-      .run(item.id, item.repo, item.pluginId, JSON.stringify(item));
-    connection
-      .prepare(
-        'INSERT INTO rove_plugin_audit(installation,event,digest,at) VALUES(?,?,?,?)',
-      )
-      .run(item.id, event, digest, Date.now());
+    const changed = await connection.run(
+      "INSERT INTO rove_plugin_installation(id,repo,plugin_id,data) VALUES($1,$2,$3,$4) ON CONFLICT(id) DO UPDATE SET data=excluded.data WHERE rove_plugin_installation.data::jsonb->>'revision'=$5",
+      [item.id, item.repo, item.pluginId, JSON.stringify(item), revision],
+    );
+    if (!changed)
+      throw new HttpError(
+        409,
+        'Plugin settings changed. Reload and review them again.',
+      );
+    await connection.run(
+      'INSERT INTO rove_plugin_audit(installation,event,digest,at) VALUES($1,$2,$3,$4)',
+      [item.id, event, digest, Date.now()],
+    );
   }
-  function artifact(digest: string): VerifiedRelease {
-    const row = db
-      .prepare('SELECT data FROM rove_plugin_artifact WHERE digest=?')
-      .get(digest);
+  async function artifact(digest: string): Promise<VerifiedRelease> {
+    const row = await db.get(
+      'SELECT data FROM rove_plugin_artifact WHERE digest=$1',
+      [digest],
+    );
     if (!row) throw new HttpError(404, 'Plugin release not found.');
     const release = JSON.parse(String(row.data)) as VerifiedRelease;
     if (hash(release.bytes) !== digest)
@@ -192,8 +201,8 @@ export function createPlugins(
       );
     return { ...release, manifest: parsePackage(JSON.parse(release.bytes)) };
   }
-  function selected(item: Installation, digest: string) {
-    const release = artifact(digest);
+  async function selected(item: Installation, digest: string) {
+    const release = await artifact(digest);
     if (
       release.repo.toLowerCase() !== item.repo ||
       release.manifest.id !== item.pluginId
@@ -201,9 +210,9 @@ export function createPlugins(
       throw new HttpError(400, 'This release belongs to another installation.');
     return release;
   }
-  function detail(id: string, digest: string) {
-    const release = selected(
-      get(parse(z.uuid(), id)),
+  async function detail(id: string, digest: string) {
+    const release = await selected(
+      await get(parse(z.uuid(), id)),
       parse(digestSchema, digest),
     );
     return {
@@ -212,11 +221,14 @@ export function createPlugins(
       commit: release.commit,
       manifest: release.manifest,
       origin: release.origin,
-      blocked: compatibility(release.manifest, runtime?.status().configured),
+      blocked: compatibility(
+        release.manifest,
+        (await runtime?.status())?.configured,
+      ),
     };
   }
-  function assertApproved(repo: string) {
-    const row = source(repo);
+  async function assertApproved(repo: string) {
+    const row = await source(repo);
     if (!row?.approved)
       throw new HttpError(
         409,
@@ -224,64 +236,65 @@ export function createPlugins(
       );
     return row;
   }
-  function list() {
+  async function list() {
     return {
-      sources: db
-        .prepare(
+      sources: (
+        await db.all(
           'SELECT repo,approved,token FROM rove_plugin_source ORDER BY repo',
+          [],
         )
-        .all()
-        .map((row) => ({
-          repo: String(row.repo),
-          approved: Boolean(row.approved),
-          configured: Boolean(row.token),
-        })),
-      installations: installations().map((item) => ({
-        id: item.id,
-        repo: item.repo,
-        pluginId: item.pluginId,
-        active: item.active,
-        revision: item.revision,
-        values: item.values,
-        grants: item.grants,
-        channelAccess: item.channelAccess,
-        secrets: Object.fromEntries(
-          Object.entries(item.secrets).map(([key, binding]) => [
-            key,
-            {
-              source: binding.source,
-              ...(binding.source === 'environment'
-                ? { name: binding.name }
-                : {}),
-              configured:
-                binding.source === 'stored' || Boolean(env[binding.name]),
-            },
-          ]),
-        ),
-        versions: db
-          .prepare(
-            'SELECT digest,summary FROM rove_plugin_artifact WHERE repo=? AND plugin_id=? ORDER BY rowid DESC',
-          )
-          .all(item.repo, item.pluginId)
-          .map((row) => ({
+      ).map((row) => ({
+        repo: String(row.repo),
+        approved: Boolean(row.approved),
+        configured: Boolean(row.token),
+      })),
+      installations: await Promise.all(
+        (await installations()).map(async (item) => ({
+          id: item.id,
+          repo: item.repo,
+          pluginId: item.pluginId,
+          active: item.active,
+          revision: item.revision,
+          values: item.values,
+          grants: item.grants,
+          channelAccess: item.channelAccess,
+          secrets: Object.fromEntries(
+            Object.entries(item.secrets).map(([key, binding]) => [
+              key,
+              {
+                source: binding.source,
+                ...(binding.source === 'environment'
+                  ? { name: binding.name }
+                  : {}),
+                configured:
+                  binding.source === 'stored' || Boolean(env[binding.name]),
+              },
+            ]),
+          ),
+          versions: (
+            await db.all(
+              'SELECT digest,summary FROM rove_plugin_artifact WHERE repo=$1 AND plugin_id=$2 ORDER BY sequence DESC',
+              [item.repo, item.pluginId],
+            )
+          ).map((row) => ({
             digest: String(row.digest),
             ...(JSON.parse(String(row.summary)) as ReleaseSummary),
           })),
-        audit: db
-          .prepare(
-            'SELECT event,digest,at FROM rove_plugin_audit WHERE installation=? ORDER BY id DESC LIMIT 30',
-          )
-          .all(item.id),
-      })),
+          audit: await db.all(
+            'SELECT event,digest,at FROM rove_plugin_audit WHERE installation=$1 ORDER BY id DESC LIMIT 30',
+            [item.id],
+          ),
+        })),
+      ),
       executable: {
-        available: Boolean(runtime?.status().configured),
-        reason: runtime?.status().configured
+        available: Boolean((await runtime?.status())?.configured),
+        reason: (await runtime?.status())?.configured
           ? 'Custom code runs offline in Railway Sandbox with approval for each call. Live Railway behavior must be verified on your deployment.'
           : 'Configure Railway Sandbox to activate executable User Plugins. Custom code receives ordinary settings and approved input, never credentials or network access.',
       },
     };
   }
-  function saveSource(body: unknown) {
+  async function saveSource(body: unknown) {
     mutable();
     const input = parse(sourceInput, body);
     if (/[\r\n]/.test(input.token ?? '') || (input.token && input.clearToken))
@@ -289,28 +302,26 @@ export function createPlugins(
         400,
         'Enter a replacement GitHub token or clear the saved token.',
       );
-    const previous = source(input.repo);
+    const previous = await source(input.repo);
     if (
       !previous &&
       Number(
-        db.prepare('SELECT COUNT(*) AS count FROM rove_plugin_source').get()
+        (await db.get('SELECT COUNT(*) AS count FROM rove_plugin_source', []))
           ?.count,
       ) >= 16
     )
       throw new HttpError(409, 'Keep at most 16 approved repositories.');
     const revoked = input.approved
       ? []
-      : installations().filter(
+      : (await installations()).filter(
           (entry) => entry.repo === input.repo && entry.active,
         );
-    extensions.deactivateManaged(
+    await extensions.deactivateManaged(
       revoked.map((item) => item.id),
-      (connection) => {
-        connection
-          .prepare(
-            'INSERT INTO rove_plugin_source VALUES(?,?,?,?) ON CONFLICT(repo) DO UPDATE SET token=excluded.token,approved=excluded.approved,revision=excluded.revision',
-          )
-          .run(
+      async (connection) => {
+        await connection.run(
+          'INSERT INTO rove_plugin_source VALUES($1,$2,$3,$4) ON CONFLICT(repo) DO UPDATE SET token=excluded.token,approved=excluded.approved,revision=excluded.revision',
+          [
             input.repo,
             input.clearToken
               ? ''
@@ -319,24 +330,26 @@ export function createPlugins(
                 : String(previous?.token ?? ''),
             Number(input.approved),
             randomUUID(),
-          );
+          ],
+        );
         for (const item of revoked) {
           item.active = null;
-          write(connection, item, 'source-revoked');
+          await write(connection, item, 'source-revoked');
         }
       },
     );
-    return list();
+    return await list();
   }
-  function stageRelease(release: VerifiedRelease) {
+  async function stageRelease(release: VerifiedRelease) {
     const repo = parse(repositoryName, release.repo);
-    assertApproved(repo);
+    await assertApproved(repo);
     const manifest = parsePackage(JSON.parse(release.bytes));
     if (hash(release.bytes) !== release.digest)
       throw new HttpError(409, 'Release digest does not match its bytes.');
-    const sameBytes = db
-      .prepare('SELECT repo,plugin_id FROM rove_plugin_artifact WHERE digest=?')
-      .get(release.digest);
+    const sameBytes = await db.get(
+      'SELECT repo,plugin_id FROM rove_plugin_artifact WHERE digest=$1',
+      [release.digest],
+    );
     if (
       sameBytes &&
       (sameBytes.repo !== repo || sameBytes.plugin_id !== manifest.id)
@@ -346,18 +359,17 @@ export function createPlugins(
         'These identical artifact bytes are already associated with another source.',
       );
     for (const server of manifest.servers) mcpURL(server.url, config.baseURL);
-    const previous = db
-      .prepare(
-        'SELECT digest FROM rove_plugin_artifact WHERE repo=? AND plugin_id=? AND version=?',
-      )
-      .get(repo, manifest.id, manifest.version);
+    const previous = await db.get(
+      'SELECT digest FROM rove_plugin_artifact WHERE repo=$1 AND plugin_id=$2 AND version=$3',
+      [repo, manifest.id, manifest.version],
+    );
     if (previous && previous.digest !== release.digest)
       throw new HttpError(
         409,
         'This version was already installed with different bytes. Publish a new version.',
       );
     if (previous) {
-      const pinned = artifact(String(previous.digest));
+      const pinned = await artifact(String(previous.digest));
       if (
         pinned.tag !== release.tag ||
         pinned.commit !== release.commit ||
@@ -369,10 +381,10 @@ export function createPlugins(
           'This version is already pinned to a different release identity. Publish a new version rather than replacing its source or notices.',
         );
     }
-    let item = installations().find(
+    let item = (await installations()).find(
       (entry) => entry.repo === repo && entry.pluginId === manifest.id,
     );
-    if (!item && installations().length >= 16)
+    if (!item && (await installations()).length >= 16)
       throw new HttpError(
         409,
         'This deployment supports 16 plugin installations.',
@@ -380,34 +392,35 @@ export function createPlugins(
     if (
       !previous &&
       Number(
-        db
-          .prepare(
-            'SELECT COUNT(*) AS count FROM rove_plugin_artifact WHERE repo=? AND plugin_id=?',
+        (
+          await db.get(
+            'SELECT COUNT(*) AS count FROM rove_plugin_artifact WHERE repo=$1 AND plugin_id=$2',
+            [repo, manifest.id],
           )
-          .get(repo, manifest.id)?.count,
+        )?.count,
       ) >= 16
     )
       throw new HttpError(
         409,
         'This installation retains at most 16 releases. Export a backup before pruning through a future maintenance release.',
       );
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      db.prepare(
-        'INSERT INTO rove_plugin_artifact(digest,repo,plugin_id,version,data,summary) VALUES(?,?,?,?,?,?) ON CONFLICT(digest) DO NOTHING',
-      ).run(
-        release.digest,
-        repo,
-        manifest.id,
-        manifest.version,
-        JSON.stringify({ ...release, repo, manifest }),
-        JSON.stringify({
-          name: manifest.name,
-          description: manifest.description,
-          category: manifest.category,
-          version: manifest.version,
-          tag: release.tag,
-        } satisfies ReleaseSummary),
+    return db.transaction(async (tx) => {
+      await tx.run(
+        'INSERT INTO rove_plugin_artifact(digest,repo,plugin_id,version,data,summary) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(digest) DO NOTHING',
+        [
+          release.digest,
+          repo,
+          manifest.id,
+          manifest.version,
+          JSON.stringify({ ...release, repo, manifest }),
+          JSON.stringify({
+            name: manifest.name,
+            description: manifest.description,
+            category: manifest.category,
+            version: manifest.version,
+            tag: release.tag,
+          } satisfies ReleaseSummary),
+        ],
       );
       if (!item) {
         item = {
@@ -420,25 +433,22 @@ export function createPlugins(
           secrets: {},
           grants: [],
         };
-        write(db, item, 'installed', release.digest);
-      } else if (!previous) write(db, item, 'release-prepared', release.digest);
-      db.exec('COMMIT');
-    } catch (error) {
-      db.exec('ROLLBACK');
-      throw error;
-    }
-    return item;
+        await write(tx, item, 'installed', release.digest);
+      } else if (!previous)
+        await write(tx, item, 'release-prepared', release.digest);
+      return item;
+    });
   }
   async function install(body: unknown) {
     const input = parse(installInput, body);
-    const approved = assertApproved(input.repo);
+    const approved = await assertApproved(input.repo);
     const request = {
       repo: input.repo,
       tag: input.tag,
       token: approved.token
         ? secrets.decrypt(String(approved.token))
         : undefined,
-      signal: AbortSignal.any([lifetime.signal, AbortSignal.timeout(60000)]),
+      signal: AbortSignal.any([shutdown, AbortSignal.timeout(60000)]),
     };
     const release =
       input.format === 'rove'
@@ -447,13 +457,13 @@ export function createPlugins(
             { ...request, format: input.format },
             fetchImpl,
           );
-    if (source(input.repo)?.revision !== approved.revision)
+    if ((await source(input.repo))?.revision !== approved.revision)
       throw new HttpError(
         409,
         'Repository approval changed during download. Start again.',
       );
-    stageRelease(release);
-    return list();
+    await stageRelease(release);
+    return await list();
   }
   function validateValues(
     pkg: PluginPackage,
@@ -490,11 +500,11 @@ export function createPlugins(
     }
     return values;
   }
-  function configure(body: unknown) {
+  async function configure(body: unknown) {
     mutable();
     const input = parse(configuration, body);
-    const item = current(input.id, input.revision);
-    const pkg = selected(item, input.digest).manifest;
+    const item = await current(input.id, input.revision);
+    const pkg = (await selected(item, input.digest)).manifest;
     item.values = input.values;
     item.grants = [...new Set(input.grants)];
     if (input.channelAccess && !pkg.channel)
@@ -513,10 +523,12 @@ export function createPlugins(
     }
     validateValues(pkg, item, false);
     item.active = null;
-    extensions.deactivateManaged(item.id, (connection) =>
-      write(connection, item, 'configuration-saved', input.digest),
+    await extensions.deactivateManaged(
+      item.id,
+      async (connection) =>
+        await write(connection, item, 'configuration-saved', input.digest),
     );
-    return list();
+    return await list();
   }
   function secretValue(item: Installation, key: string) {
     const binding = item.secrets[key];
@@ -556,7 +568,7 @@ export function createPlugins(
     pkg: PluginPackage,
     signal: AbortSignal,
   ): Promise<ManagedExtension[]> {
-    const blocked = compatibility(pkg, runtime?.status().configured);
+    const blocked = compatibility(pkg, (await runtime?.status())?.configured);
     if (blocked) throw new HttpError(409, blocked);
     if (pkg.channel && !channelAccess.safeParse(item.channelAccess).success)
       throw new HttpError(
@@ -622,119 +634,72 @@ export function createPlugins(
     }
     return entries;
   }
-  function requireAipGate(release: VerifiedRelease, aipId?: string) {
-    if (
-      !db
-        .prepare(
-          "SELECT 1 FROM sqlite_master WHERE type='table' AND name='rove_aip'",
-        )
-        .get()
-    )
-      return;
-    const related = db
-      .prepare(`SELECT data FROM rove_aip WHERE lower(json_extract(data,'$.repo'))=?
-      AND json_extract(data,'$.skillName')=? AND coalesce(json_extract(data,'$.packageVersion'),'1.0.0')=?`)
-      .all(
-        release.repo.toLowerCase(),
-        release.manifest.id,
-        release.manifest.version,
-      );
-    if (!related.length) return;
-    const proposals = related.map(
-      (row) =>
-        JSON.parse(String(row.data)) as {
-          id: string;
-          status: string;
-          review?: { headSha: string };
-          candidateHead?: string;
-          release?: { digest: string; commit: string; assetId: number };
-        },
-    );
-    const permitted = proposals.some((proposal) => {
-      const pinned =
-        proposal.release?.digest === release.digest &&
-        proposal.release.commit === release.commit &&
-        proposal.release.assetId === release.assetId;
-      return (
-        pinned &&
-        (aipId
-          ? aipId === proposal.id &&
-            proposal.status === 'activating' &&
-            typeof proposal.candidateHead === 'string' &&
-            proposal.review?.headSha === proposal.candidateHead
-          : proposal.status === 'activated')
-      );
-    });
-    if (!permitted)
-      throw new HttpError(
-        409,
-        'This package belongs to an AIP. Complete its final review, release verification and activation in the originating conversation.',
-      );
-  }
 
   async function activate(body: unknown, aipId?: string) {
     const input = parse(activation, body);
-    const item = current(input.id, input.revision);
-    const sourceRevision = assertApproved(item.repo).revision;
-    const release = selected(item, input.digest);
-    requireAipGate(release, aipId);
+    const item = await current(input.id, input.revision);
+    const sourceRevision = (await assertApproved(item.repo)).revision;
+    const release = await selected(item, input.digest);
+    await requireAipRelease(db, release, aipId);
     const entries = await prepare(
       item,
       release.manifest,
-      AbortSignal.any([lifetime.signal, AbortSignal.timeout(30000)]),
+      AbortSignal.any([shutdown, AbortSignal.timeout(30000)]),
     );
-    current(item.id, item.revision);
-    requireAipGate(release, aipId);
-    if (assertApproved(item.repo).revision !== sourceRevision)
-      throw new HttpError(
-        409,
-        'Repository approval changed. Review activation again.',
+    await change(async () => {
+      await current(item.id, item.revision);
+      await requireAipRelease(db, release, aipId);
+      if ((await assertApproved(item.repo)).revision !== sourceRevision)
+        throw new HttpError(
+          409,
+          'Repository approval changed. Review activation again.',
+        );
+      item.active = release.digest;
+      item.environmentFingerprint = environmentFingerprint(item);
+      let operationCount = 0;
+      for (const entry of await installations()) {
+        operationCount +=
+          entry.id === item.id
+            ? release.manifest.operations.length
+            : entry.active
+              ? (await selected(entry, entry.active)).manifest.operations.length
+              : 0;
+      }
+      const serverCount =
+        (await extensions.list()).servers
+          .filter((server) => server.enabled && server.managedBy !== item.id)
+          .reduce((count, server) => count + server.tools.length, 0) +
+        entries.reduce((count, entry) => count + entry.tools.length, 0);
+      if (operationCount + serverCount > 32)
+        throw new HttpError(
+          409,
+          'Enable at most 32 MCP and plugin operations across this deployment.',
+        );
+      await extensions.replaceManaged(
+        item.id,
+        entries,
+        async (connection) =>
+          await write(connection, item, 'activated', release.digest),
       );
-    item.active = release.digest;
-    item.environmentFingerprint = environmentFingerprint(item);
-    const operationCount = installations().reduce(
-      (count, entry) =>
-        count +
-        (entry.id === item.id
-          ? release.manifest.operations.length
-          : entry.active
-            ? selected(entry, entry.active).manifest.operations.length
-            : 0),
-      0,
-    );
-    const serverCount =
-      extensions
-        .list()
-        .servers.filter(
-          (server) => server.enabled && server.managedBy !== item.id,
-        )
-        .reduce((count, server) => count + server.tools.length, 0) +
-      entries.reduce((count, entry) => count + entry.tools.length, 0);
-    if (operationCount + serverCount > 32)
-      throw new HttpError(
-        409,
-        'Enable at most 32 MCP and plugin operations across this deployment.',
-      );
-    extensions.replaceManaged(item.id, entries, (connection) =>
-      write(connection, item, 'activated', release.digest),
-    );
-    return list();
+    });
+    return await list();
   }
-  function deactivate(body: unknown) {
+  async function deactivate(body: unknown) {
     mutable();
     const input = parse(target, body);
-    const item = current(input.id, input.revision);
+    const item = await current(input.id, input.revision);
     item.active = null;
-    extensions.deactivateManaged(item.id, (connection) =>
-      write(connection, item, 'deactivated'),
+    await extensions.deactivateManaged(
+      item.id,
+      async (connection) => await write(connection, item, 'deactivated'),
     );
-    return list();
+    return await list();
   }
-  function activeChannel(id: string): ActiveChannel | undefined {
+  async function activeChannel(id: string): Promise<ActiveChannel | undefined> {
     if (closed) return;
-    const item = installations().find((entry) => entry.id === id);
-    if (!item?.active || !source(item.repo)?.approved) return;
-    const pkg = selected(item, item.active).manifest;
+    const item = (await installations()).find((entry) => entry.id === id);
+    if (!item?.active || !(await source(item.repo))?.approved) return;
+    const pkg = (await selected(item, item.active)).manifest;
     if (
       !pkg.channel ||
       !item.channelAccess ||
@@ -757,60 +722,65 @@ export function createPlugins(
       ),
     };
   }
-  function activeContributions() {
+  async function activeContributions() {
     if (closed) throw new HttpError(503, 'Plugins are shutting down.');
-    const executionTarget = runtime?.status();
-    return installations().flatMap((item) => {
-      if (
-        !item.active ||
-        !source(item.repo)?.approved ||
-        item.environmentFingerprint !== environmentFingerprint(item)
+    const executionTarget = await runtime?.status();
+    return (
+      await Promise.all(
+        (
+          await installations()
+        ).map(async (item) => {
+          if (
+            !item.active ||
+            !(await source(item.repo))?.approved ||
+            item.environmentFingerprint !== environmentFingerprint(item)
+          )
+            return [];
+          const pkg = (await selected(item, item.active)).manifest;
+          if (
+            compatibility(pkg, executionTarget?.configured) ||
+            pkg.capabilities.some((grant) => !item.grants.includes(grant))
+          )
+            return [];
+          const values = validateValues(pkg, item, true);
+          if (
+            pkg.secrets.some(
+              (field) => field.required && !secretValue(item, field.key),
+            )
+          )
+            return [];
+          const revision = hash(
+            JSON.stringify([
+              item.revision,
+              item.active,
+              values,
+              item.grants,
+              item.environmentFingerprint,
+              executionTarget?.environmentId ?? null,
+              executionTarget?.authType ?? null,
+            ]),
+          );
+          return [
+            {
+              item,
+              pkg,
+              values,
+              operations: pkg.operations.map((operation) => ({
+                operation,
+                definition: operationDefinition(item.id, revision, operation),
+              })),
+            },
+          ];
+        }),
       )
-        return [];
-      const pkg = selected(item, item.active).manifest;
-      if (
-        compatibility(pkg, executionTarget?.configured) ||
-        pkg.capabilities.some((grant) => !item.grants.includes(grant))
-      )
-        return [];
-      const values = validateValues(pkg, item, true);
-      if (
-        pkg.secrets.some(
-          (field) => field.required && !secretValue(item, field.key),
-        )
-      )
-        return [];
-      const revision = hash(
-        JSON.stringify([
-          item.revision,
-          item.active,
-          values,
-          item.grants,
-          item.environmentFingerprint,
-          executionTarget?.environmentId ?? null,
-          executionTarget?.authType ?? null,
-        ]),
-      );
-      return [
-        {
-          item,
-          pkg,
-          values,
-          operations: pkg.operations.map((operation) => ({
-            operation,
-            definition: operationDefinition(item.id, revision, operation),
-          })),
-        },
-      ];
-    });
+    ).flat();
   }
-  function operationCatalog() {
-    const available = activeContributions();
+  async function operationCatalog() {
+    const available = await activeContributions();
     const count =
       available.reduce((sum, entry) => sum + entry.operations.length, 0) +
-      extensions
-        .list()
-        .servers.filter((server) => server.enabled)
+      (await extensions.list()).servers
+        .filter((server) => server.enabled)
         .reduce((sum, server) => sum + server.tools.length, 0);
     if (count > 32)
       throw new HttpError(
@@ -819,9 +789,9 @@ export function createPlugins(
       );
     return available;
   }
-  function contributions() {
+  async function contributions() {
     return {
-      plugins: operationCatalog()
+      plugins: (await operationCatalog())
         .filter(
           ({ pkg }) =>
             pkg.pages.length ||
@@ -848,8 +818,8 @@ export function createPlugins(
         })),
     };
   }
-  function findOperation(name: string) {
-    for (const entry of operationCatalog()) {
+  async function findOperation(name: string) {
+    for (const entry of await operationCatalog()) {
       const operation = entry.operations.find(
         ({ definition }) => definition.name === name,
       );
@@ -863,7 +833,7 @@ export function createPlugins(
     revision: string,
     signal: AbortSignal,
   ) {
-    const entry = findOperation(name);
+    const entry = await findOperation(name);
     if (entry.definition.revision !== revision)
       throw new HttpError(
         409,
@@ -872,20 +842,26 @@ export function createPlugins(
     const input = structuredClone(args);
     await checkOperationArguments(entry.definition, input);
     mutable();
-    if (busy)
+    if (busy || changing)
       throw new HttpError(
         409,
         'Wait for the current plugin change before running an operation.',
       );
-    if (findOperation(name).definition.revision !== revision)
+    if ((await findOperation(name)).definition.revision !== revision)
       throw new HttpError(
         409,
         'The plugin configuration changed. Request a new approval.',
       );
     if (!runtime || !entry.pkg.execution)
       throw new HttpError(409, 'Plugin execution is unavailable.');
-    const operationSignal = AbortSignal.any([signal, lifetime.signal]);
+    const operationSignal = AbortSignal.any([signal, shutdown]);
     operationSignal.throwIfAborted();
+    mutable();
+    if (busy || changing)
+      throw new HttpError(
+        409,
+        'Wait for the current plugin change before running an operation.',
+      );
     executing = true;
     try {
       const result = await runtime.execute(
@@ -898,7 +874,7 @@ export function createPlugins(
         operationSignal,
       );
       operationSignal.throwIfAborted();
-      if (findOperation(name).definition.revision !== revision)
+      if ((await findOperation(name)).definition.revision !== revision)
         throw new HttpError(
           409,
           'The plugin configuration changed during execution.',
@@ -906,12 +882,11 @@ export function createPlugins(
       return result;
     } finally {
       executing = false;
-      if (closed && !busy) db.close();
     }
   }
   async function run<T>(action: () => Promise<T>) {
     mutable();
-    if (busy)
+    if (busy || changing)
       throw new HttpError(
         409,
         'Another plugin operation is running. Wait for it to finish.',
@@ -921,53 +896,49 @@ export function createPlugins(
       return await action();
     } finally {
       busy = false;
-      if (closed) db.close();
     }
   }
-  try {
-    // Deployment-variable rotation invalidates cached credentials and pending approvals before chat starts.
-    for (const item of installations())
-      if (
-        item.active &&
-        Object.values(item.secrets).some(
-          (binding) => binding.source === 'environment',
-        ) &&
-        item.environmentFingerprint !== environmentFingerprint(item)
-      ) {
-        item.active = null;
-        extensions.deactivateManaged(item.id, (connection) =>
-          write(connection, item, 'environment-secret-changed'),
-        );
-      }
-  } catch (error) {
-    db.close();
-    throw error;
-  }
+  // Deployment-variable rotation invalidates cached credentials and pending approvals before chat starts.
+  for (const item of await installations())
+    if (
+      item.active &&
+      Object.values(item.secrets).some(
+        (binding) => binding.source === 'environment',
+      ) &&
+      item.environmentFingerprint !== environmentFingerprint(item)
+    ) {
+      item.active = null;
+      await extensions.deactivateManaged(
+        item.id,
+        async (connection) =>
+          await write(connection, item, 'environment-secret-changed'),
+      );
+    }
   return {
     list,
     detail,
-    saveSource,
-    configure,
-    deactivate,
+    saveSource: (body: unknown) => change(() => saveSource(body)),
+    configure: (body: unknown) => change(() => configure(body)),
+    deactivate: (body: unknown) => change(() => deactivate(body)),
     activeChannel,
     contributions,
     tools: async (signal: AbortSignal) => {
       signal.throwIfAborted();
-      return operationCatalog().flatMap((entry) =>
+      return (await operationCatalog()).flatMap((entry) =>
         entry.operations.map(({ definition }) => definition),
       );
     },
     execute,
-    preview: (name: string, args: Record<string, unknown>) => {
-      const { pkg, operation } = findOperation(name);
+    preview: async (name: string, args: Record<string, unknown>) => {
+      const { pkg, operation } = await findOperation(name);
       return `${pkg.name}: ${operation.name}\nOffline custom code; no network or credentials.\n${JSON.stringify(args, null, 2)}`;
     },
     install: (body: unknown) => run(() => install(body)),
     activate: (body: unknown) => run(() => activate(body)),
     activateRelease: (skill: ReleasedSkill) =>
       run(async () => {
-        const item = stageRelease(skill.release);
-        requireAipGate(skill.release, skill.id);
+        const item = await stageRelease(skill.release);
+        await requireAipRelease(db, skill.release, skill.id);
         if (item.active === skill.release.digest) return;
         await activate(
           {
@@ -982,7 +953,6 @@ export function createPlugins(
       if (closed) return;
       closed = true;
       lifetime.abort();
-      if (!busy && !executing) db.close();
     },
   };
 }

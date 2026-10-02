@@ -1,15 +1,14 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import { createApplication, MAX_BODY, requestBodyLimit } from '../src/app.js';
 import { createIdentity } from '../src/auth.js';
 import { readConfig } from '../src/config.js';
+import { createDatabase } from '../src/database.js';
 import { createExtensions } from '../src/extensions.js';
 import { createPlugins } from '../src/plugins.js';
+import { closeRuntime, openRuntime } from '../src/runtime.js';
+import { testConfig, testRuntime } from './storage.js';
 
 const origin = 'https://rove.example';
 const setupSecret = 'test-setup-secret-for-local-tests-only-32-chars';
@@ -44,13 +43,12 @@ function cookies(response: Response) {
     .join('; ');
 }
 
-test('protected setup, administrator authorization, recovery, sign-out and restart', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'rove-auth-'));
+test('protected setup, administrator authorization, recovery, sign-out and restart', async (t) => {
   const config = {
+    ...(await testConfig(t)),
     baseURL: origin,
     authSecret,
     setupSecret,
-    databasePath: join(dir, 'rove.sqlite'),
   };
   let app = await createApplication(config);
   try {
@@ -185,27 +183,28 @@ test('protected setup, administrator authorization, recovery, sign-out and resta
       ).json(),
       { name: account.name, email: account.email, role: 'admin' },
     );
-    const db = new DatabaseSync(config.databasePath);
-    const stored = db.prepare('SELECT password FROM account').get();
+    const db = await createDatabase(config.databaseURL);
+    const stored = await db.get('SELECT password FROM account');
     assert.notEqual(stored?.password, account.password);
     assert.notEqual(
-      db.prepare('SELECT recovery_hash FROM rove_admin').get()?.recovery_hash,
+      (await db.get('SELECT recovery_hash FROM rove_admin'))?.recovery_hash,
       recoveryKey,
     );
     // A valid session alone cannot grant administration to a different user.
     const outsider = randomUUID();
-    db.prepare(
-      'INSERT INTO user(id,name,email,emailVerified,createdAt,updatedAt) VALUES(?,?,?,0,?,?)',
-    ).run(outsider, 'Other user', 'other@example.com', Date.now(), Date.now());
-    db.prepare('UPDATE session SET userId = ?').run(outsider);
+    await db.run(
+      'INSERT INTO "user"(id,name,email,"emailVerified","createdAt","updatedAt") VALUES($1,$2,$3,false,$4,$4)',
+      [outsider, 'Other user', 'other@example.com', new Date()],
+    );
+    await db.run('UPDATE session SET "userId" = $1', [outsider]);
     assert.equal(
       (await app.fetch(request('/api/admin/me', undefined, cookie))).status,
       403,
     );
-    db.prepare(
-      'UPDATE session SET userId = (SELECT user_id FROM rove_admin)',
-    ).run();
-    db.close();
+    await db.run(
+      'UPDATE session SET "userId" = (SELECT user_id FROM rove_admin)',
+    );
+    await db.close();
     await app.close();
     app = await createApplication({ ...config, setupSecret: undefined });
     assert.deepEqual(await (await app.fetch(request('/api/setup'))).json(), {
@@ -283,23 +282,19 @@ test('protected setup, administrator authorization, recovery, sign-out and resta
     );
   } finally {
     await app.close();
-    rmSync(dir, { recursive: true, force: true });
   }
 });
 
 test('plugin configuration accepts all declared settings and secrets within its own HTTP envelope', async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), 'rove-config-body-'));
+  let app: Awaited<ReturnType<typeof createApplication>> | undefined;
+  t.after(() => app?.close());
   const config = {
+    ...(await testConfig(t)),
     baseURL: origin,
     authSecret,
     setupSecret,
-    databasePath: join(dir, 'rove.sqlite'),
   };
-  const app = await createApplication(config);
-  t.after(async () => {
-    await app.close();
-    rmSync(dir, { recursive: true, force: true });
-  });
+  const fixture = await openRuntime(config);
   const fields = (count: number) =>
     Array.from({ length: count }, (_, n) => ({
       key: `field-${n}`,
@@ -350,11 +345,13 @@ test('plugin configuration accepts all declared settings and secrets within its 
     if (path.endsWith('/releases/assets/7')) return new Response(bytes);
     assert.fail(`Unexpected fixture request: ${path}`);
   };
-  const extensions = createExtensions(config);
-  const plugins = createPlugins(config, extensions, controlledFetch);
-  let installation: ReturnType<typeof plugins.list>['installations'][number];
+  const extensions = await createExtensions(fixture);
+  const plugins = await createPlugins(fixture, extensions, controlledFetch);
+  let installation: Awaited<
+    ReturnType<typeof plugins.list>
+  >['installations'][number];
   try {
-    plugins.saveSource({ repo: 'example/large-config', approved: true });
+    await plugins.saveSource({ repo: 'example/large-config', approved: true });
     const state = await plugins.install({
       repo: 'example/large-config',
       tag: 'v1.0.0',
@@ -362,9 +359,11 @@ test('plugin configuration accepts all declared settings and secrets within its 
     assert.ok(state.installations[0]);
     installation = state.installations[0];
   } finally {
-    plugins.close();
-    extensions.close();
+    await plugins.close();
+    await extensions.close();
+    await closeRuntime(fixture);
   }
+  app = await createApplication(config);
   assert.equal((await app.fetch(request('/api/setup', account))).status, 201);
   const cookie = cookies(
     await app.fetch(request('/api/auth/sign-in/email', account)),
@@ -413,13 +412,12 @@ test('plugin configuration accepts all declared settings and secrets within its 
   );
 });
 
-test('malformed input and persistent rate limits cannot be bypassed with proxy headers', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'rove-limit-'));
+test('malformed input and persistent rate limits cannot be bypassed with proxy headers', async (t) => {
   const config = {
+    ...(await testConfig(t)),
     baseURL: origin,
     authSecret,
     setupSecret,
-    databasePath: join(dir, 'rove.sqlite'),
   };
   let app = await createApplication(config);
   try {
@@ -454,7 +452,6 @@ test('malformed input and persistent rate limits cannot be bypassed with proxy h
     );
   } finally {
     await app.close();
-    rmSync(dir, { recursive: true, force: true });
   }
 });
 
@@ -477,41 +474,49 @@ test('deployment config fails closed', () => {
       }),
     /separate/,
   );
+  const env = {
+    ROVE_URL: origin,
+    BETTER_AUTH_SECRET: authSecret,
+    DATABASE_URL: 'postgres://localhost/rove',
+    REDIS_URL: 'redis://localhost:6379',
+  };
   assert.equal(
-    readConfig({
-      ROVE_URL: 'http://localhost:3000',
-      BETTER_AUTH_SECRET: authSecret,
-    }).baseURL,
+    readConfig({ ...env, ROVE_URL: 'http://localhost:3000' }).baseURL,
     'http://localhost:3000',
   );
-  assert.deepEqual(
-    readConfig({
-      ROVE_URL: origin,
-      ROVE_SETUP_SECRET: setupSecret,
-      ROVE_DATABASE_PATH: '/data/chosen.sqlite',
-      BETTER_AUTH_SECRET: authSecret,
-    }),
-    {
-      baseURL: origin,
-      setupSecret,
-      databasePath: '/data/chosen.sqlite',
-      authSecret,
-    },
+  assert.deepEqual(readConfig({ ...env, ROVE_SETUP_SECRET: setupSecret }), {
+    baseURL: origin,
+    setupSecret,
+    authSecret,
+    databaseURL: env.DATABASE_URL,
+    redisURL: env.REDIS_URL,
+    redisPrefix: 'rove',
+  });
+  assert.throws(
+    () => readConfig({ ...env, DATABASE_URL: undefined }),
+    /DATABASE_URL/,
   );
-  assert.equal(
-    readConfig({ ROVE_URL: origin, BETTER_AUTH_SECRET: authSecret })
-      .databasePath,
-    './data/rove.sqlite',
+  assert.throws(
+    () => readConfig({ ...env, REDIS_URL: undefined }),
+    /REDIS_URL/,
+  );
+  assert.throws(
+    () => readConfig({ ...env, DATABASE_URL: 'file:/tmp/db' }),
+    /DATABASE_URL/,
+  );
+  assert.throws(
+    () => readConfig({ ...env, ROVE_STATE_KEY_PREFIX: '*' }),
+    /ROVE_STATE_KEY_PREFIX/,
   );
 });
 
 // Pause real password verification to make the reset/login race deterministic.
-test('recovery rejects a login already checking the previous password', async () => {
+test('recovery rejects a login already checking the previous password', async (t) => {
   const identity = await createIdentity({
+    ...(await testRuntime(t)),
     baseURL: origin,
     authSecret,
     setupSecret,
-    databasePath: ':memory:',
   });
   try {
     const { recoveryKey } = await identity.bootstrap(account);
@@ -558,4 +563,30 @@ test('recovery rejects a login already checking the previous password', async ()
   } finally {
     identity.close();
   }
+});
+
+test('login cannot insert a session after runtime ownership is lost during password verification', async (t) => {
+  const config = {
+    ...(await testRuntime(t)),
+    baseURL: origin,
+    authSecret,
+    setupSecret,
+  };
+  const identity = await createIdentity(config);
+  await identity.bootstrap(account);
+  const context = await identity.auth.$context;
+  const verify = context.password.verify;
+  context.password.verify = async (value) => {
+    const result = await verify(value);
+    await config.state.close();
+    return result;
+  };
+  const response = await identity.signIn(
+    request('/api/auth/sign-in/email', account),
+  );
+  assert.equal(response.status, 503);
+  assert.equal(
+    (await config.db.get('SELECT count(*) AS count FROM session'))?.count,
+    0,
+  );
 });

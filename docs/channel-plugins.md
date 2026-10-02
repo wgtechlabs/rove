@@ -97,5 +97,6 @@ An interrupted `processing` or `delivering` job becomes `uncertain` at restart.
 Pending and prepared replies survive restart, subject to current permissions.
 Event tombstones are retained: 10,000 total events and 500 outstanding jobs per
 deployment. Reaching either bound rejects new events; no automatic archival is
-implemented. Use one process and replica per database. Do not treat a controlled
+implemented. Use one active core per deployment; PostgreSQL stores the durable
+queue and Redis enforces core ownership. Do not treat a controlled
 local integration test as proof of delivery to a live provider.

@@ -6,7 +6,6 @@
 !src/**
 !public/
 !public/**
-!docker-entrypoint.sh
 !LICENSE
 !Dockerfile
 !.dockerignore
