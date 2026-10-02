@@ -2,16 +2,26 @@ import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { createAips } from './aip.js';
 import { createIdentity, HttpError } from './auth.js';
+import { createChannels } from './channels.js';
 import { createChat } from './chat.js';
 import type { Config } from './config.js';
 import { createExtensions } from './extensions.js';
-import { createSlack } from './slack.js';
+import { createPluginChannels } from './plugin-channel.js';
+import { createPlugins } from './plugins.js';
+import { createRailwayRuntime } from './railway.js';
 
 export const MAX_BODY = 32768;
+// Plugin settings, secret bindings and channel allowlists can exceed the chat
+// envelope, including JSON escaping. Keep the larger bound on this route only.
+export function requestBodyLimit(path: string) {
+  return path === '/api/admin/plugins/configure' ? 512 * 1024 : MAX_BODY;
+}
 const assets: Record<string, [string, string]> = {
   '/': ['index.html', 'text/html; charset=utf-8'],
   '/app.js': ['app.js', 'text/javascript; charset=utf-8'],
   '/manage.js': ['manage.js', 'text/javascript; charset=utf-8'],
+  '/plugins.js': ['plugins.js', 'text/javascript; charset=utf-8'],
+  '/plugin-pages.js': ['plugin-pages.js', 'text/javascript; charset=utf-8'],
   '/chat.js': ['chat.js', 'text/javascript; charset=utf-8'],
   '/style.css': ['style.css', 'text/css; charset=utf-8'],
   '/brand/icon.svg': ['brand/icon.svg', 'image/svg+xml'],
@@ -31,13 +41,21 @@ export async function createApplication(
   let extensions: ReturnType<typeof createExtensions>;
   let aips: ReturnType<typeof createAips>;
   let chat: ReturnType<typeof createChat>;
-  let slack: ReturnType<typeof createSlack>;
+  let slack: ReturnType<typeof createChannels>;
+  let plugins: ReturnType<typeof createPlugins>;
+  let runtime: ReturnType<typeof createRailwayRuntime>;
+  let installedChannels: ReturnType<typeof createPluginChannels> | undefined;
   try {
     extensions = createExtensions(config);
     cleanup.push(() => extensions.close());
-    aips = createAips(config, (skill) => {
-      extensions.adoptSkill(skill);
-    });
+    runtime = createRailwayRuntime(config);
+    cleanup.push(() => runtime.close());
+    plugins = createPlugins(config, extensions, fetch, process.env, runtime);
+    cleanup.push(() => plugins.close());
+    void runtime
+      .reconcile()
+      .catch(() => console.error('Sandbox cleanup needs attention.'));
+    aips = createAips(config, (skill) => plugins.activateRelease(skill));
     cleanup.push(() => aips.close());
     chat = createChat(config, {
       instructions(scope) {
@@ -55,23 +73,46 @@ export async function createApplication(
           .join('\n\n');
       },
       preview(name, args, scope) {
-        return name.startsWith('rove_aip_')
-          ? aips.preview(name, args, scope)
-          : JSON.stringify(args, null, 2);
+        if (name.startsWith('rove_aip_'))
+          return aips.preview(name, args, scope);
+        if (name.startsWith('rove_plugin_')) return plugins.preview(name, args);
+        return JSON.stringify(args, null, 2);
       },
       async tools(scope, signal) {
-        return [...(await extensions.tools(signal)), ...aips.tools(scope)];
+        const tools = [
+          ...(await extensions.tools(signal)),
+          ...(await plugins.tools(signal)),
+        ];
+        if (tools.length > 32)
+          throw new HttpError(
+            409,
+            'Enable at most 32 MCP and plugin operations.',
+          );
+        return [...tools, ...aips.tools(scope)];
       },
       execute(name, args, revision, scope, signal) {
-        return name.startsWith('rove_aip_')
-          ? aips.execute(name, args, revision, scope, signal)
-          : extensions.execute(name, args, revision, signal);
+        if (name.startsWith('rove_aip_'))
+          return aips.execute(name, args, revision, scope, signal);
+        if (name.startsWith('rove_plugin_'))
+          return plugins.execute(name, args, revision, signal);
+        return extensions.execute(name, args, revision, signal);
       },
     });
     cleanup.push(() => chat.close());
-    slack = createSlack(config, chat);
+    slack = createChannels(config, chat);
     cleanup.push(() => slack.close());
     slack.start();
+    try {
+      installedChannels = createPluginChannels(
+        config,
+        chat,
+        plugins.activeChannel,
+      );
+      cleanup.push(() => installedChannels?.close());
+      installedChannels.start();
+    } catch {
+      console.error('Installed channels are unavailable.');
+    }
   } catch (error) {
     await Promise.allSettled(cleanup.reverse().map(async (close) => close()));
     throw error;
@@ -79,6 +120,14 @@ export async function createApplication(
   const json = (body: unknown, status = 200) => Response.json(body, { status });
   async function route(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
+    const channelRoute = /^\/api\/channels\/([a-f0-9-]{36})\/events$/.exec(
+      path,
+    );
+    if (request.method === 'POST' && channelRoute?.[1]) {
+      if (!installedChannels)
+        throw new HttpError(503, 'Installed channels are unavailable.');
+      return installedChannels.handle(request, channelRoute[1]);
+    }
     if (
       request.method === 'POST' &&
       ['/api/slack/events', '/api/slack/interactivity'].includes(path)
@@ -93,7 +142,27 @@ export async function createApplication(
       if (request.method === 'GET' && path === '/api/admin/me')
         return json(admin);
       if (request.method === 'GET') {
+        const releaseRoute =
+          /^\/api\/admin\/plugins\/([a-f0-9-]{36})\/releases\/([a-f0-9]{64})$/.exec(
+            path,
+          );
+        if (releaseRoute?.[1] && releaseRoute[2])
+          return json(plugins.detail(releaseRoute[1], releaseRoute[2]));
+        const channelStatus =
+          /^\/api\/admin\/plugins\/([a-f0-9-]{36})\/channel$/.exec(path);
+        if (channelStatus?.[1])
+          return json(
+            installedChannels?.status(channelStatus[1]) ?? {
+              state: 'failed',
+              jobs: [],
+            },
+          );
         if (path === '/api/admin/extensions') return json(extensions.list());
+        if (path === '/api/admin/plugins') return json(plugins.list());
+        if (path === '/api/admin/plugins/contributions')
+          return json(plugins.contributions());
+        if (path === '/api/admin/runtime') return json(runtime.status());
+        if (path === '/api/admin/channels') return json(slack.status());
         if (path === '/api/admin/slack') return json(slack.settings());
         if (path === '/api/admin/github') return json(aips.settings());
         const aipRoute = /^\/api\/admin\/aips\/([a-f0-9-]{36})$/.exec(path);
@@ -122,7 +191,7 @@ export async function createApplication(
       )
         throw new HttpError(415, 'Send JSON.');
       const raw = await request.text();
-      if (Buffer.byteLength(raw) > MAX_BODY)
+      if (Buffer.byteLength(raw) > requestBodyLimit(path))
         throw new HttpError(413, 'The request is too large.');
       let body: unknown;
       try {
@@ -133,6 +202,16 @@ export async function createApplication(
       if (!body || typeof body !== 'object' || Array.isArray(body))
         throw new HttpError(400, 'Send a JSON object.');
       const values = body as Record<string, unknown>;
+      if (path === '/api/admin/plugins/sources')
+        return json(plugins.saveSource(values));
+      if (path === '/api/admin/plugins/install')
+        return json(await plugins.install(values));
+      if (path === '/api/admin/plugins/configure')
+        return json(plugins.configure(values));
+      if (path === '/api/admin/plugins/activate')
+        return json(await plugins.activate(values));
+      if (path === '/api/admin/plugins/deactivate')
+        return json(plugins.deactivate(values));
       if (path === '/api/admin/extensions')
         return json(extensions.save(values));
       if (path === '/api/admin/extensions/probe') {
@@ -148,6 +227,10 @@ export async function createApplication(
         /^\/api\/admin\/conversations\/([a-f0-9-]{36})\/approval$/.exec(path);
       if (approvalRoute?.[1])
         return json(await chat.decide(approvalRoute[1], values));
+      const actionRoute =
+        /^\/api\/admin\/conversations\/([a-f0-9-]{36})\/actions$/.exec(path);
+      if (actionRoute?.[1])
+        return json(await chat.requestAction(actionRoute[1], values));
       if (path === '/api/admin/settings')
         return json(chat.saveSettings(body as Record<string, unknown>));
       if (path === '/api/admin/settings/disconnect')
@@ -196,15 +279,22 @@ export async function createApplication(
   }
   return {
     cancelPending() {
+      installedChannels?.cancelPending();
       slack.cancelPending();
       chat.cancelPending();
     },
     async close() {
+      installedChannels?.cancelPending();
       slack.cancelPending();
       chat.cancelPending();
+      await installedChannels?.close().catch(() => {
+        console.error('Installed channel cleanup failed.');
+      });
       await slack.close();
       chat.close();
       aips.close();
+      plugins.close();
+      await runtime.close();
       extensions.close();
       identity.close();
     },

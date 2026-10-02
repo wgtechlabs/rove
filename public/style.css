@@ -228,7 +228,8 @@ label {
   font-weight: 650;
 }
 input,
-textarea {
+textarea,
+select {
   inline-size: 100%;
   min-inline-size: 0;
   min-block-size: 48px;
@@ -241,7 +242,8 @@ textarea {
   caret-color: var(--focus);
 }
 input:hover,
-textarea:hover {
+textarea:hover,
+select:hover {
   border-color: var(--focus);
 }
 input::placeholder,
@@ -250,7 +252,8 @@ textarea::placeholder {
   opacity: 1;
 }
 input:focus-visible,
-textarea:focus-visible {
+textarea:focus-visible,
+select:focus-visible {
   border-color: var(--focus);
 }
 textarea {
@@ -743,4 +746,49 @@ noscript {
 summary {
   cursor: pointer;
   min-block-size: 44px;
+}
+.plugin-empty {
+  margin-block: 24px;
+  color: var(--quiet);
+}
+.plugin-details {
+  margin-block: 20px;
+}
+.plugin-details > summary {
+  padding-block: 10px;
+  font-weight: 650;
+}
+.plugin-preview {
+  max-block-size: 320px;
+  overflow: auto;
+  padding: 16px;
+  background: var(--canvas);
+  border-radius: var(--control-radius);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 0.8125rem;
+}
+.plugin-permissions {
+  margin: 24px 0 0;
+  padding: 0;
+  border: 0;
+  min-inline-size: 0;
+}
+.plugin-permissions legend {
+  padding: 0;
+  font-weight: 650;
+}
+.plugin-source {
+  margin-block-start: 24px;
+}
+.plugin-source .settings-actions {
+  margin-block-start: 12px;
+}
+.plugin-audit {
+  padding-inline-start: 24px;
+  font-size: 0.875rem;
+  font-variant-numeric: tabular-nums;
+}
+.plugin-audit li + li {
+  margin-block-start: 16px;
 }

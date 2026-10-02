@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
+import { isDeepStrictEqual } from 'node:util';
 import { HttpError } from './auth.js';
 import type { Config } from './config.js';
 import {
@@ -30,9 +31,11 @@ interface Run {
   status: 'waiting' | 'executing' | 'ready' | 'done';
   steps: number;
   answer?: string;
+  direct?: true;
   pending?: {
     id: string;
     name: string;
+    label?: string;
     arguments: Record<string, unknown>;
     revision: string;
     created: number;
@@ -59,6 +62,12 @@ export function createAgent(config: Config, tools: AgentTools) {
     ).run(run.id, run.conversation, run.scope, JSON.stringify(run));
   }
   function toolResult(run: Run, result: string) {
+    if (run.direct) {
+      run.answer = result.slice(0, 24000);
+      run.status = 'done';
+      save(run);
+      return;
+    }
     const last = run.history.at(-1);
     if (!last || !('tool_calls' in last) || !last.tool_calls[0])
       throw new HttpError(500, 'The saved action cannot be resumed.');
@@ -104,7 +113,9 @@ export function createAgent(config: Config, tools: AgentTools) {
     signal: AbortSignal,
   ) {
     if (run.status === 'waiting' || run.status === 'done') return run;
-    const available = await tools.tools(run.scope, signal);
+    const available = (await tools.tools(run.scope, signal)).filter((tool) =>
+      (tool.surfaces ?? ['tool']).some((surface) => surface !== 'action'),
+    );
     const instructions = tools.instructions(run.scope);
     const result = await complete(
       {
@@ -142,6 +153,7 @@ export function createAgent(config: Config, tools: AgentTools) {
       run.pending = {
         id: randomUUID(),
         name: definition.name,
+        label: definition.label,
         arguments: args as Record<string, unknown>,
         revision: definition.revision,
         created: Date.now(),
@@ -173,6 +185,102 @@ export function createAgent(config: Config, tools: AgentTools) {
   }
   return {
     completed,
+    async requestAction(
+      id: string,
+      conversation: string,
+      scope: string,
+      name: string,
+      args: unknown,
+      signal: AbortSignal,
+      expectedRevision?: string,
+    ) {
+      if (scope !== `web:${conversation}`)
+        throw new HttpError(
+          403,
+          'Dashboard actions require a web conversation.',
+        );
+      let argumentsSnapshot: Record<string, unknown>;
+      try {
+        const serialized = JSON.stringify(args);
+        const parsed: unknown = JSON.parse(serialized);
+        if (
+          !parsed ||
+          typeof parsed !== 'object' ||
+          Array.isArray(parsed) ||
+          Buffer.byteLength(serialized) > 16000
+        )
+          throw new Error('Invalid arguments.');
+        argumentsSnapshot = parsed as Record<string, unknown>;
+      } catch {
+        throw new HttpError(
+          400,
+          'Action arguments must be a JSON object within 16 KB.',
+        );
+      }
+      const previous = read(id);
+      if (previous) {
+        if (
+          !previous.direct ||
+          previous.conversation !== conversation ||
+          previous.scope !== scope ||
+          previous.pending?.name !== name ||
+          (expectedRevision !== undefined &&
+            previous.pending.revision !== expectedRevision) ||
+          !isDeepStrictEqual(previous.pending.arguments, argumentsSnapshot)
+        )
+          throw new HttpError(
+            409,
+            'This request ID was already used for another action or message.',
+          );
+        return previous;
+      }
+      if (active(conversation, scope))
+        throw new HttpError(
+          409,
+          'Review the pending action before requesting another action.',
+        );
+      const definition = (await tools.tools(scope, signal)).find(
+        (tool) => tool.name === name && tool.surfaces?.includes('action'),
+      );
+      if (!definition)
+        throw new HttpError(
+          409,
+          'This dashboard action is no longer available.',
+        );
+      if (
+        expectedRevision !== undefined &&
+        definition.revision !== expectedRevision
+      )
+        throw new HttpError(
+          409,
+          'This dashboard action changed. Reload its page before reviewing it.',
+        );
+      signal.throwIfAborted();
+      const run: Run = {
+        id,
+        conversation,
+        scope,
+        prompt: `Run action: ${definition.label || definition.name}`,
+        history: [],
+        status: 'waiting',
+        steps: 1,
+        direct: true,
+        pending: {
+          id: randomUUID(),
+          name: definition.name,
+          label: definition.label,
+          arguments: argumentsSnapshot,
+          revision: definition.revision,
+          created: Date.now(),
+          detail:
+            tools.preview?.(name, argumentsSnapshot, scope) ||
+            JSON.stringify(argumentsSnapshot, null, 2),
+          description: definition.description,
+        },
+      };
+      save(run);
+      return run;
+    },
     pending(conversation: string, scope: string) {
       const run = active(conversation, scope);
       return run ? view(run) : undefined;
@@ -189,7 +297,8 @@ export function createAgent(config: Config, tools: AgentTools) {
       const previous = read(id);
       if (
         previous &&
-        (previous.conversation !== conversation ||
+        (previous.direct ||
+          previous.conversation !== conversation ||
           previous.scope !== scope ||
           previous.prompt !== prompt)
       )
@@ -219,16 +328,20 @@ export function createAgent(config: Config, tools: AgentTools) {
       scope: string,
       approvalId: string,
       decision: string,
-      provider: ProviderSettings,
+      provider: () => ProviderSettings,
       signal: AbortSignal,
     ) {
       const done = completed(conversation, scope).find(
         (run) => run.pending?.id === approvalId,
       );
-      if (done) return done;
+      if (done) {
+        if (!done.direct) provider();
+        return done;
+      }
       const run = active(conversation, scope);
       if (!run || run.pending?.id !== approvalId)
         throw new HttpError(409, 'This approval is no longer pending.');
+      const model = run.direct ? undefined : provider();
       if (!['approve', 'deny'].includes(decision))
         throw new HttpError(400, 'Choose approve or deny.');
       if (run.status === 'executing')
@@ -251,7 +364,12 @@ export function createAgent(config: Config, tools: AgentTools) {
             !available.some(
               (tool) =>
                 tool.name === pending.name &&
-                tool.revision === pending.revision,
+                tool.revision === pending.revision &&
+                (run.direct
+                  ? tool.surfaces?.includes('action')
+                  : (tool.surfaces ?? ['tool']).some(
+                      (surface) => surface !== 'action',
+                    )),
             )
           )
             throw new HttpError(
@@ -269,15 +387,19 @@ export function createAgent(config: Config, tools: AgentTools) {
               scope,
               signal,
             );
-          } catch {
+          } catch (error) {
             result =
-              'Action failed or its outcome could not be confirmed. Check the external system before trying again. This approved call will not be repeated.';
+              error instanceof HttpError &&
+              [400, 404, 409].includes(error.status)
+                ? `${error.message} Check the recorded state before requesting another approval. This approved call will not be repeated.`
+                : 'Action failed or its outcome could not be confirmed. Check the external system before trying again. This approved call will not be repeated.';
           }
           toolResult(run, result);
         }
       }
+      if (!model) return run;
       // A failed model continuation resumes from the saved result, never from the action.
-      return advance(run, provider, signal);
+      return advance(run, model, signal);
     },
     close() {
       db.close();

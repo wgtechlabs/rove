@@ -1,6 +1,7 @@
 import { createServer } from 'node:http';
-import { createApplication, MAX_BODY } from './app.js';
+import { createApplication, requestBodyLimit } from './app.js';
 import { readConfig } from './config.js';
+import { MAX_CHANNEL_BODY } from './plugin-channel.js';
 import { MAX_SLACK_BODY } from './slack.js';
 
 const config = readConfig();
@@ -18,7 +19,10 @@ const server = createServer(async (incoming, outgoing) => {
       incoming.method === 'POST' &&
       ['/api/slack/events', '/api/slack/interactivity'].includes(path)
         ? MAX_SLACK_BODY
-        : MAX_BODY;
+        : incoming.method === 'POST' &&
+            /^\/api\/channels\/[a-f0-9-]{36}\/events$/.test(path)
+          ? MAX_CHANNEL_BODY
+          : requestBodyLimit(path);
     let size = 0;
     const chunks: Buffer[] = [];
     for await (const chunk of incoming) {

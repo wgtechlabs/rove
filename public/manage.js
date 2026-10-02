@@ -1,12 +1,20 @@
+import { renderPluginPages } from './plugin-pages.js';
+import { renderPlugins } from './plugins.js';
+
 // User-controlled values only enter textContent or form controls.
-export function mountManage(root, api, run, back) {
+export function mountManage(root, api, run, back, requestAction, onError) {
   let section = 'skills';
   let state;
   let alive = true;
+  let runtime;
+  const selectedVersions = new Map();
+  const actionDrafts = new Map();
   const labels = {
+    plugins: 'Plugins',
+    pages: 'Pages & actions',
     skills: 'Skills',
     servers: 'Tools & MCP',
-    plugins: 'Plugins',
+    bundles: 'Local bundles',
     slack: 'Slack',
     github: 'GitHub & AIPs',
   };
@@ -79,11 +87,11 @@ export function mountManage(root, api, run, back) {
   function edit(item = {}) {
     root.querySelector('#manage-status').textContent = '';
     content.replaceChildren();
-    const kind = { skills: 'skill', servers: 'server', plugins: 'plugin' }[
+    const kind = { skills: 'skill', servers: 'server', bundles: 'plugin' }[
       section
     ];
     intro(
-      `${item.id ? 'Edit' : 'Add'} ${kind}`,
+      `${item.id ? 'Edit' : 'Add'} ${kind === 'plugin' ? 'local bundle' : kind}`,
       kind === 'server'
         ? 'A connection makes tools available for review. Each call still needs administrator approval.'
         : 'Enabled instructions are sent to your model with every new message.',
@@ -151,7 +159,7 @@ export function mountManage(root, api, run, back) {
           null,
           2,
         ),
-        'A JSON array of named Markdown skills. Plugins cannot run code or grant tool permissions.',
+        'A local JSON array of named Markdown skills. Bundles cannot run code or grant tool permissions.',
       );
       bundle.required = true;
     }
@@ -185,7 +193,7 @@ export function mountManage(root, api, run, back) {
         'Teach Rove your language, processes, and expectations. Start with a short, specific workflow.',
       servers:
         'Connect remote MCP servers, discover their tools, then approve each proposed call in its conversation.',
-      plugins:
+      bundles:
         'Import related skills as one bundle. Enable or disable the bundle together.',
     };
     intro(labels[section], descriptions[section]);
@@ -195,7 +203,7 @@ export function mountManage(root, api, run, back) {
         () => edit(),
       ),
     );
-    const items = state[section];
+    const items = state[section === 'bundles' ? 'plugins' : section];
     if (!items.length)
       content.append(
         node(
@@ -212,16 +220,35 @@ export function mountManage(root, api, run, back) {
       );
       if (item.url) row.append(node('p', item.url, 'small'));
       const actions = node('div', null, 'settings-actions');
-      actions.append(button('Edit', () => edit(item)));
-      if (section === 'servers') {
+      if (item.managedBy) {
+        row.append(
+          node(
+            'p',
+            'Managed by an installed plugin. Review its version and settings in Plugins.',
+            'hint',
+          ),
+        );
         actions.append(
-          button('Discover tools', () =>
+          button('Open Plugins', () =>
             run(async () => {
-              state = await api('/api/admin/extensions/probe', { id: item.id });
-              if (alive) render();
+              section = 'plugins';
+              await load();
             }),
           ),
         );
+      } else actions.append(button('Edit', () => edit(item)));
+      if (section === 'servers') {
+        if (!item.managedBy)
+          actions.append(
+            button('Discover tools', () =>
+              run(async () => {
+                state = await api('/api/admin/extensions/probe', {
+                  id: item.id,
+                });
+                if (alive) render();
+              }),
+            ),
+          );
         row.append(
           node(
             'p',
@@ -249,6 +276,8 @@ export function mountManage(root, api, run, back) {
       'Slack',
       'Keep web chat available while Rove joins selected Slack conversations. Only the people and channels you allow can use it.',
     );
+    if (state.health?.state === 'failed')
+      content.append(node('p', state.health.message, 'error'));
     if (state.failures?.length)
       content.append(
         node(
@@ -346,7 +375,8 @@ export function mountManage(root, api, run, back) {
       'Discuss a workflow improvement in web chat or Slack.',
       'Review the draft and ask Rove to revise it in that conversation.',
       'Approve a separate action to open a draft GitHub pull request.',
-      'Review and merge in GitHub, then ask Rove to adopt the verified skill.',
+      'Approve the exact final revision, pass repository checks, and merge in GitHub.',
+      'Publish a verified immutable release, then approve its activation separately in the original conversation.',
     ])
       steps.append(node('li', text));
     content.append(steps);
@@ -358,7 +388,7 @@ export function mountManage(root, api, run, back) {
       'Company repository',
       'text',
       state.repo || '',
-      'Use owner/repository. Proposal PRs change .rove/skills Markdown files only.',
+      'Use owner/repository. Approve the same repository in Plugins before activating its released changes.',
     );
     repo.required = true;
     const token = field(
@@ -367,10 +397,24 @@ export function mountManage(root, api, run, back) {
       'GitHub access token',
       'password',
       '',
-      'Use a repository-scoped token with Contents and Pull requests read/write. Leave blank to retain the saved token.',
+      'Use a repository-scoped token with Contents and Pull requests read/write, plus Actions read access for release verification. Leave blank to retain the saved token.',
+    );
+    const workflow = field(
+      form,
+      'workflowPath',
+      'Release workflow path',
+      'text',
+      state.workflowPath || '',
+      'The GitHub Actions workflow that builds the release artifact, for example .github/workflows/release.yml. Leave blank to keep the configured default.',
     );
     submit(form, 'Save GitHub connection', () =>
-      api('/api/admin/github', { repo: repo.value, token: token.value }),
+      api('/api/admin/github', {
+        repo: repo.value,
+        token: token.value,
+        ...(workflow.value.trim()
+          ? { workflowPath: workflow.value.trim() }
+          : {}),
+      }),
     );
     content.append(
       node(
@@ -390,15 +434,58 @@ export function mountManage(root, api, run, back) {
         'aria-current',
         control.dataset.section === section ? 'page' : 'false',
       );
-    if (section === 'slack') renderSlack();
+    if (section === 'plugins') {
+      intro(
+        'Plugins',
+        'Prepare a released version, review its settings and permissions, then activate it when you are ready.',
+      );
+      renderPlugins(content, state, runtime, {
+        node,
+        button,
+        field,
+        submit,
+        api,
+        run,
+        selectedVersions,
+        onError,
+        change(path, body, message) {
+          return run(async () => {
+            root.querySelector('#manage-status').textContent = '';
+            await api(path, body);
+            if (!alive) return;
+            await load();
+            root.querySelector('#manage-status').textContent = message;
+          });
+        },
+      });
+    } else if (section === 'pages') {
+      intro(
+        'Pages & actions',
+        'Company pages from your active plugins. Review and approve each action in chat.',
+      );
+      renderPluginPages(content, state, {
+        node,
+        button,
+        field,
+        run,
+        requestAction,
+        drafts: actionDrafts,
+      });
+    } else if (section === 'slack') renderSlack();
     else if (section === 'github') renderGitHub();
     else renderCollection();
     content.querySelector('h2')?.focus();
   }
   async function load() {
-    const result = await api(
-      `/api/admin/${['slack', 'github'].includes(section) ? section : 'extensions'}`,
-    );
+    const endpoint =
+      {
+        slack: 'slack',
+        github: 'github',
+        plugins: 'plugins',
+        pages: 'plugins/contributions',
+      }[section] || 'extensions';
+    const result = await api(`/api/admin/${endpoint}`);
+    if (section === 'plugins') runtime = await api('/api/admin/runtime');
     if (!alive) return;
     state = result;
     render();

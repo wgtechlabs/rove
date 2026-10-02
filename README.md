@@ -15,7 +15,10 @@ and teach through reviewed **Agent Improvement Proposals (AIPs)**. Your company
 supplies the knowledge, policies and workflows.
 
 > **MVP preview:** web chat, approved tool execution, Markdown skills, declarative
-> plugins, remote MCP, optional Slack, and GitHub-backed AIPs are implemented.
+> release installations, remote MCP, optional Slack, and reviewed AIP releases are implemented.
+> Offline User Plugin tools, dashboard actions and pages are implemented.
+> Live Railway containment and template installation still need validation.
+> Installable channels currently support a signed JSON protocol; provider-specific plugins are separate work.
 > Bring your own provider and integration credentials. Live compatibility depends
 > on your provider and installed integrations.
 
@@ -32,8 +35,12 @@ supplies the knowledge, policies and workflows.
 | AI web chat with saved conversations | Available |
 | Web configuration for model connection and system instructions | Available |
 | Optional Slack channel, activated from the web interface | Implemented |
+| Installable signed JSON channel gateway | Implemented; provider plugins are separate |
 | Web configuration for tools, MCP servers, plugins and skills | Implemented |
-| AIP drafts, GitHub PRs and verified skill adoption | Implemented |
+| Approved GitHub releases, plugin settings, activation and rollback | Implemented |
+| AIP final review, GitHub release verification and separate activation | Implemented |
+| User Plugin tools, dashboard actions, pages and agent workflow steps | Implemented; every operation requires approval |
+| Railway Sandbox execution | Implemented with per-call isolation checks; live compatibility unverified |
 
 The MVP starts with one company and one administrator per deployment. Web setup
 requires no Slack or AI-provider credentials. A Rove CLI, Discord and Telegram
@@ -85,6 +92,8 @@ keeps setup closed. Keep `BETTER_AUTH_SECRET` stable across restarts. Then
    `ROVE_SETUP_SECRET` values in the service variables.
 4. Deploy, open the domain and create your administrator account. Save the
    recovery key, remove `ROVE_SETUP_SECRET` and redeploy.
+
+For the template-editor settings and generated secrets, see [Railway template configuration](docs/railway-template.md). Template publication and a live installation still need verification.
 
 Run **one replica with its own volume**. Rove listens on the assigned `PORT`,
 serves `/health` after database initialization and cancels pending model requests
@@ -150,8 +159,14 @@ Open **Customize Rove** after signing in:
 
 - **Skills:** add Markdown instructions and explicitly enable them. Up to 8,000
   characters per skill and 24,000 across saved skills and bundles.
-- **Plugins:** add a JSON array of `{ "name": "…", "markdown": "…" }` skills.
-  This MVP supports declarative skill bundles, not downloaded executable code.
+- **Plugins:** approve an exact GitHub repository, prepare a release, review its
+  contents and permissions, configure settings and secrets, then activate it.
+  Keep previous versions for rollback. See the [package contract](docs/plugins.md)
+  and [supported imports](docs/compatibility.md).
+- **Pages & actions:** open company pages and request actions from active plugins.
+  Review and approve each action in chat; dashboard actions need no model connection.
+- **Local bundles:** keep existing locally edited groups of Markdown skills.
+  Released plugin content is immutable and managed from Plugins.
 - **Tools & MCP:** save a remote Streamable HTTP endpoint and optional bearer
   token, enable it, then select **Discover tools**. All discovered tools on an
   enabled connection are available to the model. Every call pauses for an
@@ -164,7 +179,7 @@ outcome is never silently retried; check the external system before requesting
 another action. Conversation messages, proposal drafts, approval arguments and
 tool results are stored locally as plaintext; integration credentials are encrypted.
 
-MCP limits: eight servers, 32 enabled tools in total, four catalog pages, and
+MCP limits: eight servers, 32 combined MCP tools and plugin operations, four catalog pages, and
 text/JSON results up to 16 KB. Public HTTPS endpoints are required; loopback HTTP
 is available only when Rove itself uses a loopback development URL. Redirects,
 private network destinations, schema references and regex patterns are rejected.
@@ -206,12 +221,33 @@ with Contents and Pull requests read/write permission. Ask Rove to draft an Agen
 Improvement Proposal in web chat or Slack. Review its title, summary, proposed
 skill, rationale and validation plan; request revisions or cancellation there.
 
-Drafting, publishing and adoption are separate administrator-reviewed calls.
-Publishing creates a draft PR containing only `.rove/skills/<name>.md` with the
-stored proposed content. Rove never merges it. After a human reviews and merges
-in GitHub, ask Rove to adopt it in the original conversation. Adoption checks the
-matching merged PR and exact file content at its merge commit, then activates the
-skill. Changes made during GitHub review require a new matching proposal.
+Drafting and publishing remain separate administrator-reviewed calls. A proposal
+includes its next numeric package version. Publishing creates a draft PR with
+`.rove/skills/<name>.md` and a matching `rove-plugin.json`; it never merges it.
+Proposals can include a complete native plugin package, preserving its source,
+settings and permissions in that same review. Package ID and version must match
+the proposal. Preparing executable source does not enable its execution.
+The complete native-package draft or revision is limited to 16,000 UTF-8 bytes,
+including its proposal text; the model's output limit may be smaller.
+Inspect the final PR revision in the originating conversation and explicitly
+approve that exact revision. The same administrator may author and review it.
+
+After merge, the company's release workflow must pass for that merge commit and
+publish a tagged release containing the exact committed `rove-plugin.json` asset.
+Configure the required workflow path in **GitHub & AIPs** (default:
+`.github/workflows/plugin-release.yml`); the token also needs Actions read access.
+Ask Rove to verify the release tag, then separately approve activation in that
+conversation. The company repository must also be approved under **Plugins**.
+Rove checks the final head, permitted file changes, merge, workflow identity,
+source commit and artifact bytes. Changed or missing evidence blocks activation.
+AIP-bound packages cannot bypass this gate through the general installer.
+If a release requires settings, secrets or permissions, configure it in Plugins
+and return to the originating conversation to approve activation again.
+
+The old merged-skill adoption path is closed. Previously adopted local content
+keeps working; pending legacy single-file proposals need a compatible package
+proposal and release. Company release-workflow templates and separate production
+plugin repositories are later deliveries.
 
 Each conversation supports 100 proposals. Proposals do not include conversation
 transcripts or source-channel URLs in PR bodies. Review the proposed text for
@@ -231,6 +267,9 @@ your deployment host.
 | `ROVE_SETUP_SECRET` | Different random secret, at least 32 characters. Required until the first administrator is created. |
 | `ROVE_DATABASE_PATH` | SQLite file. Defaults to `./data/rove.sqlite` locally and `/data/rove.sqlite` in the image. |
 | `PORT` | Server port; defaults to `3000`. |
+| `RAILWAY_ENVIRONMENT_ID` | Automatically supplied on Railway; optional for web use. |
+| `RAILWAY_API_TOKEN` / `RAILWAY_TOKEN` | Optional sandbox administration credentials; see [auth modes](docs/railway-sandbox.md). |
+| `ROVE_PLUGIN_SECRET_*` | Optional deployment secrets explicitly bound to a plugin. |
 
 ## Access and recovery
 
@@ -272,6 +311,9 @@ call a live model or prove compatibility with every provider. Tool-loop tests co
 restart/crash recovery and approval replay. MCP tests use real local HTTP/SSE
 servers; Slack and GitHub tests use controlled API boundaries. These do not prove
 your live Slack installation, GitHub token, or hosted MCP server configuration.
+Plugin tests cover immutable installs, source revocation, separate activation,
+rollback, encrypted bindings and additive migrations. Railway tests use a fake
+provider boundary and the pinned SDK transport; live containment remains unverified.
 To check container persistence and shutdown:
 
 ```sh

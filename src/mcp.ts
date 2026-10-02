@@ -67,7 +67,7 @@ export function mcpURL(value: string, applicationURL: string): string {
 }
 
 // Resolve and pin each connection; a prior hostname check alone permits DNS rebinding.
-async function destination(
+export async function resolvePublicDestination(
   url: URL,
   localDevelopment: boolean,
   signal: AbortSignal,
@@ -121,7 +121,11 @@ function boundedFetch(
       ...(init?.signal ? [init.signal] : []),
     ]);
     combined.throwIfAborted();
-    const address = await destination(url, localDevelopment, combined);
+    const address = await resolvePublicDestination(
+      url,
+      localDevelopment,
+      combined,
+    );
     combined.throwIfAborted();
     const headers = Object.fromEntries(new Headers(init?.headers));
     return new Promise<Response>((resolve, reject) => {
