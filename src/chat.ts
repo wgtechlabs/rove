@@ -10,6 +10,12 @@ import {
 } from './provider.js';
 import { createSecrets } from './secrets.js';
 
+const requestIdPattern =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+// Only pre-dispatch contention may be retried by a durable channel inbox.
+export class ChatBusyError extends HttpError {}
+
 export function createChat(
   config: Config,
   tools: AgentTools = {
@@ -114,6 +120,18 @@ export function createChat(
       )
       .all(scope);
   }
+  function readMessages(id: string, exclude = new Set<string>()): Message[] {
+    return db
+      .prepare(
+        'SELECT request_id, prompt, reply FROM rove_exchange WHERE conversation_id = ? ORDER BY sequence',
+      )
+      .all(id)
+      .filter((item) => !exclude.has(String(item.request_id)))
+      .flatMap((item) => [
+        { role: 'user' as const, content: String(item.prompt) },
+        { role: 'assistant' as const, content: String(item.reply) },
+      ]);
+  }
   function get(id: string, scope = 'web') {
     // Final model results are durable before presentation; repair a crash between the two writes.
     const owned = db
@@ -136,15 +154,7 @@ export function createChat(
       )
       .get(id, scope);
     if (!row) throw new HttpError(404, 'Conversation not found.');
-    const exchanges = db
-      .prepare(
-        'SELECT prompt, reply FROM rove_exchange WHERE conversation_id = ? ORDER BY sequence',
-      )
-      .all(id);
-    const messages: Message[] = exchanges.flatMap((item) => [
-      { role: 'user' as const, content: String(item.prompt) },
-      { role: 'assistant' as const, content: String(item.reply) },
-    ]);
+    const messages = readMessages(id);
     const pending = agent.pending(id, `${scope}:${id}`);
     return {
       ...(pending ? { pending } : {}),
@@ -179,27 +189,32 @@ export function createChat(
     scope = 'web',
   ) {
     if (stopping)
-      throw new HttpError(
+      throw new ChatBusyError(
         503,
         'Rove is restarting. Retry your message in a moment.',
       );
     const content = textField(body, 'content', 1, 4000).trim();
     const requestId = textField(body, 'requestId', 36, 36);
-    if (
-      !content ||
-      !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-        requestId,
-      )
-    )
+    if (!content || !requestIdPattern.test(requestId))
       throw new HttpError(400, 'Send a message with a valid request ID.');
     const conversation = get(id, scope);
+    const actionRequests = new Set(
+      agent
+        .completed(id, `${scope}:${id}`)
+        .filter((run) => run.direct)
+        .map((run) => run.id),
+    );
     const previous = db
       .prepare(
         'SELECT conversation_id, prompt FROM rove_exchange WHERE request_id = ?',
       )
       .get(requestId);
     if (previous) {
-      if (previous.conversation_id !== id || previous.prompt !== content)
+      if (
+        previous.conversation_id !== id ||
+        previous.prompt !== content ||
+        actionRequests.has(requestId)
+      )
         throw new HttpError(
           409,
           'This request ID was already used for another message.',
@@ -207,7 +222,7 @@ export function createChat(
       return conversation;
     }
     if (busy)
-      throw new HttpError(
+      throw new ChatBusyError(
         409,
         'Rove is already replying. Wait a moment and try again.',
       );
@@ -228,7 +243,8 @@ export function createChat(
       systemPrompt: String(row.system_prompt),
       apiKey: decrypt(String(row.api_key)),
     };
-    const history = conversation.messages.slice(-40);
+    // Direct results remain visible in the UI, but are not model-authored conversation history.
+    const history = readMessages(id, actionRequests).slice(-40);
     while (
       history.reduce(
         (total, message) => total + message.content.length,
@@ -253,6 +269,56 @@ export function createChat(
       const answer = result.answer || '';
       persist(id, requestId, content, answer, conversation);
       return get(id, scope);
+    } finally {
+      busy = false;
+      active = undefined;
+    }
+  }
+  async function requestAction(id: string, body: Record<string, unknown>) {
+    if (busy || stopping)
+      throw new ChatBusyError(
+        409,
+        'Rove is busy or restarting. Try again shortly.',
+      );
+    if (
+      Object.keys(body).some(
+        (key) => !['name', 'arguments', 'requestId', 'revision'].includes(key),
+      )
+    )
+      throw new HttpError(
+        400,
+        'Send only an action name, arguments, request ID and revision.',
+      );
+    const name = textField(body, 'name', 1, 160);
+    const revision =
+      body.revision === undefined
+        ? undefined
+        : textField(body, 'revision', 1, 256);
+    const requestId = textField(body, 'requestId', 36, 36);
+    if (!requestIdPattern.test(requestId))
+      throw new HttpError(400, 'Request an action with a valid request ID.');
+    const conversation = get(id);
+    const previous = db
+      .prepare('SELECT 1 FROM rove_exchange WHERE request_id=?')
+      .get(requestId);
+    if (!previous && conversation.messages.length >= 200)
+      throw new HttpError(
+        409,
+        'This conversation has reached 100 replies. Start a new conversation.',
+      );
+    busy = true;
+    active = new AbortController();
+    try {
+      await agent.requestAction(
+        requestId,
+        id,
+        `web:${id}`,
+        name,
+        body.arguments,
+        active.signal,
+        revision,
+      );
+      return get(id);
     } finally {
       busy = false;
       active = undefined;
@@ -295,22 +361,13 @@ export function createChat(
     scope = 'web',
   ) {
     if (busy || stopping)
-      throw new HttpError(
+      throw new ChatBusyError(
         409,
         'Rove is busy or restarting. Try again shortly.',
       );
     const conversation = get(id, scope);
     const approvalId = textField(body, 'approvalId', 36, 36);
     const decision = textField(body, 'decision', 1, 10);
-    const row = saved();
-    if (!row?.api_key)
-      throw new HttpError(409, 'Connect a model before continuing.');
-    const provider: ProviderSettings = {
-      baseURL: String(row.base_url),
-      model: String(row.model),
-      systemPrompt: String(row.system_prompt),
-      apiKey: decrypt(String(row.api_key)),
-    };
     busy = true;
     active = new AbortController();
     try {
@@ -319,7 +376,17 @@ export function createChat(
         `${scope}:${id}`,
         approvalId,
         decision,
-        provider,
+        () => {
+          const row = saved();
+          if (!row?.api_key)
+            throw new HttpError(409, 'Connect a model before continuing.');
+          return {
+            baseURL: String(row.base_url),
+            model: String(row.model),
+            systemPrompt: String(row.system_prompt),
+            apiKey: decrypt(String(row.api_key)),
+          };
+        },
         active.signal,
       );
       if (result.status === 'done')
@@ -344,6 +411,7 @@ export function createChat(
     get,
     create,
     send,
+    requestAction,
     decide,
     cancelPending() {
       stopping = true;

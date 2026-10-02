@@ -7,9 +7,11 @@ export interface Message {
 }
 export interface ToolDefinition {
   name: string;
+  label?: string;
   description: string;
   parameters: Record<string, unknown>;
   revision: string;
+  surfaces?: Array<'tool' | 'action' | 'step'>;
 }
 export interface ToolCall {
   id: string;

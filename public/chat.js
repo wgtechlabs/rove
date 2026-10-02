@@ -8,6 +8,7 @@ export function mountChat(main, admin, api, expire, signout) {
   let conversations = [];
   let manager;
   const drafts = new Map();
+  const actionRequests = new Map();
   const avatar = document.querySelector('.brand-mark');
   avatar.dataset.expression = 'idle';
   document.title = 'Chat · Rove';
@@ -53,8 +54,10 @@ export function mountChat(main, admin, api, expire, signout) {
   function setBusy(value) {
     busy = value;
     main.setAttribute('aria-busy', String(value));
-    for (const control of main.querySelectorAll('button, input, textarea')) {
-      control.disabled = value;
+    for (const control of main.querySelectorAll(
+      'button, input, textarea, select',
+    )) {
+      control.disabled = value || control.dataset.unavailable === 'true';
     }
     signout.disabled = value;
     find('#settings-open').disabled = value || !settings;
@@ -65,6 +68,27 @@ export function mountChat(main, admin, api, expire, signout) {
     send.disabled = value || !settings?.configured || Boolean(current?.pending);
   }
 
+  function handleFailure(failure) {
+    if (!alive) return;
+    if (failure.status === 401) {
+      expire();
+      return;
+    }
+    if (avatar.dataset.expression === 'thinking')
+      avatar.dataset.expression = 'unsure';
+    error.textContent =
+      failure instanceof TypeError
+        ? 'Rove could not be reached. Check your connection and try again.'
+        : failure.message;
+    if (!settings) {
+      find('#reload-workspace').hidden = false;
+      find('#list-status').textContent = 'Conversations could not be loaded.';
+      find('#model-label').textContent = 'Model settings could not be loaded.';
+      composer.hidden = true;
+    }
+    error.focus();
+  }
+
   async function run(action) {
     if (busy || !alive) return;
     error.textContent = '';
@@ -73,25 +97,7 @@ export function mountChat(main, admin, api, expire, signout) {
     try {
       await action();
     } catch (failure) {
-      if (!alive) return;
-      if (failure.status === 401) {
-        expire();
-        return;
-      }
-      if (avatar.dataset.expression === 'thinking')
-        avatar.dataset.expression = 'unsure';
-      error.textContent =
-        failure instanceof TypeError
-          ? 'Rove could not be reached. Check your connection and try again.'
-          : failure.message;
-      if (!settings) {
-        find('#reload-workspace').hidden = false;
-        find('#list-status').textContent = 'Conversations could not be loaded.';
-        find('#model-label').textContent =
-          'Model settings could not be loaded.';
-        composer.hidden = true;
-      }
-      error.focus();
+      handleFailure(failure);
     } finally {
       if (alive) setBusy(false);
     }
@@ -160,7 +166,7 @@ export function mountChat(main, admin, api, expire, signout) {
           ? 'Review this action'
           : 'Continue after the saved result';
       const description = document.createElement('p');
-      description.textContent = `${pending.name}: ${pending.description || 'Proposed action.'} Administrator approval is required. Review the exact arguments below. Approval expires after 15 minutes.`;
+      description.textContent = `${pending.label || pending.name}: ${pending.description || 'Proposed action.'} Administrator approval is required. Review the exact arguments below. Approval expires after 15 minutes.`;
       const args = document.createElement('pre');
       try {
         args.textContent = JSON.stringify(
@@ -202,7 +208,9 @@ export function mountChat(main, admin, api, expire, signout) {
       panel.append(heading, description, args, actions);
       messages.append(panel);
     }
-    find('#chat-empty').hidden = Boolean(current?.messages.length);
+    find('#chat-empty').hidden = Boolean(
+      current?.messages.length || current?.pending,
+    );
     find('#chat-title').textContent = current?.title || 'Start a conversation';
     message.value = drafts.get(current?.id)?.content || '';
     send.textContent = drafts.get(current?.id)?.requestId
@@ -282,7 +290,39 @@ export function mountChat(main, admin, api, expire, signout) {
     run(async () => {
       const view = find('#manage-view');
       manager?.dispose();
-      manager = mountManage(view, api, run, showChat);
+      manager = mountManage(
+        view,
+        api,
+        run,
+        showChat,
+        async (action) => {
+          // Retain the target and ID if a response is lost, even after switching chats.
+          const key = JSON.stringify(action);
+          let request = actionRequests.get(key);
+          if (!request) {
+            request = {
+              requestId: crypto.randomUUID(),
+              conversationId: current?.pending ? undefined : current?.id,
+            };
+            actionRequests.set(key, request);
+          }
+          if (!request.conversationId) {
+            const conversation = await api('/api/admin/conversations', {});
+            if (!alive) return;
+            request.conversationId = conversation.id;
+            updateConversation(conversation);
+          }
+          const conversation = await api(
+            `/api/admin/conversations/${request.conversationId}/actions`,
+            { ...action, requestId: request.requestId },
+          );
+          if (!alive) return;
+          actionRequests.delete(key);
+          updateConversation(conversation);
+          showChat();
+        },
+        handleFailure,
+      );
       await manager.load();
       if (!alive) return;
       chatView.hidden = true;
@@ -427,5 +467,6 @@ export function mountChat(main, admin, api, expire, signout) {
     avatar.dataset.expression = 'idle';
     signout.disabled = false;
     drafts.clear();
+    actionRequests.clear();
   };
 }

@@ -37,14 +37,19 @@ const input = z.discriminatedUnion('kind', [
     })
     .strict(),
 ]);
-type Entry = z.infer<typeof input>;
+export type Entry = z.infer<typeof input>;
 type Stored = {
   id: string;
   entry: Entry;
   revision: string;
   credential: string;
   tools: Tool[];
+  managedBy?: string;
 };
+export type ManagedExtension = Pick<
+  Stored,
+  'id' | 'entry' | 'credential' | 'tools'
+>;
 export interface ExtensionTool {
   name: string;
   description: string;
@@ -68,6 +73,30 @@ const markdown = (entry: Entry) =>
       ? entry.skills
       : [];
 
+export async function discoverTools(
+  url: string,
+  token: string,
+  baseURL: string,
+  signal: AbortSignal,
+) {
+  return withMcp(url, token, baseURL, signal, async (client, options) => {
+    const result = await client.listTools(undefined, options);
+    if (
+      result.tools.length > 32 ||
+      new Set(result.tools.map((tool) => tool.name)).size !==
+        result.tools.length
+    )
+      throw new HttpError(
+        502,
+        'MCP catalogs need at most 32 uniquely named tools.',
+      );
+    for (const tool of result.tools) validateTool(tool);
+    if (Buffer.byteLength(JSON.stringify(result.tools)) > 64000)
+      throw new HttpError(502, 'The MCP tool catalog is too large.');
+    return result.tools.map(definition);
+  });
+}
+
 export function createExtensions(config: Config) {
   const secrets = createSecrets(config.authSecret);
   const db = new DatabaseSync(config.databasePath);
@@ -76,7 +105,8 @@ export function createExtensions(config: Config) {
       CREATE TABLE IF NOT EXISTS rove_extension (
         id TEXT PRIMARY KEY, data TEXT NOT NULL, revision TEXT NOT NULL,
         credential TEXT NOT NULL DEFAULT '', tools TEXT NOT NULL DEFAULT '[]'
-      );`);
+      );
+      CREATE TABLE IF NOT EXISTS rove_extension_owner (id TEXT PRIMARY KEY, installation TEXT NOT NULL);`);
   } catch (error) {
     db.close();
     throw error;
@@ -87,7 +117,9 @@ export function createExtensions(config: Config) {
   function records(): Stored[] {
     if (closed) throw new HttpError(503, 'Extensions are shutting down.');
     return db
-      .prepare('SELECT * FROM rove_extension ORDER BY id')
+      .prepare(
+        'SELECT e.*, o.installation FROM rove_extension e LEFT JOIN rove_extension_owner o ON e.id=o.id ORDER BY e.id',
+      )
       .all()
       .map((row) => ({
         id: String(row.id),
@@ -95,6 +127,7 @@ export function createExtensions(config: Config) {
         revision: String(row.revision),
         credential: String(row.credential),
         tools: JSON.parse(String(row.tools)) as Tool[],
+        ...(row.installation ? { managedBy: String(row.installation) } : {}),
       }));
   }
   function revision(rows = records()) {
@@ -105,12 +138,26 @@ export function createExtensions(config: Config) {
     return {
       skills: rows.flatMap((row) =>
         row.entry.kind === 'skill'
-          ? [{ ...row.entry, id: row.id, revision: row.revision }]
+          ? [
+              {
+                ...row.entry,
+                id: row.id,
+                revision: row.revision,
+                managedBy: row.managedBy,
+              },
+            ]
           : [],
       ),
       plugins: rows.flatMap((row) =>
         row.entry.kind === 'plugin'
-          ? [{ ...row.entry, id: row.id, revision: row.revision }]
+          ? [
+              {
+                ...row.entry,
+                id: row.id,
+                revision: row.revision,
+                managedBy: row.managedBy,
+              },
+            ]
           : [],
       ),
       servers: rows.flatMap((row) =>
@@ -123,6 +170,7 @@ export function createExtensions(config: Config) {
                 url: row.entry.url,
                 enabled: row.entry.enabled,
                 revision: row.revision,
+                managedBy: row.managedBy,
                 configured: Boolean(row.credential),
                 tools: row.tools.map((tool) => ({
                   name: tool.name,
@@ -151,6 +199,11 @@ export function createExtensions(config: Config) {
     const existing = entry.id
       ? rows.find((row) => row.id === entry.id)
       : undefined;
+    if (existing?.managedBy)
+      throw new HttpError(
+        409,
+        'Manage released content from its plugin installation.',
+      );
     if (entry.id && !existing && !allowNewId)
       throw new HttpError(404, 'Extension not found.');
     if (existing && existing.entry.kind !== entry.kind)
@@ -233,31 +286,11 @@ export function createExtensions(config: Config) {
     db.prepare(
       "UPDATE rove_extension SET tools='[]',revision=? WHERE id=?",
     ).run(current, id);
-    const tools = await withMcp(
+    const tools = await discoverTools(
       row.entry.url,
       token,
       config.baseURL,
       AbortSignal.any([signal, lifetime.signal]),
-      async (client, options) => {
-        const result = await client.listTools(undefined, options);
-        if (result.tools.length > 32)
-          throw new HttpError(
-            502,
-            'An MCP server may expose at most 32 tools in this preview.',
-          );
-        if (
-          new Set(result.tools.map((tool) => tool.name)).size !==
-          result.tools.length
-        )
-          throw new HttpError(
-            502,
-            'The MCP server returned duplicate tool names.',
-          );
-        for (const tool of result.tools) validateTool(tool);
-        if (Buffer.byteLength(JSON.stringify(result.tools)) > 64_000)
-          throw new HttpError(502, 'The MCP tool catalog is too large.');
-        return result.tools.map(definition);
-      },
     );
     if (lifetime.signal.aborted)
       throw new HttpError(503, 'Extensions are shutting down.');
@@ -391,8 +424,101 @@ export function createExtensions(config: Config) {
       executing = false;
     });
   }
+  // All managed content and its active release pointer commit on one SQLite connection.
+  function replaceManaged(
+    owner: string,
+    entries: ManagedExtension[],
+    commit: (db: DatabaseSync) => void,
+  ) {
+    if (executing)
+      throw new HttpError(
+        409,
+        'Wait for the current tool call before changing active plugins.',
+      );
+    const existing = records();
+    const remaining = existing.filter((row) => row.managedBy !== owner);
+    for (const row of entries) {
+      if (!input.safeParse(row.entry).success)
+        throw new HttpError(
+          400,
+          'A configured plugin contribution exceeds the supported field limits. Shorten its settings or instructions.',
+        );
+      if (remaining.some((item) => item.id === row.id))
+        throw new HttpError(409, 'Plugin contribution ID is already in use.');
+    }
+    const all = [...remaining, ...entries];
+    if (
+      all.length > 32 ||
+      all.filter((row) => row.entry.kind === 'server').length > 8 ||
+      all
+        .flatMap((row) => markdown(row.entry))
+        .reduce((sum, item) => sum + item.markdown.length, 0) > 24000 ||
+      all
+        .filter((row) => row.entry.enabled)
+        .reduce((sum, row) => sum + row.tools.length, 0) > 32
+    )
+      throw new HttpError(
+        409,
+        'Plugin activation exceeds the shared extension limits.',
+      );
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      db.prepare(
+        'DELETE FROM rove_extension WHERE id IN (SELECT id FROM rove_extension_owner WHERE installation=?)',
+      ).run(owner);
+      db.prepare('DELETE FROM rove_extension_owner WHERE installation=?').run(
+        owner,
+      );
+      for (const row of entries) {
+        db.prepare('INSERT INTO rove_extension VALUES(?,?,?,?,?)').run(
+          row.id,
+          JSON.stringify(row.entry),
+          randomUUID(),
+          row.credential,
+          JSON.stringify(row.tools),
+        );
+        db.prepare('INSERT INTO rove_extension_owner VALUES(?,?)').run(
+          row.id,
+          owner,
+        );
+      }
+      commit(db);
+      db.exec('COMMIT');
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+  function deactivateManaged(
+    owner: string | string[],
+    commit: (db: DatabaseSync) => void,
+  ) {
+    // Revocation blocks future dispatch even while a previously dispatched request completes.
+    const owners = Array.isArray(owner) ? owner : [owner];
+    const owned = records().filter(
+      (row) => row.managedBy && owners.includes(row.managedBy),
+    );
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const row of owned)
+        db.prepare(
+          'UPDATE rove_extension SET data=?,revision=? WHERE id=?',
+        ).run(
+          JSON.stringify({ ...row.entry, enabled: false }),
+          randomUUID(),
+          row.id,
+        );
+      commit(db);
+      db.exec('COMMIT');
+    } catch (error) {
+      db.exec('ROLLBACK');
+      throw error;
+    }
+  }
   return {
     list,
+    replaceManaged,
+    deactivateManaged,
     save: (body: unknown) => save(body),
     adoptSkill(body: {
       id: string;

@@ -11,7 +11,8 @@ import { type TestContext, test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createApplication } from '../src/app.js';
 import { HttpError } from '../src/auth.js';
-import { createSlack, MAX_SLACK_BODY } from '../src/slack.js';
+import { createChannels } from '../src/channels.js';
+import { MAX_SLACK_BODY } from '../src/slack.js';
 
 const nativeFetch = globalThis.fetch;
 const secret = 'fake-slack-signing-secret';
@@ -175,7 +176,7 @@ async function fixture(t: TestContext) {
       return Response.json({ ok: true, ts: '1001.000001' });
     },
   );
-  let slack = createSlack(config, chat);
+  let slack = createChannels(config, chat);
   await slack.save(settings);
   t.after(async () => {
     await slack.close();
@@ -194,7 +195,7 @@ async function fixture(t: TestContext) {
     },
     async restart() {
       await slack.close();
-      slack = createSlack(config, chat);
+      slack = createChannels(config, chat);
     },
     hold(value: Promise<void> | undefined) {
       wait = value;
@@ -283,9 +284,17 @@ test('Slack filters denied users/channels, other workspaces, shared channels, bo
   await delay(350);
   assert.equal(f.sends.length, 0);
   await f.slack.handle(
-    signed(
-      event('EDM', { type: 'message', channel_type: 'im', channel: 'DALICE' }),
-    ),
+    signed({
+      ...event('EDM', {
+        type: 'message',
+        channel_type: 'im',
+        channel: 'DALICE',
+        scope: 'web',
+        role: 'admin',
+      }),
+      scope: 'web',
+      conversation: 'another-conversation',
+    }),
   );
   await until(() => f.posts.length === 1);
   assert.equal(f.sends[0]?.scope, 'slack:TTEAM:DALICE:1000.000001');
@@ -758,7 +767,6 @@ test('application startup rolls back every opened database when a service fails 
     'rove_aip',
     'ALTER TABLE rove_conversation',
     'rove_run',
-    'rove_slack_job',
   ]) {
     failure = stage;
     await assert.rejects(
@@ -831,6 +839,16 @@ test('HTTP ingress admits signed large Slack interactions while preserving route
     assert.ok(Buffer.byteLength(raw) < MAX_SLACK_BODY);
     const send = (path: string, body: string, headers: Headers) =>
       fetchHTTP(base + path, { method: 'POST', headers, body });
+    const installedPath =
+      '/api/channels/00000000-0000-4000-8000-000000000001/events';
+    assert.equal(
+      (await send(installedPath, 'x'.repeat(40000), request.headers)).status,
+      404, // Reaches the gateway, which rejects the inactive installation.
+    );
+    assert.equal(
+      (await send(installedPath, 'x'.repeat(65537), request.headers)).status,
+      413,
+    );
     assert.equal(
       (await send('/api/slack/interactivity', raw, request.headers)).status,
       200,
@@ -843,6 +861,20 @@ test('HTTP ingress admits signed large Slack interactions while preserving route
     );
     assert.equal(
       (await send('/api/admin/settings', raw, request.headers)).status,
+      413,
+    );
+    assert.equal(
+      (await send('/api/admin/plugins/configure', raw, request.headers)).status,
+      401, // The larger route envelope still requires an authenticated admin.
+    );
+    assert.equal(
+      (
+        await send(
+          '/api/admin/plugins/configure',
+          'x'.repeat(512 * 1024 + 1),
+          request.headers,
+        )
+      ).status,
       413,
     );
     assert.equal(
