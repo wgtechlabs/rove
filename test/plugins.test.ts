@@ -307,6 +307,126 @@ test('approved releases install inactive, atomically activate, update and roll b
   assert.doesNotMatch(JSON.stringify(f.plugins.list()), /dummy-github-token/);
 });
 
+test('release lists use bounded summaries while selected details verify ownership and immutable bytes', async (t) => {
+  const f = fixture(t);
+  f.approve();
+  await f.install();
+  const db = new DatabaseSync(f.config.databasePath);
+  t.after(() => db.close());
+  // Exercise the pre-summary schema and the maximum retained inventory on restart.
+  db.exec(
+    'DELETE FROM rove_plugin_artifact; ALTER TABLE rove_plugin_artifact DROP COLUMN summary; DELETE FROM rove_plugin_installation;',
+  );
+  let fullManifestBytes = 0;
+  for (let index = 0; index < 16; index++) {
+    const id = randomUUID();
+    const pluginId = `company-${index}`;
+    db.prepare('INSERT INTO rove_plugin_installation VALUES(?,?,?,?)').run(
+      id,
+      repo,
+      pluginId,
+      JSON.stringify({
+        id,
+        repo,
+        pluginId,
+        active: null,
+        revision: randomUUID(),
+        values: {},
+        secrets: {},
+        grants: [],
+      }),
+    );
+    for (let version = 0; version < 16; version++) {
+      const pkg = parsePackage({
+        ...manifest(`1.0.${version}`),
+        id: pluginId,
+        skills: Array.from({ length: 3 }, (_, skill) => ({
+          name: `Knowledge ${skill}`,
+          markdown: '界'.repeat(8000),
+        })),
+        instructions: '',
+        pages: Array.from({ length: 4 }, (_, page) => ({
+          id: `page-${page}`,
+          title: `Page ${page}`,
+          content: 'z'.repeat(8000),
+        })),
+      });
+      const bytes = JSON.stringify(pkg);
+      const digest = hash(bytes);
+      fullManifestBytes += Buffer.byteLength(bytes);
+      db.prepare('INSERT INTO rove_plugin_artifact VALUES(?,?,?,?,?)').run(
+        digest,
+        repo,
+        pluginId,
+        pkg.version,
+        JSON.stringify({
+          repo,
+          digest,
+          bytes,
+          manifest: pkg,
+          tag: `v${pkg.version}`,
+          commit: 'a'.repeat(40),
+          assetId: 7,
+        }),
+      );
+    }
+  }
+  f.restart();
+  const list = f.plugins.list();
+  assert.equal(list.installations.length, 16);
+  assert.ok(list.installations.every((item) => item.versions.length === 16));
+  const responseBytes = Buffer.byteLength(JSON.stringify(list));
+  assert.ok(fullManifestBytes > 26_000_000);
+  assert.ok(
+    responseBytes < 100_000,
+    `summary response was ${responseBytes} bytes`,
+  );
+  const item = list.installations[0];
+  const other = list.installations[1];
+  assert.ok(item && other && item.versions[0]);
+  const summary = item.versions[0];
+  assert.equal('manifest' in summary, false);
+  const detail = f.plugins.detail(item.id, summary.digest);
+  assert.equal(detail.manifest.pages.length, 4);
+  assert.equal(detail.manifest.version, summary.version);
+  assert.throws(
+    () => f.plugins.detail(other.id, summary.digest),
+    /another installation/,
+  );
+  const corrupted = JSON.parse(
+    String(
+      db
+        .prepare('SELECT data FROM rove_plugin_artifact WHERE digest=?')
+        .get(summary.digest)?.data,
+    ),
+  );
+  corrupted.bytes = '{}';
+  db.prepare('UPDATE rove_plugin_artifact SET data=? WHERE digest=?').run(
+    JSON.stringify(corrupted),
+    summary.digest,
+  );
+  assert.deepEqual(
+    f.plugins.list(),
+    list,
+    'list should not inspect unselected artifact bodies',
+  );
+  assert.throws(
+    () => f.plugins.detail(item.id, summary.digest),
+    /integrity check/,
+  );
+  await assert.rejects(
+    f.plugins.activate({
+      id: item.id,
+      revision: item.revision,
+      digest: summary.digest,
+    }),
+    /integrity check/,
+  );
+  t.diagnostic(
+    `256 full manifests: ${fullManifestBytes} bytes; summary response: ${responseBytes} bytes`,
+  );
+});
+
 test('revocation during preparation, stale settings, and immutable source identity fail closed', async (t) => {
   const f = fixture(t);
   f.approve();

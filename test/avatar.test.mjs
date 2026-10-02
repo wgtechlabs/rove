@@ -147,6 +147,8 @@ test('plugin actions work without a model and retry the same conversation and re
   find('#manage-view').querySelector = find;
   const avatar = element();
   let invokeAction;
+  let reportFailure;
+  let expirations = 0;
   const action = {
     name: 'rove_plugin_example',
     revision: 'revision-one',
@@ -182,13 +184,22 @@ test('plugin actions work without a model and retry the same conversation and re
       },
       crypto,
       requestAnimationFrame: (callback) => callback(),
-      mountManage: (_root, _api, run, _back, requestAction) => {
+      mountManage: (_root, _api, run, _back, requestAction, onError) => {
         invokeAction = () => run(() => requestAction(action));
+        reportFailure = onError;
         return { async load() {}, dispose() {} };
       },
     },
   );
-  const dispose = mount(main, {}, api, () => {}, element());
+  const dispose = mount(
+    main,
+    {},
+    api,
+    () => {
+      expirations++;
+    },
+    element(),
+  );
   await setImmediate();
   assert.equal(find('#composer').hidden, true);
   find('#manage-open').onclick();
@@ -230,5 +241,18 @@ test('plugin actions work without a model and retry the same conversation and re
     created.findLast((node) => node.textContent === 'Approve this action'),
   );
   assert.equal(find('#workspace-error').textContent, '');
+  response = Promise.withResolvers();
+  invokeAction();
+  await setImmediate();
+  reportFailure({ status: 401 });
+  assert.equal(
+    expirations,
+    1,
+    'a lazy-read expiry must work while another action is busy',
+  );
   dispose();
+  reportFailure({ status: 401 });
+  assert.equal(expirations, 1, 'disposed workspaces ignore late failures');
+  response.resolve({ id: 'target', messages: [] });
+  await setImmediate();
 });

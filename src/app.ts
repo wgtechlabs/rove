@@ -11,6 +11,11 @@ import { createPlugins } from './plugins.js';
 import { createRailwayRuntime } from './railway.js';
 
 export const MAX_BODY = 32768;
+// Plugin settings, secret bindings and channel allowlists can exceed the chat
+// envelope, including JSON escaping. Keep the larger bound on this route only.
+export function requestBodyLimit(path: string) {
+  return path === '/api/admin/plugins/configure' ? 512 * 1024 : MAX_BODY;
+}
 const assets: Record<string, [string, string]> = {
   '/': ['index.html', 'text/html; charset=utf-8'],
   '/app.js': ['app.js', 'text/javascript; charset=utf-8'],
@@ -137,6 +142,12 @@ export async function createApplication(
       if (request.method === 'GET' && path === '/api/admin/me')
         return json(admin);
       if (request.method === 'GET') {
+        const releaseRoute =
+          /^\/api\/admin\/plugins\/([a-f0-9-]{36})\/releases\/([a-f0-9]{64})$/.exec(
+            path,
+          );
+        if (releaseRoute?.[1] && releaseRoute[2])
+          return json(plugins.detail(releaseRoute[1], releaseRoute[2]));
         const channelStatus =
           /^\/api\/admin\/plugins\/([a-f0-9-]{36})\/channel$/.exec(path);
         if (channelStatus?.[1])
@@ -180,7 +191,7 @@ export async function createApplication(
       )
         throw new HttpError(415, 'Send JSON.');
       const raw = await request.text();
-      if (Buffer.byteLength(raw) > MAX_BODY)
+      if (Buffer.byteLength(raw) > requestBodyLimit(path))
         throw new HttpError(413, 'The request is too large.');
       let body: unknown;
       try {

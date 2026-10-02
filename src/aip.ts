@@ -12,15 +12,12 @@ import {
 } from './aip-release.js';
 import { HttpError } from './auth.js';
 import type { Config } from './config.js';
-import { parsePackage } from './plugin-manifest.js';
+import { parsePackage, pluginPackage } from './plugin-manifest.js';
 import { createSecrets } from './secrets.js';
 
 const proposal = z
   .object({
-    packageVersion: z
-      .string()
-      .regex(/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/)
-      .default('1.0.0'),
+    packageVersion: pluginPackage.shape.version.default('1.0.0'),
     title: z.string().trim().min(1).max(120),
     summary: z.string().trim().min(1).max(500),
     bullets: z.array(z.string().trim().min(1).max(500)).min(1).max(7),
@@ -110,6 +107,23 @@ function parse<T>(schema: z.ZodType<T>, value: unknown): T {
   return result.data;
 }
 
+function packageBytes(record: Proposal) {
+  if (record.pluginPackage)
+    return `${JSON.stringify(parsePackage(record.pluginPackage))}\n`;
+  const generated = {
+    schemaVersion: 1,
+    apiVersion: 1,
+    id: record.skillName,
+    name: record.skillName,
+    version: record.packageVersion ?? '1.0.0',
+    category: 'agent',
+    description: record.summary,
+    skills: [{ name: record.skillName, markdown: record.skillContent }],
+  };
+  parsePackage(generated);
+  return `${JSON.stringify(generated, null, 2)}\n`;
+}
+
 function parseStage(value: unknown) {
   const input = parse(stageInput, value);
   if (input.action !== 'cancel' && input.pluginPackage) {
@@ -125,7 +139,7 @@ function parseStage(value: unknown) {
         'The plugin package id and version must match the proposal.',
       );
     input.pluginPackage = pkg;
-  }
+  } else if (input.action !== 'cancel') packageBytes(input);
   return input;
 }
 
@@ -550,6 +564,7 @@ export function createAips(
         409,
         'This AIP cannot be published again. Reconcile any uncertain GitHub outcome manually.',
       );
+    const manifest = packageBytes(record);
     const repository = await github('');
     const base = requiredString(repository.default_branch);
     const ref = await github(`/git/ref/heads/${encodeURIComponent(base)}`);
@@ -572,7 +587,7 @@ export function createAips(
         encoding: 'utf-8',
       });
       const manifestBlob = await github('/git/blobs', {
-        content: packageBytes(record),
+        content: manifest,
         encoding: 'utf-8',
       });
       const tree = await github('/git/trees', {
@@ -632,16 +647,11 @@ export function createAips(
       throw failure;
     }
   }
-  function packageBytes(record: Aip) {
-    if (record.pluginPackage)
-      return `${JSON.stringify(parsePackage(record.pluginPackage))}\n`;
-    return `${JSON.stringify({ schemaVersion: 1, apiVersion: 1, id: record.skillName, name: record.skillName, version: record.packageVersion ?? '1.0.0', category: 'agent', description: record.summary, skills: [{ name: record.skillName, markdown: record.skillContent }] }, null, 2)}\n`;
-  }
   async function inspect(record: Aip, client: ReturnType<typeof githubClient>) {
     const pr = await client.object(`/pulls/${record.number}`);
     const metadata = z
       .object({
-        changed_files: z.literal(2),
+        changed_files: z.number().int().min(1).max(2),
         merged: z.boolean(),
         merge_commit_sha: z.string().nullable(),
         base: z.object({
@@ -658,7 +668,7 @@ export function createAips(
     if (!metadata.success)
       throw new HttpError(
         409,
-        'The PR must contain exactly the proposal document and package manifest.',
+        'The PR may change only the proposal document and package manifest.',
       );
     const data = metadata.data;
     if (!record.baseBranch) {
@@ -683,16 +693,15 @@ export function createAips(
           status: z.enum(['added', 'modified']),
         }),
       )
-      .length(2)
+      .length(data.changed_files)
       .safeParse(
         await client.request(`/pulls/${record.number}/files?per_page=3`),
       );
     if (
       !files.success ||
-      !paths.every(
-        (path) =>
-          files.data.filter((file) => file.filename === path).length === 1,
-      )
+      !files.data.every((file) => paths.includes(file.filename)) ||
+      new Set(files.data.map((file) => file.filename)).size !==
+        files.data.length
     )
       throw new HttpError(
         409,

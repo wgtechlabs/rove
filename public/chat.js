@@ -68,6 +68,27 @@ export function mountChat(main, admin, api, expire, signout) {
     send.disabled = value || !settings?.configured || Boolean(current?.pending);
   }
 
+  function handleFailure(failure) {
+    if (!alive) return;
+    if (failure.status === 401) {
+      expire();
+      return;
+    }
+    if (avatar.dataset.expression === 'thinking')
+      avatar.dataset.expression = 'unsure';
+    error.textContent =
+      failure instanceof TypeError
+        ? 'Rove could not be reached. Check your connection and try again.'
+        : failure.message;
+    if (!settings) {
+      find('#reload-workspace').hidden = false;
+      find('#list-status').textContent = 'Conversations could not be loaded.';
+      find('#model-label').textContent = 'Model settings could not be loaded.';
+      composer.hidden = true;
+    }
+    error.focus();
+  }
+
   async function run(action) {
     if (busy || !alive) return;
     error.textContent = '';
@@ -76,25 +97,7 @@ export function mountChat(main, admin, api, expire, signout) {
     try {
       await action();
     } catch (failure) {
-      if (!alive) return;
-      if (failure.status === 401) {
-        expire();
-        return;
-      }
-      if (avatar.dataset.expression === 'thinking')
-        avatar.dataset.expression = 'unsure';
-      error.textContent =
-        failure instanceof TypeError
-          ? 'Rove could not be reached. Check your connection and try again.'
-          : failure.message;
-      if (!settings) {
-        find('#reload-workspace').hidden = false;
-        find('#list-status').textContent = 'Conversations could not be loaded.';
-        find('#model-label').textContent =
-          'Model settings could not be loaded.';
-        composer.hidden = true;
-      }
-      error.focus();
+      handleFailure(failure);
     } finally {
       if (alive) setBusy(false);
     }
@@ -287,32 +290,39 @@ export function mountChat(main, admin, api, expire, signout) {
     run(async () => {
       const view = find('#manage-view');
       manager?.dispose();
-      manager = mountManage(view, api, run, showChat, async (action) => {
-        // Retain the target and ID if a response is lost, even after switching chats.
-        const key = JSON.stringify(action);
-        let request = actionRequests.get(key);
-        if (!request) {
-          request = {
-            requestId: crypto.randomUUID(),
-            conversationId: current?.pending ? undefined : current?.id,
-          };
-          actionRequests.set(key, request);
-        }
-        if (!request.conversationId) {
-          const conversation = await api('/api/admin/conversations', {});
+      manager = mountManage(
+        view,
+        api,
+        run,
+        showChat,
+        async (action) => {
+          // Retain the target and ID if a response is lost, even after switching chats.
+          const key = JSON.stringify(action);
+          let request = actionRequests.get(key);
+          if (!request) {
+            request = {
+              requestId: crypto.randomUUID(),
+              conversationId: current?.pending ? undefined : current?.id,
+            };
+            actionRequests.set(key, request);
+          }
+          if (!request.conversationId) {
+            const conversation = await api('/api/admin/conversations', {});
+            if (!alive) return;
+            request.conversationId = conversation.id;
+            updateConversation(conversation);
+          }
+          const conversation = await api(
+            `/api/admin/conversations/${request.conversationId}/actions`,
+            { ...action, requestId: request.requestId },
+          );
           if (!alive) return;
-          request.conversationId = conversation.id;
+          actionRequests.delete(key);
           updateConversation(conversation);
-        }
-        const conversation = await api(
-          `/api/admin/conversations/${request.conversationId}/actions`,
-          { ...action, requestId: request.requestId },
-        );
-        if (!alive) return;
-        actionRequests.delete(key);
-        updateConversation(conversation);
-        showChat();
-      });
+          showChat();
+        },
+        handleFailure,
+      );
       await manager.load();
       if (!alive) return;
       chatView.hidden = true;

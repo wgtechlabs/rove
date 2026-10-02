@@ -2,7 +2,7 @@ import { renderPluginPages } from './plugin-pages.js';
 import { renderPlugins } from './plugins.js';
 
 // User-controlled values only enter textContent or form controls.
-export function mountManage(root, api, run, back, requestAction) {
+export function mountManage(root, api, run, back, requestAction, onError) {
   let section = 'skills';
   let state;
   let alive = true;
@@ -447,6 +447,7 @@ export function mountManage(root, api, run, back, requestAction) {
         api,
         run,
         selectedVersions,
+        onError,
         change(path, body, message) {
           return run(async () => {
             root.querySelector('#manage-status').textContent = '';

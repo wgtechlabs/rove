@@ -864,6 +864,20 @@ test('HTTP ingress admits signed large Slack interactions while preserving route
       413,
     );
     assert.equal(
+      (await send('/api/admin/plugins/configure', raw, request.headers)).status,
+      401, // The larger route envelope still requires an authenticated admin.
+    );
+    assert.equal(
+      (
+        await send(
+          '/api/admin/plugins/configure',
+          'x'.repeat(512 * 1024 + 1),
+          request.headers,
+        )
+      ).status,
+      413,
+    );
+    assert.equal(
       (
         await send(
           '//example.invalid/api/slack/interactivity',

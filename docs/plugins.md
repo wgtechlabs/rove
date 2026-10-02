@@ -26,8 +26,10 @@ See [format import compatibility](compatibility.md), the
    repositories need no token; private ones need a token with Contents read access.
 2. Enter a published release tag and choose its format. Preparation downloads and
    validates content, without activating it or running installation scripts.
-3. Inspect the content, source commit and digest. Fill required settings and
-   secrets, and explicitly grant requested permissions. Channel access rules
+3. Open **Review versions and settings** for the installation. Rove loads and
+   verifies only the selected release's full content; the plugin list contains
+   small release summaries. Inspect the content, source commit and digest. Fill
+   required settings and secrets, and explicitly grant requested permissions. Channel access rules
    belong to the administrator and cannot be supplied by the package. Saving configuration
    deactivates an active installation; activate separately after reviewing it.
 4. Select **Activate release**. Rove validates required fields and discovers MCP
@@ -175,6 +177,8 @@ Limits: 16 sources, 16 installations, 16 retained releases per installation,
 8 secrets per package. Existing shared limits remain: 32 extension records,
 24,000 instruction characters, 8 MCP servers and 32 combined MCP tools and plugin operations. Limits include
 local and installed contributions. Cache pruning is not yet exposed.
+Configuration requests have a 512 KiB aggregate JSON limit, including settings,
+secret bindings and channel access rules.
 
 Native package AIPs have a smaller limit: the whole draft/revision request,
 including proposal text and source, must fit within 16,000 UTF-8 bytes. Model

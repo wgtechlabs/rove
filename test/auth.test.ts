@@ -1,13 +1,15 @@
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
-import { createApplication, MAX_BODY } from '../src/app.js';
+import { createApplication, MAX_BODY, requestBodyLimit } from '../src/app.js';
 import { createIdentity } from '../src/auth.js';
 import { readConfig } from '../src/config.js';
+import { createExtensions } from '../src/extensions.js';
+import { createPlugins } from '../src/plugins.js';
 
 const origin = 'https://rove.example';
 const setupSecret = 'test-setup-secret-for-local-tests-only-32-chars';
@@ -59,6 +61,8 @@ test('protected setup, administrator authorization, recovery, sign-out and resta
     assert.equal((await app.fetch(request('/api/admin/me'))).status, 401);
     for (const path of [
       '/api/admin/plugins',
+      '/api/admin/plugins/contributions',
+      `/api/admin/plugins/00000000-0000-4000-8000-000000000001/releases/${'a'.repeat(64)}`,
       '/api/admin/runtime',
       '/api/admin/channels',
       '/api/admin/plugins/00000000-0000-4000-8000-000000000001/channel',
@@ -281,6 +285,132 @@ test('protected setup, administrator authorization, recovery, sign-out and resta
     await app.close();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('plugin configuration accepts all declared settings and secrets within its own HTTP envelope', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'rove-config-body-'));
+  const config = {
+    baseURL: origin,
+    authSecret,
+    setupSecret,
+    databasePath: join(dir, 'rove.sqlite'),
+  };
+  const app = await createApplication(config);
+  t.after(async () => {
+    await app.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const fields = (count: number) =>
+    Array.from({ length: count }, (_, n) => ({
+      key: `field-${n}`,
+      label: `Field ${n}`,
+      required: true,
+    }));
+  const pkg = {
+    schemaVersion: 1,
+    apiVersion: 1,
+    id: 'large-config',
+    name: 'Large configuration',
+    version: '1.0.0',
+    category: 'agent',
+    description: '',
+    settings: fields(16).map((field) => ({ ...field, type: 'text' })),
+    secrets: fields(8).map((field) => ({
+      ...field,
+      key: `secret-${field.key}`,
+    })),
+  };
+  const bytes = JSON.stringify(pkg);
+  const digest = createHash('sha256').update(bytes).digest('hex');
+  const controlledFetch: typeof fetch = async (input) => {
+    const path = new URL(String(input)).pathname;
+    if (path.includes('/releases/tags/'))
+      return Response.json({
+        tag_name: 'v1.0.0',
+        draft: false,
+        prerelease: false,
+        assets: [
+          {
+            id: 7,
+            name: 'rove-plugin.json',
+            state: 'uploaded',
+            size: Buffer.byteLength(bytes),
+            digest: `sha256:${digest}`,
+          },
+        ],
+      });
+    if (path.includes('/git/ref/tags/'))
+      return Response.json({ object: { type: 'commit', sha: 'a'.repeat(40) } });
+    if (path.endsWith('/contents/rove-plugin.json'))
+      return Response.json({
+        type: 'file',
+        encoding: 'base64',
+        content: Buffer.from(bytes).toString('base64'),
+      });
+    if (path.endsWith('/releases/assets/7')) return new Response(bytes);
+    assert.fail(`Unexpected fixture request: ${path}`);
+  };
+  const extensions = createExtensions(config);
+  const plugins = createPlugins(config, extensions, controlledFetch);
+  let installation: ReturnType<typeof plugins.list>['installations'][number];
+  try {
+    plugins.saveSource({ repo: 'example/large-config', approved: true });
+    const state = await plugins.install({
+      repo: 'example/large-config',
+      tag: 'v1.0.0',
+    });
+    assert.ok(state.installations[0]);
+    installation = state.installations[0];
+  } finally {
+    plugins.close();
+    extensions.close();
+  }
+  assert.equal((await app.fetch(request('/api/setup', account))).status, 201);
+  const cookie = cookies(
+    await app.fetch(request('/api/auth/sign-in/email', account)),
+  );
+  // Escaped control characters exercise JSON's six-byte-per-character overhead.
+  const value = '\u0001'.repeat(2000);
+  const body = {
+    id: installation.id,
+    revision: installation.revision,
+    digest,
+    grants: [],
+    values: Object.fromEntries(pkg.settings.map((field) => [field.key, value])),
+    secrets: Object.fromEntries(
+      pkg.secrets.map((field) => [field.key, { source: 'stored', value }]),
+    ),
+  };
+  const path = '/api/admin/plugins/configure';
+  assert.ok(Buffer.byteLength(JSON.stringify(body)) > MAX_BODY);
+  assert.equal((await app.fetch(request(path, body))).status, 401);
+  assert.equal(
+    (await app.fetch(request(path, body, cookie, 'https://attacker.example')))
+      .status,
+    403,
+  );
+  const result = await app.fetch(request(path, body, cookie));
+  assert.equal(result.status, 200, await result.clone().text());
+  const saved = await result.json();
+  assert.deepEqual(saved.installations[0].values, body.values);
+  assert.equal(JSON.stringify(saved).includes('"encrypted"'), false);
+  assert.equal(
+    (await app.fetch(request('/api/admin/settings', body, cookie))).status,
+    413,
+  );
+  const oversized = request(path, body, cookie);
+  assert.equal(
+    (
+      await app.fetch(
+        new Request(oversized.url, {
+          method: 'POST',
+          headers: oversized.headers,
+          body: JSON.stringify(body).padEnd(requestBodyLimit(path) + 1),
+        }),
+      )
+    ).status,
+    413,
+  );
 });
 
 test('malformed input and persistent rate limits cannot be bypassed with proxy headers', async () => {

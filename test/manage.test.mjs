@@ -167,18 +167,41 @@ test('plugin management keeps package text inert and saves explicit grants befor
       },
     ],
   };
+  const releases = installation.versions;
+  installation.versions = releases.map(({ digest, tag, manifest }) => ({
+    digest,
+    tag,
+    name: manifest.name,
+    description: manifest.description,
+    category: manifest.category,
+    version: manifest.version,
+  }));
   const state = {
     sources: [{ repo: 'example/plugins', approved: true, configured: true }],
     installations: [installation],
     executable: { reason: 'Executable plugins are unavailable.' },
   };
   const writes = [];
+  const detailRequests = [];
+  let failDetail = false;
+  let expired = false;
+  const failures = [];
+  let heldDetail;
   let pending;
   const run = (action) => {
     pending = action();
     return pending;
   };
   const api = async (path, body) => {
+    if (path.includes('/releases/')) {
+      detailRequests.push(path);
+      if (expired)
+        throw Object.assign(new Error('Sign in again.'), { status: 401 });
+      if (failDetail)
+        throw new Error('Version details are temporarily unavailable. Retry.');
+      if (heldDetail && path.endsWith(digest)) await heldDetail;
+      return releases.find((release) => path.endsWith(release.digest));
+    }
     if (body) {
       writes.push({ path, body: JSON.parse(JSON.stringify(body)) });
       if (path.endsWith('/configure')) {
@@ -203,7 +226,14 @@ test('plugin management keeps package text inert and saves explicit grants befor
       return { state: 'ready', jobs: [{ status: 'uncertain', count: 1 }] };
     return state;
   };
-  const manager = (await management(Element))(root, api, run, () => {});
+  const manager = (await management(Element))(
+    root,
+    api,
+    run,
+    () => {},
+    undefined,
+    (error) => failures.push(error),
+  );
   await manager.load();
   const button = (text) =>
     root
@@ -213,6 +243,23 @@ test('plugin management keeps package text inert and saves explicit grants befor
       );
   button('Plugins').onclick();
   await pending;
+  assert.equal(
+    detailRequests.length,
+    0,
+    'listing installed plugins must not fetch artifact content',
+  );
+  const details = root
+    .all()
+    .find(
+      (element) =>
+        element.tag === 'details' &&
+        element.children[0]?.textContent === 'Review versions and settings',
+    );
+  details.open = true;
+  await details.ontoggle();
+  assert.deepEqual(detailRequests, [
+    `/api/admin/plugins/installation-id/releases/${digest}`,
+  ]);
   assert.equal(
     root
       .all()
@@ -311,13 +358,47 @@ test('plugin management keeps package text inert and saves explicit grants befor
   assert.equal(focused().textContent, 'Plugins');
   const version = root.querySelector('#manage-version-installation-id');
   version.value = previous;
-  version.onchange();
+  failDetail = true;
+  await version.onchange();
+  assert.equal(
+    button('Activate selected version'),
+    undefined,
+    'failed detail reads must not leave a stale activation control',
+  );
+  failDetail = false;
+  await button('Retry version details').onclick();
+  let finishDetail;
+  heldDetail = new Promise((resolve) => {
+    finishDetail = resolve;
+  });
+  version.value = digest;
+  const staleDetail = version.onchange();
+  version.value = previous;
+  await version.onchange();
+  finishDetail();
+  await staleDetail;
+  assert.equal(
+    root.all().some((element) => element.textContent === 'c'.repeat(40)),
+    false,
+    'late responses must not replace the selected release',
+  );
   button('Activate selected version').onclick();
   await pending;
   assert.equal(writes[2].body.digest, previous);
   button('Edit repository').onclick();
   assert.equal(focused().id, 'manage-source-repo');
   assert.equal(root.querySelector('#manage-source-token').value, '');
+  expired = true;
+  const expiredVersion = root.querySelector('#manage-version-installation-id');
+  expiredVersion.value = digest;
+  await expiredVersion.onchange();
+  assert.equal(failures.length, 1);
+  assert.equal(
+    failures[0].status,
+    401,
+    'lazy reads must forward expiry to the workspace handler',
+  );
+  assert.equal(button('Retry version details'), undefined);
   manager.dispose();
 });
 

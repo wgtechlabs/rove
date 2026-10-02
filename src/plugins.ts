@@ -77,6 +77,10 @@ interface Installation {
   environmentFingerprint?: string;
   channelAccess?: z.infer<typeof channelAccess>;
 }
+type ReleaseSummary = Pick<
+  PluginPackage,
+  'name' | 'description' | 'category' | 'version'
+> & { tag: string };
 const hash = (value: string) =>
   createHash('sha256').update(value).digest('hex');
 function parse<T>(schema: z.ZodType<T>, value: unknown): T {
@@ -103,8 +107,21 @@ export function createPlugins(
     db.exec(`PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS rove_plugin_source(repo TEXT PRIMARY KEY, token TEXT NOT NULL, approved INTEGER NOT NULL, revision TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS rove_plugin_installation(id TEXT PRIMARY KEY, repo TEXT NOT NULL, plugin_id TEXT NOT NULL, data TEXT NOT NULL, UNIQUE(repo,plugin_id));
-      CREATE TABLE IF NOT EXISTS rove_plugin_artifact(digest TEXT PRIMARY KEY, repo TEXT NOT NULL, plugin_id TEXT NOT NULL, version TEXT NOT NULL, data TEXT NOT NULL, UNIQUE(repo,plugin_id,version));
+      CREATE TABLE IF NOT EXISTS rove_plugin_artifact(digest TEXT PRIMARY KEY, repo TEXT NOT NULL, plugin_id TEXT NOT NULL, version TEXT NOT NULL, data TEXT NOT NULL, summary TEXT, UNIQUE(repo,plugin_id,version));
       CREATE TABLE IF NOT EXISTS rove_plugin_audit(id INTEGER PRIMARY KEY, installation TEXT NOT NULL, event TEXT NOT NULL, digest TEXT, at INTEGER NOT NULL);`);
+    if (
+      !db
+        .prepare('PRAGMA table_info(rove_plugin_artifact)')
+        .all()
+        .some((column) => column.name === 'summary')
+    )
+      db.exec('ALTER TABLE rove_plugin_artifact ADD COLUMN summary TEXT');
+    // Display metadata is stored once; only selected review and execution read verified artifact bytes.
+    db.exec(`UPDATE rove_plugin_artifact SET summary=json_object(
+      'name',json_extract(data,'$.manifest.name'),
+      'description',json_extract(data,'$.manifest.description'),
+      'category',json_extract(data,'$.manifest.category'),
+      'version',version,'tag',json_extract(data,'$.tag')) WHERE summary IS NULL`);
   } catch (error) {
     db.close();
     throw error;
@@ -184,6 +201,20 @@ export function createPlugins(
       throw new HttpError(400, 'This release belongs to another installation.');
     return release;
   }
+  function detail(id: string, digest: string) {
+    const release = selected(
+      get(parse(z.uuid(), id)),
+      parse(digestSchema, digest),
+    );
+    return {
+      digest: release.digest,
+      tag: release.tag,
+      commit: release.commit,
+      manifest: release.manifest,
+      origin: release.origin,
+      blocked: compatibility(release.manifest, runtime?.status().configured),
+    };
+  }
   function assertApproved(repo: string) {
     const row = source(repo);
     if (!row?.approved)
@@ -229,23 +260,13 @@ export function createPlugins(
         ),
         versions: db
           .prepare(
-            'SELECT digest FROM rove_plugin_artifact WHERE repo=? AND plugin_id=? ORDER BY rowid DESC',
+            'SELECT digest,summary FROM rove_plugin_artifact WHERE repo=? AND plugin_id=? ORDER BY rowid DESC',
           )
           .all(item.repo, item.pluginId)
-          .map((row) => {
-            const release = artifact(String(row.digest));
-            return {
-              digest: release.digest,
-              tag: release.tag,
-              commit: release.commit,
-              manifest: release.manifest,
-              origin: release.origin,
-              blocked: compatibility(
-                release.manifest,
-                runtime?.status().configured,
-              ),
-            };
-          }),
+          .map((row) => ({
+            digest: String(row.digest),
+            ...(JSON.parse(String(row.summary)) as ReleaseSummary),
+          })),
         audit: db
           .prepare(
             'SELECT event,digest,at FROM rove_plugin_audit WHERE installation=? ORDER BY id DESC LIMIT 30',
@@ -373,13 +394,20 @@ export function createPlugins(
     db.exec('BEGIN IMMEDIATE');
     try {
       db.prepare(
-        'INSERT INTO rove_plugin_artifact VALUES(?,?,?,?,?) ON CONFLICT(digest) DO NOTHING',
+        'INSERT INTO rove_plugin_artifact(digest,repo,plugin_id,version,data,summary) VALUES(?,?,?,?,?,?) ON CONFLICT(digest) DO NOTHING',
       ).run(
         release.digest,
         repo,
         manifest.id,
         manifest.version,
         JSON.stringify({ ...release, repo, manifest }),
+        JSON.stringify({
+          name: manifest.name,
+          description: manifest.description,
+          category: manifest.category,
+          version: manifest.version,
+          tag: release.tag,
+        } satisfies ReleaseSummary),
       );
       if (!item) {
         item = {
@@ -917,6 +945,7 @@ export function createPlugins(
   }
   return {
     list,
+    detail,
     saveSource,
     configure,
     deactivate,

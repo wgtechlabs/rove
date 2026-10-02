@@ -1,7 +1,16 @@
 // Packages contribute data only; the host owns every control and action.
 export function renderPlugins(content, state, runtime, ui) {
-  const { node, button, field, submit, api, run, change, selectedVersions } =
-    ui;
+  const {
+    node,
+    button,
+    field,
+    submit,
+    api,
+    run,
+    change,
+    selectedVersions,
+    onError,
+  } = ui;
   const path = (action) => `/api/admin/plugins/${action}`;
   const unavailable = (control, value) => {
     control.disabled = value;
@@ -51,43 +60,35 @@ export function renderPlugins(content, state, runtime, ui) {
       (version) => version.digest === item.active,
     );
     row.append(
-      node('h3', latest.manifest.name),
-      node(
-        'p',
-        active ? `Active · ${active.manifest.version}` : 'Inactive',
-        'small',
-      ),
+      node('h3', latest.name),
+      node('p', active ? `Active · ${active.version}` : 'Inactive', 'small'),
     );
     info(row, 'Repository', item.repo);
-    row.append(node('p', latest.manifest.description, 'description'));
+    row.append(node('p', latest.description, 'description'));
     content.append(row);
     const details = disclosure(
       row,
       'Review versions and settings',
-      !item.active,
+      selectedVersions.get(item.id)?.open || false,
     );
+    details.name = 'plugin-review';
     const selected =
-      selectedVersions.get(item.id) || item.active || latest.digest;
+      selectedVersions.get(item.id)?.digest || item.active || latest.digest;
     const versions = choose(
       details,
       `version-${item.id}`,
       'Prepared version',
       item.versions.map((version) => [
         version.digest,
-        `${version.manifest.version} · ${version.tag}${version.digest === item.active ? ' · active' : ''}`,
+        `${version.version} · ${version.tag}${version.digest === item.active ? ' · active' : ''}`,
       ]),
       selected,
     );
     const body = node('div');
     details.append(body);
-    const renderVersion = () => {
+    const renderVersion = (version) => {
       body.replaceChildren();
-      const version =
-        item.versions.find(
-          (candidate) => candidate.digest === versions.value,
-        ) || latest;
       const manifest = version.manifest;
-      selectedVersions.set(item.id, version.digest);
       const target = {
         id: item.id,
         revision: item.revision,
@@ -433,8 +434,57 @@ export function renderPlugins(content, state, runtime, ui) {
         ),
       );
     };
-    versions.onchange = renderVersion;
-    renderVersion();
+    let loadedDigest;
+    let loadingDigest;
+    let request = 0;
+    const loadVersion = async () => {
+      const digest = versions.value;
+      if (digest === loadedDigest || digest === loadingDigest) return;
+      const current = ++request;
+      loadingDigest = digest;
+      loadedDigest = undefined;
+      selectedVersions.set(item.id, { digest, open: details.open });
+      const status = node('p', 'Loading version details…', 'hint');
+      status.setAttribute('role', 'status');
+      body.replaceChildren(status);
+      body.setAttribute('aria-busy', 'true');
+      try {
+        const version = await api(path(`${item.id}/releases/${digest}`));
+        if (current !== request) return;
+        renderVersion(version);
+        loadedDigest = digest;
+      } catch (error) {
+        if (error.status === 401) {
+          onError(error);
+          return;
+        }
+        if (current !== request) return;
+        const message = node(
+          'p',
+          error.message || 'Version details could not be loaded.',
+          'error',
+        );
+        message.setAttribute('role', 'alert');
+        body.replaceChildren(
+          message,
+          button('Retry version details', loadVersion),
+        );
+      } finally {
+        if (current === request) {
+          loadingDigest = undefined;
+          body.setAttribute('aria-busy', 'false');
+        }
+      }
+    };
+    versions.onchange = loadVersion;
+    details.ontoggle = () => {
+      selectedVersions.set(item.id, {
+        digest: versions.value,
+        open: details.open,
+      });
+      if (details.open) return loadVersion();
+    };
+    if (details.open) loadVersion();
     const audit = disclosure(row, 'Recent changes');
     const history = node('ol', null, 'plugin-audit');
     for (const event of item.audit) {

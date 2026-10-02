@@ -81,7 +81,10 @@ function fixture() {
     workflow: 'success',
     workflowRepo: 'example/knowledge',
     workflowPath: '.github/workflows/plugin-release.yml',
-    file: 'rove-plugin.json',
+    files: [
+      { filename: 'rove-plugin.json', status: 'added' },
+      { filename: `.rove/skills/${draft.skillName}.md`, status: 'added' },
+    ],
     assetId: 9,
     releaseExtra: '',
     tagCommit: 'b'.repeat(40),
@@ -108,7 +111,7 @@ function fixture() {
     if (path.endsWith('/pulls/42'))
       result = {
         merged: state.merged,
-        changed_files: 2,
+        changed_files: state.files.length,
         merge_commit_sha: state.merged ? state.merge : null,
         base: { ref: 'main', repo: { full_name: 'example/knowledge' } },
         head: {
@@ -117,11 +120,7 @@ function fixture() {
           repo: { full_name: 'example/knowledge' },
         },
       };
-    else if (path.endsWith('/pulls/42/files'))
-      result = [
-        { filename: state.file, status: 'added' },
-        { filename: `.rove/skills/${draft.skillName}.md`, status: 'added' },
-      ];
+    else if (path.endsWith('/pulls/42/files')) result = state.files;
     else if (path.includes('/contents/')) {
       assert.ok(
         [state.head, state.merge].includes(
@@ -336,7 +335,7 @@ test('AIP drafts persist, preserve scope, invalidate approvals, and cancel witho
   }
 });
 
-test('native executable AIPs require final human review, a verified release and separate activation across restart', async () => {
+test('native executable AIPs with unchanged proposal documents require final review, a verified release and separate activation across restart', async () => {
   const f = fixture();
   const activated: ReleasedSkill[] = [];
   const activate = (skill: ReleasedSkill) => {
@@ -378,6 +377,8 @@ test('native executable AIPs require final human review, a verified release and 
     );
     assert.ok(Buffer.byteLength(JSON.stringify(nativeDraft)) < 16000);
     assert.equal(published.status, 'published');
+    // GitHub omits the unchanged proposal document from a package-only update.
+    f.state.files = [{ filename: 'rove-plugin.json', status: 'modified' }];
     const pr = f.calls.find((call) => call.path.endsWith('/pulls'));
     assert.equal(pr?.body?.draft, true);
     assert.equal(pr?.body?.base, 'main');
@@ -583,12 +584,83 @@ test('PR files and final content cannot change outside the reviewed package', as
     const created = JSON.parse(await run('stage', draft));
     const target = { id: created.id };
     await run('publish', target);
-    f.state.file = '.github/workflows/plugin-release.yml';
-    await assert.rejects(run('inspect', target), /outside/);
-    f.state.file = 'rove-plugin.json';
+    for (const files of [
+      [{ filename: '.github/workflows/plugin-release.yml', status: 'added' }],
+      [{ filename: 'rove-plugin.json', status: 'removed' }],
+      [{ filename: 'rove-plugin.json', status: 'renamed' }],
+      [
+        { filename: 'rove-plugin.json', status: 'added' },
+        { filename: 'rove-plugin.json', status: 'modified' },
+      ],
+    ]) {
+      f.state.files = files;
+      await assert.rejects(run('inspect', target), /outside/);
+    }
+    f.state.files = [{ filename: 'rove-plugin.json', status: 'modified' }];
     f.state.skill = '# Unauthorized replacement';
     await assert.rejects(run('inspect', target), /differs/);
     assert.equal(service.list('web:one')[0]?.review, undefined);
+  } finally {
+    service.close();
+    f.cleanup();
+  }
+});
+
+test('generated AIP packages validate before saving drafts or revisions', async () => {
+  const f = fixture();
+  const service = createAips(f.config, undefined, f.fetchImpl);
+  const run = (args: unknown) =>
+    service.execute('rove_aip_stage', args, revision(service), 'web:one');
+  try {
+    service.saveSettings(githubSettings);
+    const boundaryVersion = `${'1'.repeat(36)}.0.0`;
+    const tooLong = { ...draft, packageVersion: `${'1'.repeat(37)}.0.0` };
+    assert.throws(
+      () => service.preview('rove_aip_stage', tooLong, 'web:one'),
+      /Invalid AIP fields/,
+    );
+    await assert.rejects(run(tooLong), /Invalid AIP fields/);
+    assert.equal(service.list('web:one').length, 0);
+    const created = JSON.parse(
+      await run({ ...draft, packageVersion: boundaryVersion }),
+    );
+    await assert.rejects(
+      run({ ...tooLong, action: 'revise', id: created.id }),
+      /Invalid AIP fields/,
+    );
+    for (const action of ['draft', 'revise'])
+      await assert.rejects(
+        run({
+          ...draft,
+          action,
+          ...(action === 'revise' ? { id: created.id } : {}),
+          skillContent: `Use \${settings.undeclared}.`,
+        }),
+        /Unsupported plugin manifest/,
+      );
+    assert.equal(service.list('web:one').length, 1);
+    assert.equal(service.list('web:one')[0]?.packageVersion, boundaryVersion);
+    assert.equal(service.list('web:one')[0]?.version, 1);
+    const db = new DatabaseSync(f.config.databasePath);
+    try {
+      db.prepare('UPDATE rove_aip SET data=? WHERE id=?').run(
+        JSON.stringify({ ...created, packageVersion: tooLong.packageVersion }),
+        created.id,
+      );
+    } finally {
+      db.close();
+    }
+    await assert.rejects(
+      service.execute(
+        'rove_aip_publish',
+        { id: created.id },
+        revision(service),
+        'web:one',
+      ),
+      /Unsupported plugin manifest/,
+    );
+    assert.equal(service.list('web:one')[0]?.status, 'draft');
+    assert.equal(f.calls.length, 0);
   } finally {
     service.close();
     f.cleanup();
