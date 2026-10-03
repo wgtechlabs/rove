@@ -83,5 +83,7 @@ jobs:
 
       release-initial-version: 0.1.0
       release-commit-convention: clean-commit
+      # Recognize Clean Commit's breaking marker before an optional scope.
+      release-major-keywords: 'BREAKING CHANGE,BREAKING-CHANGE,breaking,^[^[:alnum:]]*[a-z]+![[:space:]]*(\([^)]+\))?:[[:space:]]'
       release-version-file-paths: package.json
       release-workspace-detection: false

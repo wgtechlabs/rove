@@ -42,6 +42,15 @@ export function textField(
 
 export async function createIdentity(config: RuntimeConfig) {
   const db = config.db;
+  async function requireSessionOwnership() {
+    try {
+      await config.state.assertOwned();
+    } catch {
+      throw new APIError('SERVICE_UNAVAILABLE', {
+        message: 'Runtime ownership is unavailable. Restart Rove.',
+      });
+    }
+  }
   const options = {
     appName: 'Rove',
     baseURL: config.baseURL,
@@ -50,17 +59,8 @@ export async function createIdentity(config: RuntimeConfig) {
     database: db.pool,
     databaseHooks: {
       session: {
-        create: {
-          async before() {
-            try {
-              await config.state.assertOwned();
-            } catch {
-              throw new APIError('SERVICE_UNAVAILABLE', {
-                message: 'Runtime ownership is unavailable. Restart Rove.',
-              });
-            }
-          },
-        },
+        create: { before: requireSessionOwnership },
+        delete: { before: requireSessionOwnership },
       },
     },
     emailAndPassword: {

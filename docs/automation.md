@@ -39,3 +39,10 @@ remains unchanged.
 The top-level reusable workflow is pinned to v0.2.1's commit. Its upstream nested
 CI workflow still follows the mutable `v0` tag. Enabling this workflow does not
 publish an image or create a release until a qualifying `main` push occurs.
+
+The pinned release detector needs an explicit `release-major-keywords` pattern
+for Clean Commit's `update! (scope):` syntax. The workflow preserves the default
+breaking-change keywords and adds that pattern for both planning and finalization.
+Keep it until the pinned detector supports this syntax directly. Release detection
+excludes merge commits, so changing a release PR's title cannot supply a missing
+breaking-change signal.

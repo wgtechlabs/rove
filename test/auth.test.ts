@@ -590,3 +590,48 @@ test('login cannot insert a session after runtime ownership is lost during passw
     0,
   );
 });
+
+test('sign-out and expired-session cleanup cannot delete after ownership loss during lookup', async (t) => {
+  for (const expired of [false, true]) {
+    const config = {
+      ...(await testRuntime(t)),
+      baseURL: origin,
+      authSecret,
+      setupSecret,
+    };
+    const identity = await createIdentity(config);
+    await identity.bootstrap(account);
+    const login = await identity.signIn(
+      request('/api/auth/sign-in/email', account),
+    );
+    assert.equal(login.status, 200);
+    if (expired) {
+      await config.db.run('UPDATE session SET "expiresAt" = $1', [new Date(0)]);
+    }
+    const context = await identity.auth.$context;
+    const findSession = context.internalAdapter.findSession;
+    t.mock.method(
+      context.internalAdapter,
+      'findSession',
+      async (token: string) => {
+        const session = await findSession(token);
+        await config.state.close();
+        return session;
+      },
+    );
+    const response = await identity.auth.handler(
+      request(
+        expired ? '/api/auth/get-session' : '/api/auth/sign-out',
+        expired ? undefined : {},
+        cookies(login),
+      ),
+    );
+    // Sign-out deliberately clears the browser cookie even if native deletion fails.
+    assert.equal(response.status, expired ? 503 : 200);
+    assert.equal(
+      (await config.db.get('SELECT count(*) AS count FROM session'))?.count,
+      1,
+      'An old owner must leave durable sessions for the active core.',
+    );
+  }
+});
