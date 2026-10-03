@@ -8,9 +8,12 @@ Release Build Flow Action and Container Build Flow Action together.
 
 - Pushes and PRs targeting `dev` or `main` run Biome,
   type checking, integration tests, a production build, Gitleaks, and the Docker
-  smoke test. CI starts PostgreSQL 17 with pgvector and Redis 7 before integration
-  tests. The isolated three-service smoke test verifies pgvector availability,
-  saved login and chat after storage restarts, and graceful shutdown.
+  smoke test. CI starts PostgreSQL 18 with pgvector and authenticated Redis 8.2
+  from `compose.yaml` before integration tests. The isolated container smoke test
+  reuses those service definitions under a separate Compose project with random
+  host ports and disposable credentials. It verifies pgvector availability,
+  Redis authentication and append-only persistence, saved login and chat after
+  storage restarts, and graceful shutdown.
 - Only pushes to `main` can publish. Clean Commit history determines the release
   version. The flow updates `package.json` and `CHANGELOG.md` and creates the tag,
   builds and publishes `wgtechlabs/rove` to Docker Hub and GHCR for Linux AMD64 and ARM64,

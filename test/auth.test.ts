@@ -518,51 +518,47 @@ test('recovery rejects a login already checking the previous password', async (t
     authSecret,
     setupSecret,
   });
-  try {
-    const { recoveryKey } = await identity.bootstrap(account);
-    const context = await identity.auth.$context;
-    const verify = context.password.verify;
-    let announceVerified!: () => void;
-    const verified = new Promise<void>((resolve) => {
-      announceVerified = resolve;
-    });
-    let release!: () => void;
-    const held = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    context.password.verify = async (value) => {
-      const result = await verify(value);
-      announceVerified();
-      await held;
-      return result;
-    };
-    const login = identity.signIn(request('/api/auth/sign-in/email', account));
-    await verified;
-    await identity.recover({
-      recoveryKey,
+  const { recoveryKey } = await identity.bootstrap(account);
+  const context = await identity.auth.$context;
+  const verify = context.password.verify;
+  let announceVerified!: () => void;
+  const verified = new Promise<void>((resolve) => {
+    announceVerified = resolve;
+  });
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  context.password.verify = async (value) => {
+    const result = await verify(value);
+    announceVerified();
+    await held;
+    return result;
+  };
+  const login = identity.signIn(request('/api/auth/sign-in/email', account));
+  await verified;
+  await identity.recover({
+    recoveryKey,
+    password: 'a-different-new-password',
+  });
+  release();
+  await assert.rejects(login, /credentials changed/);
+  context.password.verify = verify;
+  const fresh = await identity.signIn(
+    request('/api/auth/sign-in/email', {
+      email: account.email,
       password: 'a-different-new-password',
-    });
-    release();
-    await assert.rejects(login, /credentials changed/);
-    context.password.verify = verify;
-    const fresh = await identity.signIn(
-      request('/api/auth/sign-in/email', {
-        email: account.email,
-        password: 'a-different-new-password',
-      }),
-    );
-    assert.equal(fresh.status, 200);
-    assert.equal(
-      (
-        await identity.requireAdmin(
-          request('/api/admin/me', undefined, cookies(fresh)),
-        )
-      ).role,
-      'admin',
-    );
-  } finally {
-    identity.close();
-  }
+    }),
+  );
+  assert.equal(fresh.status, 200);
+  assert.equal(
+    (
+      await identity.requireAdmin(
+        request('/api/admin/me', undefined, cookies(fresh)),
+      )
+    ).role,
+    'admin',
+  );
 });
 
 test('login cannot insert a session after runtime ownership is lost during password verification', async (t) => {

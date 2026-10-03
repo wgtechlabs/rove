@@ -234,6 +234,5 @@ export async function createIdentity(config: RuntimeConfig) {
     signIn,
     requireAdmin,
     limit,
-    close: () => {},
   };
 }

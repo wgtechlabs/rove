@@ -62,7 +62,8 @@ jobs:
         node scripts/check-container.mjs
 
       enable-gitleaks: true
-      # Private repository: Code Security is not enabled for SARIF uploads.
+      # Optional CodeQL security scanning and SARIF uploads remain disabled.
+      # GitHub's separate Code Quality workflow runs independently.
       enable-codeql: false
       container-upload-sarif: false
 
