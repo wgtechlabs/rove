@@ -2,9 +2,9 @@
 
 The saved template uses **Rove v1.0.1**, Railway's native **PostgreSQL 18**
 service with pgvector, and native **Redis 8.2**. Its configuration has been saved
-and read back; a fresh live installation still needs verification. The template
-is not yet listed in Railway's marketplace. The configuration below also supports
-manual installation without a marketplace listing.
+and read back; a fresh live installation still needs verification. Deploy from
+the [published Railway template](https://railway.com/deploy/rove), or use the
+configuration below for manual installation.
 
 ## Services
 

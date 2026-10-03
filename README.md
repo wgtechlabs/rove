@@ -114,7 +114,8 @@ PostgreSQL and Redis need persistent volumes; Rove does not need a volume.
 See [Railway template configuration](docs/railway-template.md) for volumes,
 reference variables and generated secrets. The saved template is configured for
 this three-service layout and Rove v1.0.1. A fresh live template installation
-still needs verification; the template is not yet listed in the marketplace.
+still needs verification. The template is
+[published in Railway's marketplace](https://railway.com/deploy/rove).
 
 Run **one Rove replica**. Redis coordinates core ownership, active turns and
 credential attempt limits. Rove refuses to start without PostgreSQL, pgvector or
