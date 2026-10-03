@@ -25,7 +25,7 @@ async function allocate() {
     authSecret: 'a'.repeat(64),
     setupSecret: 's'.repeat(64),
     databaseURL: databaseURL.href,
-    redisURL: process.env.TEST_REDIS_URL || 'redis://127.0.0.1:6389',
+    redisURL: process.env.TEST_REDIS_URL || 'redis://:rove@127.0.0.1:6389',
     redisPrefix: `test:${id}`,
   };
   const cleanup = async () => {

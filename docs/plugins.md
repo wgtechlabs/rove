@@ -187,12 +187,12 @@ not imply that chat can generate or stage a package of that size.
 
 ## Upgrading existing deployments
 
-This release requires a fresh PostgreSQL database and Redis. There is no SQLite
-importer. Keep any previous database, backup, authentication secret and matching
-old image together; starting the new image does not transfer an existing account,
-conversation history, installed release or proposal.
+Rove requires PostgreSQL with pgvector and Redis. Follow the
+[storage upgrade guidance](railway-template.md#storage-upgrades) when changing
+storage versions or moving an older deployment; starting a new image does not
+transfer existing data between databases.
 
-For subsequent PostgreSQL deployments, back up the database and keep
+For PostgreSQL deployments, back up the database and keep
 `BETTER_AUTH_SECRET` before updating core. An application rollback must use a
 compatible schema or restore its matching backup. A plugin rollback only changes
 future plugin behavior; it does not restore database state or reverse external

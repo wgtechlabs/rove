@@ -1,9 +1,10 @@
 # Railway template configuration
 
-This is the three-service specification for the next PostgreSQL-based Rove
-image. The saved Railway template still targets **v0.2.0** and has not been
-updated to this layout. Publish the new application image before changing that
-template. A fresh live installation of this layout still needs verification.
+The saved template uses **Rove v1.0.0**, Railway's native **PostgreSQL 18**
+service with pgvector, and native **Redis 8.2**. Its configuration has been saved
+and read back; a fresh live installation still needs verification. The template
+is not yet listed in Railway's marketplace. The configuration below also supports
+manual installation without a marketplace listing.
 
 ## Services
 
@@ -12,33 +13,50 @@ services on private networking; only Rove needs a public HTTP domain.
 
 | Service | Image or source | Persistent volume | Settings |
 | --- | --- | --- | --- |
-| `Postgres` | `pgvector/pgvector:pg17` | `/var/lib/postgresql/data` | PostgreSQL port `5432`; pgvector is installed in this image. |
-| `Redis` | `redis:7-alpine` | `/data` | Redis port `6379`; start with `redis-server --appendonly yes`. |
-| `Rove` | A versioned `ghcr.io/wgtechlabs/rove` image containing this change, or the matching stable source release | None | Public HTTP port `3000`, healthcheck `/health`, one replica. |
+| `Postgres` | `ghcr.io/railwayapp-templates/postgres-ssl:18` | `/var/lib/postgresql/data` | Private port `5432`; keep `PGDATA=/var/lib/postgresql/data/pgdata`. The native image includes pgvector. |
+| `Redis` | `redis:8.2` | `/data` | Private port `6379`; preserve the generated password and enable append-only persistence. |
+| `rove` | `wgtechlabs/rove:1.0.0` or `ghcr.io/wgtechlabs/rove:1.0.0` | None | Public HTTP port `3000`, healthcheck `/health`, one replica. |
 
 The checked-in `railway.json` sets the Dockerfile and healthcheck for source
 builds. Set the health path separately when configuring an image deployment.
 Rove enables the `vector` extension during database initialization; the PostgreSQL
 role must have permission to enable it and create the application tables. This
 makes the database ready for vectors; semantic retrieval is not implemented.
+Railway's [PostgreSQL 18 image](https://github.com/railwayapp-templates/postgres-ssl/blob/92c18579d2610d5bf7715e60a4340a25401932bb/Dockerfile.18)
+already installs pgvector. Keep the native volume mount and `PGDATA` subdirectory;
+do not substitute the upstream PostgreSQL image's default data path.
+
+The local [Compose stack](../compose.yaml), CI and container smoke checks share
+these database image versions. Compose uses development-only credentials; Railway
+generates deployment credentials independently.
 
 ## Variables
 
-Set these variables on **Postgres**:
+Railway's native services provide their variables automatically. Keep the
+generated passwords and private URLs rather than copying local development
+credentials. These are the values relevant to Rove on **Postgres**:
 
 | Variable | Template value |
 | --- | --- |
-| `POSTGRES_USER` | `rove` |
-| `POSTGRES_DB` | `rove` |
-| `POSTGRES_PASSWORD` | `${{secret(64, "abcdef0123456789")}}` |
-| `DATABASE_URL` | `postgresql://${{POSTGRES_USER}}:${{POSTGRES_PASSWORD}}@${{RAILWAY_PRIVATE_DOMAIN}}:5432/${{POSTGRES_DB}}` |
+| `POSTGRES_USER` | `postgres` (native default) |
+| `POSTGRES_DB` | `railway` (native default) |
+| `POSTGRES_PASSWORD` | Native generated secret |
+| `PGDATA` | `/var/lib/postgresql/data/pgdata` |
+| `DATABASE_URL` | Native private URL using the generated user, password, database and `RAILWAY_PRIVATE_DOMAIN` |
 
-Set `REDIS_URL=redis://${{RAILWAY_PRIVATE_DOMAIN}}:6379` on **Redis**. This Redis
-service must remain private; the proposed image command enables AOF persistence.
-If using a separately managed Redis service, use its authenticated connection URL
-and persistent storage instead.
+On **Redis**, retain the native `REDISUSER`, `REDIS_PASSWORD`, `REDISHOST`,
+`REDISPORT` and authenticated `REDIS_URL` variables. The saved template adds
+`--appendonly yes` to Railway's native start command:
 
-Set these variables on **Rove**. Reference names must match the service names
+```sh
+/bin/sh -c "rm -rf $RAILWAY_VOLUME_MOUNT_PATH/lost+found/ && exec docker-entrypoint.sh redis-server --requirepass $REDIS_PASSWORD --save 60 1 --appendonly yes --dir $RAILWAY_VOLUME_MOUNT_PATH"
+```
+
+Both databases remain private: do not add HTTP or TCP proxies. If using separately
+managed databases, supply their authenticated connection URLs and persistent
+storage instead.
+
+Set these variables on **rove**. Reference names must match the service names
 above:
 
 | Variable | Template value |
@@ -80,11 +98,25 @@ change this order. Automatic rolling updates and zero-downtime upgrades are not
 supported by this version. See Railway's [healthcheck behavior](https://docs.railway.com/deployments/healthchecks)
 and [deployment teardown settings](https://docs.railway.com/deployments/deployment-teardown).
 
-Start this storage version with a **fresh PostgreSQL database**. There is no
-SQLite importer. Preserve old data files, backups and the matching authentication
-secret for recovery with their old image. Before later PostgreSQL-based upgrades,
-back up PostgreSQL and test recovery with a matching application version. Rove
-requires no app volume; keep the PostgreSQL and Redis volumes persistent.
+## Storage upgrades
+
+New installations use a **fresh PostgreSQL database**. Before upgrading an
+existing PostgreSQL deployment, back up the database and test recovery with a
+matching application version and authentication secret. Keep the PostgreSQL and
+Redis volumes persistent; Rove itself requires no app volume.
+
+PostgreSQL major versions do not share interchangeable data directories. The local
+Compose stack uses a new `postgres-18-data` volume and leaves the old
+`postgres-data` volume untouched. To retain PostgreSQL 17 data, export it using
+the old image, then restore into a fresh PostgreSQL 18 database before starting
+Rove. Do not attach the old volume to the new image or delete it before verifying
+the restored data. Merely changing an image tag does not perform a database
+upgrade.
+
+Deployments from before the PostgreSQL migration have no automatic SQLite
+importer. `ROVE_DATABASE_PATH` is no longer read. Preserve those database files,
+backups, their matching authentication secret and the old image for recovery;
+starting Rove v1.0.0 does not import existing accounts or conversations.
 
 ## Optional integrations and verification
 

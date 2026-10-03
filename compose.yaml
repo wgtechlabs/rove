@@ -1,24 +1,28 @@
 services:
   postgres:
-    image: pgvector/pgvector:pg17
+    image: ghcr.io/railwayapp-templates/postgres-ssl:18
     environment:
       POSTGRES_USER: rove
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rove}
       POSTGRES_DB: rove
+      PGDATA: /var/lib/postgresql/data/pgdata
+      RAILWAY_VOLUME_MOUNT_PATH: /var/lib/postgresql/data
     ports:
-      - "127.0.0.1:54329:5432"
+      - "127.0.0.1:${ROVE_POSTGRES_PORT:-54329}:5432"
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - postgres-18-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U rove -d rove"]
       interval: 5s
       timeout: 5s
       retries: 20
   redis:
-    image: redis:7-alpine
-    command: ["redis-server", "--appendonly", "yes"]
+    image: redis:8.2-alpine
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:-rove}"]
+    environment:
+      REDISCLI_AUTH: ${REDIS_PASSWORD:-rove}
     ports:
-      - "127.0.0.1:6389:6379"
+      - "127.0.0.1:${ROVE_REDIS_PORT:-6389}:6379"
     volumes:
       - redis-data:/data
     healthcheck:
@@ -34,7 +38,7 @@ services:
       BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:-}
       ROVE_SETUP_SECRET: ${ROVE_SETUP_SECRET:-}
       DATABASE_URL: postgres://rove:${POSTGRES_PASSWORD:-rove}@postgres:5432/rove
-      REDIS_URL: redis://redis:6379
+      REDIS_URL: redis://:${REDIS_PASSWORD:-rove}@redis:6379
       ROVE_STATE_KEY_PREFIX: ${ROVE_STATE_KEY_PREFIX:-rove}
     ports:
       - "127.0.0.1:3000:3000"
@@ -44,5 +48,5 @@ services:
       redis:
         condition: service_healthy
 volumes:
-  postgres-data:
+  postgres-18-data:
   redis-data:

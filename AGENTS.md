@@ -23,7 +23,8 @@ affected code and current repository state before making changes.
   Do not make Vercel infrastructure mandatory.
 - PostgreSQL with pgvector stores durable application data. Redis is required for
   runtime ownership, active turns and credential attempt limits. Use native async
-  PostgreSQL queries and transaction-bound clients. Do not add a SQLite fallback.
+  PostgreSQL queries and transaction-bound clients. Do not add an embedded
+  database fallback.
   Keep one active Rove core per deployment; Redis coordination is not a claim of
   multi-replica support. The app container needs no persistent volume.
   pgvector readiness does not imply semantic retrieval is implemented.
@@ -159,6 +160,10 @@ stay under 72 characters when practical. Example:
   local dependencies with `docker compose up -d --wait postgres redis`; the test
   helper isolates databases and Redis namespaces. Use disposable services and a
   PostgreSQL test role that can create and drop databases.
+- Keep `compose.yaml` as the storage definition shared by local development, CI
+  and container smoke checks. Match the Railway baseline of PostgreSQL 18 with
+  pgvector and authenticated Redis 8.2 with append-only persistence. Do not reuse
+  an older PostgreSQL major version's volume without an explicit migration.
 - Use dummy credentials and controlled provider boundaries for local tests.
   Never retrieve production secrets or make live provider writes just to complete
   a test without the necessary authorization.
