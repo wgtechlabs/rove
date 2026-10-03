@@ -18,7 +18,17 @@ services:
       retries: 20
   redis:
     image: redis:8.2-alpine
-    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:-rove}"]
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        case "$$REDISCLI_AUTH" in
+          *[!a-zA-Z0-9._~-]*)
+            echo "REDIS_PASSWORD must use only letters, numbers, '.', '_', '~' or '-'." >&2
+            exit 1
+            ;;
+        esac
+        exec docker-entrypoint.sh redis-server --appendonly yes --requirepass "$$REDISCLI_AUTH"
     environment:
       REDISCLI_AUTH: ${REDIS_PASSWORD:-rove}
     ports:

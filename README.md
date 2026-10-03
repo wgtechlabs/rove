@@ -72,6 +72,10 @@ The example connects to PostgreSQL on `127.0.0.1:54329` and Redis on
 `127.0.0.1:6389`. Compose keeps both services in named volumes. The local database
 and Redis passwords are for development only; use generated credentials on a
 deployment host. Redis requires authentication and uses append-only persistence.
+Custom Compose `REDIS_PASSWORD` values must contain only letters, numbers, `.`,
+`_`, `~` and `-` so they can be used directly in the connection URL. Compose
+rejects other characters at startup. This restriction applies only to the local
+Compose stack; hosted deployments use their provider's connection URL.
 
 Build and start Rove:
 
