@@ -2,24 +2,63 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { fileURLToPath } from 'node:url';
 
 const image = process.argv[2] || 'rove:foundation';
 const suffix = randomUUID().slice(0, 8);
 const name = `rove-check-${suffix}`;
 const drainName = `rove-drain-${suffix}`;
-const postgres = `rove-postgres-${suffix}`;
-const redis = `rove-redis-${suffix}`;
-const network = `rove-network-${suffix}`;
-const volumes = [`rove-pg-data-${suffix}`, `rove-redis-data-${suffix}`];
+const temporary = mkdtempSync(join(tmpdir(), `${name}-`));
+const envFile = join(temporary, '.env');
+writeFileSync(envFile, '');
 const origin = 'http://localhost:3000';
 const setupSecret = 'container-test-setup-secret-not-production';
 const authSecret = 'container-test-auth-secret-not-production';
+const postgresPassword = 'container-postgres-password';
+const redisPassword = 'container-redis-password';
 const docker = (...args) =>
   execFileSync('docker', args, {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      POSTGRES_PASSWORD: postgresPassword,
+      REDIS_PASSWORD: redisPassword,
+      ROVE_POSTGRES_PORT: '0',
+      ROVE_REDIS_PORT: '0',
+      ROVE_URL: origin,
+      BETTER_AUTH_SECRET: authSecret,
+      ROVE_SETUP_SECRET: setupSecret,
+      ROVE_STATE_KEY_PREFIX: name,
+    },
   }).trim();
+const compose = (...args) =>
+  docker(
+    'compose',
+    '--file',
+    fileURLToPath(new URL('../compose.yaml', import.meta.url)),
+    '--project-name',
+    name,
+    '--env-file',
+    envFile,
+    ...args,
+  );
+function redact(message) {
+  for (const secret of [
+    setupSecret,
+    authSecret,
+    postgresPassword,
+    redisPassword,
+  ])
+    message = message.replaceAll(secret, '[redacted]');
+  return message.slice(-4000);
+}
+let network;
+let storage;
 let base;
 async function call(path, body, cookie = '') {
   return fetch(base + path, {
@@ -40,9 +79,9 @@ async function start(setup) {
     '--network',
     network,
     '-e',
-    `DATABASE_URL=postgres://rove:rove@${postgres}:5432/rove`,
+    `DATABASE_URL=${storage.DATABASE_URL}`,
     '-e',
-    `REDIS_URL=redis://${redis}:6379`,
+    `REDIS_URL=${storage.REDIS_URL}`,
     '-e',
     `ROVE_URL=${origin}`,
     '-e',
@@ -62,69 +101,48 @@ async function start(setup) {
   throw new Error('Container did not become healthy.');
 }
 try {
-  docker('network', 'create', network);
-  for (const volume of volumes) docker('volume', 'create', volume);
-  docker(
-    'run',
-    '-d',
-    '--name',
-    postgres,
-    '--network',
-    network,
-    '-v',
-    `${volumes[0]}:/var/lib/postgresql/data`,
-    '-e',
-    'POSTGRES_USER=rove',
-    '-e',
-    'POSTGRES_PASSWORD=rove',
-    '-e',
-    'POSTGRES_DB=rove',
-    'pgvector/pgvector:pg17',
+  const configuration = JSON.parse(
+    compose('--profile', 'app', 'config', '--format', 'json'),
   );
-  docker(
-    'run',
-    '-d',
-    '--name',
-    redis,
-    '--network',
-    network,
-    '-v',
-    `${volumes[1]}:/data`,
-    'redis:7-alpine',
-    'redis-server',
-    '--appendonly',
-    'yes',
+  storage = configuration.services.rove.environment;
+  compose('up', '-d', '--wait', '--wait-timeout', '120', 'postgres', 'redis');
+  const postgres = compose('ps', '-q', 'postgres');
+  const postgresContainer = JSON.parse(docker('inspect', postgres))[0];
+  [network] = Object.keys(postgresContainer.NetworkSettings.Networks);
+  assert.ok(network, 'Compose must create an isolated storage network.');
+  assert.match(
+    compose('exec', '-T', '-e', 'REDISCLI_AUTH=', 'redis', 'redis-cli', 'ping'),
+    /NOAUTH/,
   );
-  for (let i = 0; i < 100; i++) {
-    try {
-      docker(
-        'exec',
-        postgres,
-        'pg_isready',
-        '-h',
-        '127.0.0.1',
-        '-U',
-        'rove',
-        '-d',
-        'rove',
-      );
-      docker('exec', redis, 'redis-cli', 'ping');
-      break;
-    } catch {
-      if (i === 99) throw new Error('Storage did not become ready.');
-      await delay(100);
-    }
-  }
+  assert.equal(
+    compose(
+      'exec',
+      '-T',
+      'redis',
+      'redis-cli',
+      '--raw',
+      'CONFIG',
+      'GET',
+      'appendonly',
+    ),
+    'appendonly\nyes',
+  );
+  const redisKey = 'rove:container-smoke:persistence';
+  assert.equal(
+    compose('exec', '-T', 'redis', 'redis-cli', 'SET', redisKey, suffix),
+    'OK',
+  );
   await start(true);
   assert.equal(
-    docker(
+    compose(
       'exec',
-      postgres,
+      '-T',
+      'postgres',
       'psql',
       '-U',
-      'rove',
+      configuration.services.postgres.environment.POSTGRES_USER,
       '-d',
-      'rove',
+      configuration.services.postgres.environment.POSTGRES_DB,
       '-Atc',
       "SELECT extname FROM pg_extension WHERE extname='vector'",
     ),
@@ -232,27 +250,12 @@ try {
   docker('stop', '-t', '12', name);
   assert.equal(docker('inspect', '-f', '{{.State.ExitCode}}', name), '0');
   docker('rm', name);
-  docker('restart', postgres, redis);
-  for (let i = 0; i < 100; i++) {
-    try {
-      docker(
-        'exec',
-        postgres,
-        'pg_isready',
-        '-h',
-        '127.0.0.1',
-        '-U',
-        'rove',
-        '-d',
-        'rove',
-      );
-      docker('exec', redis, 'redis-cli', 'ping');
-      break;
-    } catch {
-      if (i === 99) throw new Error('PostgreSQL restart failed.');
-      await delay(100);
-    }
-  }
+  compose('stop', 'postgres', 'redis');
+  compose('up', '-d', '--wait', '--wait-timeout', '120', 'postgres', 'redis');
+  assert.equal(
+    compose('exec', '-T', 'redis', 'redis-cli', 'GET', redisKey),
+    suffix,
+  );
   await start(false);
   assert.deepEqual(await (await call('/api/setup')).json(), {
     required: false,
@@ -290,22 +293,37 @@ try {
   assert.match(docker('logs', drainName), /drained/);
   assert.equal(docker('inspect', '-f', '{{.State.ExitCode}}', drainName), '0');
   console.log(
-    'PASS: health, non-root PID 1, admin login, body limit, model reply, saved chat, PostgreSQL + pgvector + Redis, storage restart without setup secret, graceful shutdown.',
+    'PASS: health, non-root PID 1, admin login, body limit, model reply, saved chat, PostgreSQL + pgvector, authenticated Redis + AOF persistence, storage restart without setup secret, graceful shutdown.',
+  );
+} catch (error) {
+  for (const container of [name, drainName]) {
+    try {
+      console.error(redact(docker('logs', '--tail', '40', container)));
+    } catch {
+      /* The container may not have started. */
+    }
+  }
+  try {
+    console.error(redact(compose('logs', '--no-color', '--tail', '40')));
+  } catch {
+    /* Storage may not have started. */
+  }
+  throw new Error(
+    redact(error instanceof Error ? error.message : String(error)),
   );
 } finally {
-  for (const container of [name, drainName, postgres, redis]) {
+  for (const container of [name, drainName]) {
     try {
       docker('rm', '-f', container);
     } catch {
       /* already removed */
     }
   }
-  for (const volume of volumes) {
-    try {
-      docker('volume', 'rm', volume);
-    } catch {}
-  }
   try {
-    docker('network', 'rm', network);
-  } catch {}
+    compose('down', '--volumes', '--remove-orphans');
+  } catch (error) {
+    console.error(`Storage cleanup failed: ${redact(error.message)}`);
+    process.exitCode = 1;
+  }
+  rmSync(temporary, { recursive: true, force: true });
 }

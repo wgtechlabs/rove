@@ -49,8 +49,8 @@ are outside the MVP. See [PRODUCT.md](PRODUCT.md) for the product direction.
 ## Quick start
 
 Install **Node.js 24** and **Bun 1.3.10**. Bun manages dependencies and scripts;
-Node runs the server and integration tests. Run **PostgreSQL 17 with pgvector**
-and **Redis 7** locally using Docker Compose:
+Node runs the server and integration tests. Run **PostgreSQL 18 with pgvector**
+and **Redis 8.2** locally using Docker Compose:
 
 ```sh
 git clone https://github.com/wgtechlabs/rove.git
@@ -70,7 +70,12 @@ node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
 
 The example connects to PostgreSQL on `127.0.0.1:54329` and Redis on
 `127.0.0.1:6389`. Compose keeps both services in named volumes. The local database
-password is for development only; use generated credentials on a deployment host.
+and Redis passwords are for development only; use generated credentials on a
+deployment host. Redis requires authentication and uses append-only persistence.
+Custom Compose `REDIS_PASSWORD` values must contain only letters, numbers, `.`,
+`_`, `~` and `-` so they can be used directly in the connection URL. Compose
+rejects other characters at startup. This restriction applies only to the local
+Compose stack; hosted deployments use their provider's connection URL.
 
 Build and start Rove:
 
@@ -89,26 +94,27 @@ keeps setup closed. Keep `BETTER_AUTH_SECRET` stable across restarts. Then
 
 ## Deploy on Railway
 
-Use three services: **Rove**, **PostgreSQL 17 with pgvector**, and **Redis 7**.
+Use three services: **Rove**, **PostgreSQL 18 with pgvector**, and **Redis 8.2**.
 PostgreSQL and Redis need persistent volumes; Rove does not need a volume.
 
-1. Provision PostgreSQL from `pgvector/pgvector:pg17` and Redis from `redis:7-alpine`.
-   Enable Redis AOF persistence with `redis-server --appendonly yes`.
-2. Use a versioned Rove image containing this storage change when released.
-   Until then, build this source revision with its [Dockerfile](Dockerfile) and
-   [configuration](railway.json). Set
-   `DATABASE_URL` and `REDIS_URL` to the data services' private connection URLs.
+1. Add Railway's native PostgreSQL and Redis services. The PostgreSQL 18 image
+   includes pgvector. Keep their generated credentials and persistent volumes;
+   enable Redis append-only persistence while retaining its authenticated start
+   command. Keep both services on private networking.
+2. Use `wgtechlabs/rove:1.0.0` or `ghcr.io/wgtechlabs/rove:1.0.0` for Rove.
+   Set `DATABASE_URL=${{Postgres.DATABASE_URL}}` and
+   `REDIS_URL=${{Redis.REDIS_URL}}`, matching the database service names.
+   Configure HTTP port `3000` and healthcheck `/health`.
 3. Generate a public domain. Set `ROVE_URL` to its exact HTTPS origin, with no
    trailing slash. Set separate random `BETTER_AUTH_SECRET` and
    `ROVE_SETUP_SECRET` values in the Rove service variables.
 4. Deploy, open the domain and create your administrator account. Save the
-   recovery key, remove `ROVE_SETUP_SECRET`, stop the old Rove deployment, then
-   start its replacement.
+   recovery key, stop Rove, remove `ROVE_SETUP_SECRET`, then start its replacement.
 
 See [Railway template configuration](docs/railway-template.md) for volumes,
-reference variables and generated secrets. The saved Railway template still uses
-v0.2.0; its update to this three-service configuration must follow a release of
-the new image. A fresh live template installation still needs verification.
+reference variables and generated secrets. The saved template is configured for
+this three-service layout and Rove v1.0.0. A fresh live template installation
+still needs verification; the template is not yet listed in the marketplace.
 
 Run **one Rove replica**. Redis coordinates core ownership, active turns and
 credential attempt limits. Rove refuses to start without PostgreSQL, pgvector or
@@ -123,9 +129,9 @@ its replacement; allow up to 30 seconds for ownership expiry after a crash. Set
 short outage: Railway rolling deployment waits for the new healthcheck while
 Rove requires exclusive ownership. See the [update procedure](docs/railway-template.md#restarts-and-updates).
 
-This version starts with a **fresh PostgreSQL database**. It does not import an
-existing SQLite database or read `ROVE_DATABASE_PATH`. Keep any old data files,
-backups and matching authentication secret for recovery with their old image.
+New installations start with a **fresh PostgreSQL database**. For existing data,
+follow the [storage upgrade guidance](docs/railway-template.md#storage-upgrades)
+before changing application or database versions.
 The vector extension is enabled for future use; semantic retrieval is not included.
 
 ### Run with Docker locally
@@ -141,6 +147,10 @@ addresses; PostgreSQL and Redis data survive app recreation in named volumes.
 `docker compose down` stops the stack and retains those volumes. Removing volumes
 with `docker compose down -v` deletes the stored data. Secrets and old local
 databases are excluded from the image. A published image is not required.
+
+PostgreSQL 18 uses a separate named volume from the previous PostgreSQL 17
+development stack. Existing data is not upgraded or imported automatically.
+Preserve the old volume and use PostgreSQL's dump/restore process to move data.
 
 ## Connect a model
 
@@ -351,7 +361,9 @@ Each integration test uses an isolated database and Redis namespace. The test
 PostgreSQL role needs permission to create and drop databases. To use other local
 services, set `TEST_DATABASE_URL` (defaults to
 `postgres://rove:rove@127.0.0.1:54329/postgres`) and `TEST_REDIS_URL` (defaults to
-`redis://127.0.0.1:6389`). Tests must use disposable development services.
+`redis://:rove@127.0.0.1:6389`). Tests must use disposable development
+services. If you change Compose credentials or host ports, set these test URLs
+to match; tests do not use the application's production connection variables.
 
 To check container persistence and shutdown across the three-service stack:
 
@@ -359,6 +371,11 @@ To check container persistence and shutdown across the three-service stack:
 docker build -t rove:foundation .
 node scripts/check-container.mjs
 ```
+
+The smoke test reuses the storage services in `compose.yaml` under a unique
+project with random host ports and disposable credentials. It checks Redis
+authentication and persistence, pgvector, saved login and chat, and graceful
+shutdown, then removes only its own containers and volumes.
 
 Read [AGENTS.md](AGENTS.md) for contribution and commit conventions,
 [DESIGN.md](DESIGN.md) for the visual direction, and

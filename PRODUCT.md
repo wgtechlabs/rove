@@ -22,8 +22,9 @@ PostgreSQL with pgvector is the durable store; Redis coordinates core ownership,
 active turns and credential attempt limits. Both are required. Deploy one active
 Rove core with persistent PostgreSQL and Redis services; the app container needs
 no persistent volume. The vector extension prepares the database for later work,
-without adding semantic retrieval. This storage transition requires a fresh
-PostgreSQL database; SQLite import is outside this release.
+without adding semantic retrieval. New installations start with a fresh
+PostgreSQL database. Storage upgrades and backups are operator-managed;
+automatic import from older storage formats is not included.
 
 ## Product Principles
 

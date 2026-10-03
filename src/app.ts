@@ -51,7 +51,6 @@ export async function createApplication(
     | undefined;
   try {
     identity = await createIdentity(config);
-    cleanup.push(() => identity.close());
     extensions = await createExtensions(config);
     cleanup.push(() => extensions.close());
     runtime = await createRailwayRuntime(config);
