@@ -48,11 +48,12 @@ jobs:
       ci-profile: node
       ci-runtime-version: "24"
       # Keep Node as the application runtime; install the pinned Bun toolchain.
-      ci-setup-command: npm install --global bun@1.3.10
+      ci-setup-command: |
+        npm install --global bun@1.3.10
+        docker compose up -d --wait postgres redis
       ci-install-command: bun install --frozen-lockfile
       ci-lint-command: |
         bun run check
-        sh -n docker-entrypoint.sh
       ci-typecheck-command: bun run typecheck
       ci-test-command: bun run test
       ci-build-command: bun run build
@@ -82,5 +83,7 @@ jobs:
 
       release-initial-version: 0.1.0
       release-commit-convention: clean-commit
+      # Recognize Clean Commit's breaking marker before an optional scope.
+      release-major-keywords: 'BREAKING CHANGE,BREAKING-CHANGE,breaking,^[^[:alnum:]]*[a-z]+![[:space:]]*(\([^)]+\))?:[[:space:]]'
       release-version-file-paths: package.json
       release-workspace-detection: false

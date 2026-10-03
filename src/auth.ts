@@ -4,14 +4,12 @@ import {
   randomUUID,
   timingSafeEqual,
 } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
 import { type BetterAuthOptions, betterAuth } from 'better-auth';
+import { APIError } from 'better-auth/api';
 import { hashPassword } from 'better-auth/crypto';
 import { getMigrations } from 'better-auth/db/migration';
 import { email as emailSchema } from 'zod';
-import type { Config } from './config.js';
+import type { RuntimeConfig } from './runtime.js';
 
 export class HttpError extends Error {
   constructor(
@@ -42,19 +40,29 @@ export function textField(
   return value;
 }
 
-export async function createIdentity(config: Config) {
-  if (config.databasePath !== ':memory:')
-    mkdirSync(dirname(config.databasePath), { recursive: true, mode: 0o700 });
-  const db = new DatabaseSync(config.databasePath);
-  db.exec(
-    'PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;',
-  );
+export async function createIdentity(config: RuntimeConfig) {
+  const db = config.db;
+  async function requireSessionOwnership() {
+    try {
+      await config.state.assertOwned();
+    } catch {
+      throw new APIError('SERVICE_UNAVAILABLE', {
+        message: 'Runtime ownership is unavailable. Restart Rove.',
+      });
+    }
+  }
   const options = {
     appName: 'Rove',
     baseURL: config.baseURL,
     secret: config.authSecret,
     trustedOrigins: [config.baseURL],
-    database: db,
+    database: db.pool,
+    databaseHooks: {
+      session: {
+        create: { before: requireSessionOwnership },
+        delete: { before: requireSessionOwnership },
+      },
+    },
     emailAndPassword: {
       enabled: true,
       disableSignUp: true,
@@ -75,62 +83,34 @@ export async function createIdentity(config: Config) {
     logger: { level: 'error' },
     telemetry: { enabled: false },
   } satisfies BetterAuthOptions;
-  try {
-    await (await getMigrations(options)).runMigrations();
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS rove_admin (
-        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-        user_id TEXT NOT NULL UNIQUE REFERENCES user(id) ON DELETE RESTRICT,
-        recovery_hash TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS rove_attempts (
-        action TEXT PRIMARY KEY, starts_at INTEGER NOT NULL, attempts INTEGER NOT NULL
-      );
-    `);
-    if (!hasAdmin() && !config.setupSecret)
-      throw new Error(
-        'ROVE_SETUP_SECRET is required until an administrator has been created.',
-      );
-  } catch (error) {
-    db.close();
-    throw error;
-  }
-
+  await (await getMigrations(options)).runMigrations();
+  await db.migrate(`
+    CREATE TABLE IF NOT EXISTS rove_admin (
+      singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+      user_id TEXT NOT NULL UNIQUE REFERENCES "user"(id) ON DELETE RESTRICT,
+      recovery_hash TEXT NOT NULL
+    );
+  `);
+  if (!(await hasAdmin()) && !config.setupSecret)
+    throw new Error(
+      'ROVE_SETUP_SECRET is required until an administrator has been created.',
+    );
   const auth = betterAuth(options);
   await (await auth.$context).checkSchema?.();
 
-  function hasAdmin(): boolean {
-    return Boolean(db.prepare('SELECT 1 FROM rove_admin').get());
+  async function hasAdmin(): Promise<boolean> {
+    return Boolean(await db.get('SELECT 1 FROM rove_admin'));
   }
-  function transaction<T>(action: () => T): T {
-    db.exec('BEGIN IMMEDIATE');
-    try {
-      const result = action();
-      db.exec('COMMIT');
-      return result;
-    } catch (error) {
-      db.exec('ROLLBACK');
-      throw error;
-    }
-  }
-  function limit(action: string): void {
-    const now = Date.now();
+  async function limit(action: string): Promise<void> {
     // ponytail: deployment-wide limits suit one admin; use trusted-client buckets before multi-user support.
-    const row = db
-      .prepare(`INSERT INTO rove_attempts VALUES (?, ?, 1)
-      ON CONFLICT(action) DO UPDATE SET
-        attempts = CASE WHEN starts_at <= ? THEN 1 ELSE attempts + 1 END,
-        starts_at = CASE WHEN starts_at <= ? THEN excluded.starts_at ELSE starts_at END
-      RETURNING attempts`)
-      .get(action, now, now - 60_000, now - 60_000);
-    if (Number(row?.attempts) > 10)
+    if ((await config.state.incrementWindow(`auth:${action}`, 60_000)) > 10)
       throw new HttpError(
         429,
         'Too many attempts. Wait one minute and try again.',
       );
   }
   async function bootstrap(body: Record<string, unknown>) {
-    if (hasAdmin())
+    if (await hasAdmin())
       throw new HttpError(
         409,
         'Setup is already complete. Sign in to continue.',
@@ -145,25 +125,27 @@ export async function createIdentity(config: Config) {
     const password = await hashPassword(textField(body, 'password', 12, 128));
     const userId = randomUUID();
     const recoveryKey = randomBytes(32).toString('hex');
-    const now = Date.now();
-    // Keep the Better Auth credential and singleton binding atomic, including across processes.
-    // These columns are covered by integration tests against the pinned Better Auth version.
-    transaction(() => {
-      if (hasAdmin())
+    const now = new Date();
+    await config.state.assertOwned();
+    await db.transaction(async (tx) => {
+      await tx.exec('SELECT pg_advisory_xact_lock(728683002)');
+      if (await tx.get('SELECT 1 FROM rove_admin'))
         throw new HttpError(
           409,
           'Setup is already complete. Sign in to continue.',
         );
-      db.prepare(
-        'INSERT INTO user (id, name, email, emailVerified, createdAt, updatedAt) VALUES (?, ?, ?, 0, ?, ?)',
-      ).run(userId, name, email, now, now);
-      db.prepare(
-        'INSERT INTO account (id, accountId, providerId, userId, password, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      ).run(randomUUID(), userId, 'credential', userId, password, now, now);
-      db.prepare('INSERT INTO rove_admin VALUES (1, ?, ?)').run(
+      await tx.run(
+        'INSERT INTO "user" (id, name, email, "emailVerified", "createdAt", "updatedAt") VALUES ($1, $2, $3, false, $4, $4)',
+        [userId, name, email, now],
+      );
+      await tx.run(
+        'INSERT INTO account (id, "accountId", "providerId", "userId", password, "createdAt", "updatedAt") VALUES ($1, $2, $3, $2, $4, $5, $5)',
+        [randomUUID(), userId, 'credential', password, now],
+      );
+      await tx.run('INSERT INTO rove_admin VALUES (1, $1, $2)', [
         userId,
         digest(recoveryKey).toString('hex'),
-      );
+      ]);
     });
     return { recoveryKey };
   }
@@ -171,37 +153,39 @@ export async function createIdentity(config: Config) {
     const recoveryKey = textField(body, 'recoveryKey', 1, 1024);
     const recoveryHash = digest(recoveryKey).toString('hex');
     if (
-      !db
-        .prepare('SELECT 1 FROM rove_admin WHERE recovery_hash = ?')
-        .get(recoveryHash)
-    ) {
+      !(await db.get('SELECT 1 FROM rove_admin WHERE recovery_hash = $1', [
+        recoveryHash,
+      ]))
+    )
       throw new HttpError(
         401,
         'The recovery key is incorrect or has already been used.',
       );
-    }
     const password = await hashPassword(textField(body, 'password', 12, 128));
     const nextKey = randomBytes(32).toString('hex');
-    transaction(() => {
-      const admin = db
-        .prepare('SELECT user_id FROM rove_admin WHERE recovery_hash = ?')
-        .get(recoveryHash);
-      if (!admin || typeof admin.user_id !== 'string')
+    await config.state.assertOwned();
+    await db.transaction(async (tx) => {
+      const admin = await tx.get<{ user_id: string }>(
+        'SELECT user_id FROM rove_admin WHERE recovery_hash = $1 FOR UPDATE',
+        [recoveryHash],
+      );
+      if (!admin)
         throw new HttpError(401, 'The recovery key has already been used.');
-      db.prepare(
-        "UPDATE account SET password = ?, updatedAt = ? WHERE userId = ? AND providerId = 'credential'",
-      ).run(password, Date.now(), admin.user_id);
-      db.prepare('DELETE FROM session WHERE userId = ?').run(admin.user_id);
-      db.prepare(
-        'UPDATE rove_admin SET recovery_hash = ? WHERE singleton = 1',
-      ).run(digest(nextKey).toString('hex'));
+      await tx.run(
+        `UPDATE account SET password = $1, "updatedAt" = $2 WHERE "userId" = $3 AND "providerId" = 'credential'`,
+        [password, new Date(), admin.user_id],
+      );
+      await tx.run('DELETE FROM session WHERE "userId" = $1', [admin.user_id]);
+      await tx.run(
+        'UPDATE rove_admin SET recovery_hash = $1 WHERE singleton = 1',
+        [digest(nextKey).toString('hex')],
+      );
     });
     return { recoveryKey: nextKey };
   }
   async function signIn(request: Request): Promise<Response> {
-    const generation = db
-      .prepare('SELECT recovery_hash FROM rove_admin')
-      .get()?.recovery_hash;
+    const generation = (await db.get('SELECT recovery_hash FROM rove_admin'))
+      ?.recovery_hash;
     const response = await auth.handler(request);
     if (!response.ok) return response;
     const payload: unknown = await response.clone().json();
@@ -209,7 +193,7 @@ export async function createIdentity(config: Config) {
     // Check after session insertion; delete only this stale login's session.
     if (
       generation !==
-      db.prepare('SELECT recovery_hash FROM rove_admin').get()?.recovery_hash
+      (await db.get('SELECT recovery_hash FROM rove_admin'))?.recovery_hash
     ) {
       if (
         payload &&
@@ -217,7 +201,7 @@ export async function createIdentity(config: Config) {
         'token' in payload &&
         typeof payload.token === 'string'
       ) {
-        db.prepare('DELETE FROM session WHERE token = ?').run(payload.token);
+        await db.run('DELETE FROM session WHERE token = $1', [payload.token]);
       }
       throw new HttpError(
         401,
@@ -230,9 +214,9 @@ export async function createIdentity(config: Config) {
     const session = await auth.api.getSession({ headers: request.headers });
     if (!session) throw new HttpError(401, 'Sign in to continue.');
     if (
-      !db
-        .prepare('SELECT 1 FROM rove_admin WHERE user_id = ?')
-        .get(session.user.id)
+      !(await db.get('SELECT 1 FROM rove_admin WHERE user_id = $1', [
+        session.user.id,
+      ]))
     ) {
       throw new HttpError(403, 'Administrator access is required.');
     }
@@ -250,6 +234,6 @@ export async function createIdentity(config: Config) {
     signIn,
     requireAdmin,
     limit,
-    close: () => db.close(),
+    close: () => {},
   };
 }

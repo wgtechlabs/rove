@@ -4,12 +4,14 @@ import { validateTool } from './mcp.js';
 import type { PluginPackage } from './plugin-manifest.js';
 import type { ToolDefinition } from './provider.js';
 
+type RuntimeStatus = {
+  configured: boolean;
+  environmentId?: string | null;
+  authType?: string | null;
+};
+
 export interface PluginRuntime {
-  status(): {
-    configured: boolean;
-    environmentId?: string | null;
-    authType?: string | null;
-  };
+  status(): RuntimeStatus | Promise<RuntimeStatus>;
   execute(
     request: {
       source: string;

@@ -5,12 +5,11 @@ import {
   timingSafeEqual,
 } from 'node:crypto';
 import { request as httpsRequest } from 'node:https';
-import { DatabaseSync } from 'node:sqlite';
 import { z } from 'zod';
 import { HttpError } from './auth.js';
 import { ChatBusyError } from './chat.js';
-import type { Config } from './config.js';
 import { resolvePublicDestination } from './mcp.js';
+import type { RuntimeConfig } from './runtime.js';
 import { createSecrets } from './secrets.js';
 import type { createSlack } from './slack.js';
 
@@ -121,7 +120,7 @@ export interface ActiveChannel extends z.infer<typeof channelAccess> {
 }
 
 type Chat = Parameters<typeof createSlack>[1];
-type Conversation = ReturnType<Chat['get']>;
+type Conversation = Awaited<ReturnType<Chat['get']>>;
 type Decision = 'approve' | 'deny' | 'resume';
 interface Job {
   id: string;
@@ -178,39 +177,35 @@ function replyText(conversation: Conversation) {
 }
 
 /** Owns verification, permissions, durable dispatch, credentials and delivery. */
-export function createPluginChannels(
-  config: Config,
+export async function createPluginChannels(
+  config: RuntimeConfig,
   chat: Chat,
-  active: (installation: string) => ActiveChannel | undefined,
+  active: (installation: string) => Promise<ActiveChannel | undefined>,
 ) {
-  const db = new DatabaseSync(config.databasePath);
-  try {
-    db.exec(`PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1000;
+  const db = config.db;
+  await config.state.assertOwned();
+  await db.migrate(`
       CREATE TABLE IF NOT EXISTS rove_plugin_channel_thread(scope TEXT PRIMARY KEY, conversation TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS rove_plugin_channel_job(
-        sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL,
+        sequence BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, id TEXT UNIQUE NOT NULL,
         installation TEXT NOT NULL, event TEXT NOT NULL, scope TEXT NOT NULL, actor TEXT NOT NULL,
         destination TEXT NOT NULL, thread TEXT NOT NULL, content TEXT NOT NULL,
         decision TEXT NOT NULL, approval TEXT NOT NULL, snapshot TEXT NOT NULL, fingerprint TEXT NOT NULL,
         conversation TEXT NOT NULL DEFAULT '', reply TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending',
         UNIQUE(installation,event));
-      CREATE INDEX IF NOT EXISTS rove_plugin_channel_queue ON rove_plugin_channel_job(status,sequence);
-      UPDATE rove_plugin_channel_job SET status='uncertain', snapshot='', content='', reply=''
-        WHERE status IN ('processing','delivering');`);
-  } catch (error) {
-    db.close();
-    throw error;
-  }
+      CREATE INDEX IF NOT EXISTS rove_plugin_channel_queue ON rove_plugin_channel_job(status,sequence);`);
+  await config.state.assertOwned();
+  await db.exec(`UPDATE rove_plugin_channel_job SET status='uncertain', snapshot='', content='', reply=''
+    WHERE status IN ('processing','delivering');`);
   const secrets = createSecrets(config.authSecret);
   let timer: ReturnType<typeof setInterval> | undefined;
   let running: Promise<void> | undefined;
   let controller: AbortController | undefined;
   let stopping = false;
   let failed = false;
-  let closed = false;
 
-  function capture(id: string) {
-    const value = active(id);
+  async function capture(id: string) {
+    const value = await active(id);
     if (!value) return undefined;
     const spec = channelSpec.parse(value.spec);
     const access = channelAccess.parse({
@@ -234,21 +229,22 @@ export function createPluginChannels(
       secrets: credentials,
     } satisfies ActiveChannel;
   }
-  function current(job: Job) {
-    const value = capture(job.installation);
+  async function current(job: Job) {
+    const value = await capture(job.installation);
     return value && hash(JSON.stringify(value)) === job.fingerprint;
   }
-  function finish(job: Job, status: string) {
-    db.prepare(
-      "UPDATE rove_plugin_channel_job SET status=?, snapshot='', content='', reply='' WHERE id=?",
-    ).run(status, job.id);
+  async function finish(job: Job, status: string) {
+    await db.run(
+      "UPDATE rove_plugin_channel_job SET status=$1, snapshot='', content='', reply='' WHERE id=$2",
+      [status, job.id],
+    );
   }
   async function handle(request: Request, installation: string) {
     if (stopping || failed)
       throw new HttpError(503, 'Installed channels are unavailable.');
     if (request.method !== 'POST')
       throw new HttpError(405, 'Use POST for channel events.');
-    const state = capture(installation);
+    const state = await capture(installation);
     if (!state) throw new HttpError(404, 'Channel is not active.');
     if (
       !/^application\/json(?:\s*;|$)/i.test(
@@ -350,60 +346,66 @@ export function createPluginChannels(
       );
     }
     const fingerprint = hash(JSON.stringify(state));
-    const latest = capture(installation);
+    const latest = await capture(installation);
     if (stopping || !latest || hash(JSON.stringify(latest)) !== fingerprint)
       throw new HttpError(
         409,
         'Channel configuration changed. Retry the event.',
       );
-    if (
-      db
-        .prepare(
-          'SELECT 1 FROM rove_plugin_channel_job WHERE installation=? AND event=?',
+    return db.transaction(async (tx) => {
+      await tx.exec('LOCK TABLE rove_plugin_channel_job IN EXCLUSIVE MODE');
+      if (
+        await tx.get(
+          'SELECT 1 FROM rove_plugin_channel_job WHERE installation=$1 AND event=$2',
+          [installation, event.eventId],
         )
-        .get(installation, event.eventId)
-    )
-      return new Response(null, { status: 200 });
-    // ponytail: retain 10,000 event tombstones forever; archival needs an explicit provider retry horizon.
-    if (
-      Number(
-        db
-          .prepare('SELECT COUNT(*) AS count FROM rove_plugin_channel_job')
-          .get()?.count,
-      ) >= 10000 ||
-      Number(
-        db
-          .prepare(
-            "SELECT COUNT(*) AS count FROM rove_plugin_channel_job WHERE status IN ('pending','processing','ready','delivering')",
-          )
-          .get()?.count,
-      ) >= 500
-    )
-      throw new HttpError(503, 'The channel inbox is full.');
-    const scope = `plugin-channel:${installation}:${hash(JSON.stringify([state.tenant, event.destination, event.thread]))}`;
-    db.prepare(`INSERT INTO rove_plugin_channel_job(id,installation,event,scope,actor,destination,thread,content,decision,approval,snapshot,fingerprint)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(
-      randomUUID(),
-      installation,
-      event.eventId,
-      scope,
-      event.actor,
-      event.destination,
-      event.thread,
-      decision === undefined ? String(content).trim() : '',
-      decision === undefined ? '' : String(decision),
-      typeof approval === 'string' ? approval : '',
-      secrets.encrypt(JSON.stringify(state)),
-      fingerprint,
-    );
-    return new Response(null, { status: 202 });
+      )
+        return new Response(null, { status: 200 });
+      // ponytail: retain 10,000 event tombstones forever; archival needs an explicit provider retry horizon.
+      if (
+        Number(
+          (
+            await tx.get(
+              'SELECT COUNT(*) AS count FROM rove_plugin_channel_job',
+            )
+          )?.count,
+        ) >= 10000 ||
+        Number(
+          (
+            await tx.get(
+              "SELECT COUNT(*) AS count FROM rove_plugin_channel_job WHERE status IN ('pending','processing','ready','delivering')",
+            )
+          )?.count,
+        ) >= 500
+      )
+        throw new HttpError(503, 'The channel inbox is full.');
+      const scope = `plugin-channel:${installation}:${hash(JSON.stringify([state.tenant, event.destination, event.thread]))}`;
+      await tx.run(
+        'INSERT INTO rove_plugin_channel_job(id,installation,event,scope,actor,destination,thread,content,decision,approval,snapshot,fingerprint)\n      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)',
+        [
+          randomUUID(),
+          installation,
+          event.eventId,
+          scope,
+          event.actor,
+          event.destination,
+          event.thread,
+          decision === undefined ? String(content).trim() : '',
+          decision === undefined ? '' : String(decision),
+          typeof approval === 'string' ? approval : '',
+          secrets.encrypt(JSON.stringify(state)),
+          fingerprint,
+        ],
+      );
+      return new Response(null, { status: 202 });
+    });
   }
   async function deliver(job: Job, state: ActiveChannel, signal: AbortSignal) {
     const url = new URL(state.spec.outgoing.url);
     const address = await resolvePublicDestination(url, false, signal);
     signal.throwIfAborted();
-    if (!current(job)) {
-      finish(job, 'cancelled');
+    if (!(await current(job))) {
+      await finish(job, 'cancelled');
       return;
     }
     const fields = state.spec.outgoing.fields;
@@ -412,9 +414,12 @@ export function createPluginChannels(
       [fields.thread]: job.thread,
       [fields.text]: job.reply,
     });
-    db.prepare(
-      "UPDATE rove_plugin_channel_job SET status='delivering' WHERE id=?",
-    ).run(job.id);
+    await db.run(
+      "UPDATE rove_plugin_channel_job SET status='delivering' WHERE id=$1",
+      [job.id],
+    );
+    await config.state.assertOwned();
+    signal.throwIfAborted();
     await new Promise<void>((resolve, reject) => {
       const outgoing = httpsRequest(
         url,
@@ -441,46 +446,46 @@ export function createPluginChannels(
       outgoing.on('error', reject);
       outgoing.end(body);
     });
-    finish(job, 'sent');
+    await finish(job, 'sent');
   }
   async function processJob() {
     if (stopping) return;
-    const job = db
-      .prepare(
-        "SELECT * FROM rove_plugin_channel_job WHERE status IN ('pending','ready') ORDER BY sequence LIMIT 1",
-      )
-      .get() as unknown as Job | undefined;
-    if (!job) return;
+    await config.state.assertOwned();
+    const job = await db.get<Job>(
+      "SELECT * FROM rove_plugin_channel_job WHERE status IN ('pending','ready') ORDER BY sequence LIMIT 1",
+    );
+    if (!job || stopping) return;
     controller = new AbortController();
     try {
-      if (!current(job)) {
-        finish(job, 'cancelled');
+      if (!(await current(job))) {
+        await finish(job, 'cancelled');
         return;
       }
       const state = JSON.parse(secrets.decrypt(job.snapshot)) as ActiveChannel;
       if (job.status === 'pending') {
         if (!job.conversation) {
-          const existing = db
-            .prepare(
-              'SELECT conversation FROM rove_plugin_channel_thread WHERE scope=?',
-            )
-            .get(job.scope);
+          const existing = await db.get(
+            'SELECT conversation FROM rove_plugin_channel_thread WHERE scope=$1',
+            [job.scope],
+          );
           if (job.decision && !existing) {
-            finish(job, 'cancelled');
+            await finish(job, 'cancelled');
             return;
           }
           job.conversation = existing
             ? String(existing.conversation)
-            : chat.create(job.scope).id;
-          db.prepare(
-            'INSERT OR IGNORE INTO rove_plugin_channel_thread VALUES(?,?)',
-          ).run(job.scope, job.conversation);
-          db.prepare(
-            'UPDATE rove_plugin_channel_job SET conversation=? WHERE id=?',
-          ).run(job.conversation, job.id);
+            : (await chat.create(job.scope)).id;
+          await db.run(
+            'INSERT INTO rove_plugin_channel_thread VALUES($1,$2) ON CONFLICT DO NOTHING',
+            [job.scope, job.conversation],
+          );
+          await db.run(
+            'UPDATE rove_plugin_channel_job SET conversation=$1 WHERE id=$2',
+            [job.conversation, job.id],
+          );
         }
         if (job.decision) {
-          const pending = chat.get(job.conversation, job.scope).pending;
+          const pending = (await chat.get(job.conversation, job.scope)).pending;
           if (
             !state.admins.includes(job.actor) ||
             pending?.id !== job.approval ||
@@ -491,13 +496,20 @@ export function createPluginChannels(
               (pending.detail ?? JSON.stringify(pending.arguments)).length >
                 24000)
           ) {
-            finish(job, 'cancelled');
+            await finish(job, 'cancelled');
             return;
           }
         }
-        db.prepare(
-          "UPDATE rove_plugin_channel_job SET status='processing' WHERE id=?",
-        ).run(job.id);
+        await db.run(
+          "UPDATE rove_plugin_channel_job SET status='processing' WHERE id=$1",
+          [job.id],
+        );
+        await config.state.assertOwned();
+        if (stopping) return;
+        if (!(await current(job))) {
+          await finish(job, 'cancelled');
+          return;
+        }
         const conversation = job.decision
           ? await chat.decide(
               job.conversation,
@@ -513,38 +525,49 @@ export function createPluginChannels(
               job.scope,
             );
         job.reply = replyText(conversation);
-        db.prepare(
-          "UPDATE rove_plugin_channel_job SET status='ready', reply=? WHERE id=?",
-        ).run(job.reply, job.id);
+        await db.run(
+          "UPDATE rove_plugin_channel_job SET status='ready', reply=$1 WHERE id=$2",
+          [job.reply, job.id],
+        );
       }
       if (stopping) return;
       await deliver(
         job,
         state,
-        AbortSignal.any([controller.signal, AbortSignal.timeout(10000)]),
+        AbortSignal.any([
+          controller.signal,
+          config.state.signal,
+          AbortSignal.timeout(10000),
+        ]),
       );
     } catch (error) {
+      config.state.signal.throwIfAborted();
       const phase = String(
-        db
-          .prepare('SELECT status FROM rove_plugin_channel_job WHERE id=?')
-          .get(job.id)?.status,
+        (
+          await db.get(
+            'SELECT status FROM rove_plugin_channel_job WHERE id=$1',
+            [job.id],
+          )
+        )?.status,
       );
       if (phase === 'processing' && error instanceof ChatBusyError) {
-        db.prepare(
-          "UPDATE rove_plugin_channel_job SET status='pending' WHERE id=?",
-        ).run(job.id);
+        await db.run(
+          "UPDATE rove_plugin_channel_job SET status='pending' WHERE id=$1",
+          [job.id],
+        );
         return;
       }
       if (phase === 'processing' && job.conversation) {
-        const continuation = chat.get(job.conversation, job.scope);
+        const continuation = await chat.get(job.conversation, job.scope);
         if (continuation.pending?.status === 'ready') {
-          db.prepare(
-            "UPDATE rove_plugin_channel_job SET status='ready', reply=? WHERE id=?",
-          ).run(replyText(continuation), job.id);
+          await db.run(
+            "UPDATE rove_plugin_channel_job SET status='ready', reply=$1 WHERE id=$2",
+            [replyText(continuation), job.id],
+          );
           return;
         }
       }
-      finish(
+      await finish(
         job,
         ['processing', 'delivering'].includes(phase) ? 'uncertain' : 'failed',
       );
@@ -559,14 +582,13 @@ export function createPluginChannels(
   }
   return {
     handle,
-    status(installation: string) {
+    async status(installation: string) {
       return {
         state: failed ? 'failed' : stopping ? 'stopped' : 'ready',
-        jobs: db
-          .prepare(
-            'SELECT status, COUNT(*) AS count FROM rove_plugin_channel_job WHERE installation=? GROUP BY status',
-          )
-          .all(installation),
+        jobs: await db.all(
+          'SELECT status, COUNT(*) AS count FROM rove_plugin_channel_job WHERE installation=$1 GROUP BY status',
+          [installation],
+        ),
       };
     },
     start() {
@@ -589,10 +611,6 @@ export function createPluginChannels(
     async close() {
       cancelPending();
       await running;
-      if (!closed) {
-        closed = true;
-        db.close();
-      }
     },
   };
 }

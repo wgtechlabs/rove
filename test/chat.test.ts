@@ -1,12 +1,10 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
 import { createServer, type ServerResponse } from 'node:http';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
 import { type TestContext, test } from 'node:test';
 import { createApplication } from '../src/app.js';
+import { createDatabase } from '../src/database.js';
+import { testConfig } from './storage.js';
 
 const origin = 'https://rove.example';
 const apiKey = 'local-test-provider-key-never-a-real-credential';
@@ -26,14 +24,16 @@ function request(path: string, body?: unknown, cookie = '') {
 }
 
 async function fixture(t: TestContext) {
-  const dir = mkdtempSync(join(tmpdir(), 'rove-chat-'));
+  let app!: Awaited<ReturnType<typeof createApplication>>;
+  t.after(async () => {
+    await app?.close();
+  });
   const config = {
+    ...(await testConfig(t)),
     baseURL: origin,
-    authSecret: 'test-auth-secret-for-local-tests-only-32-chars',
     setupSecret: account.setupSecret,
-    databasePath: join(dir, 'rove.sqlite'),
   };
-  let app = await createApplication(config);
+  app = await createApplication(config);
   const calls: {
     method?: string;
     url?: string;
@@ -68,12 +68,10 @@ async function fixture(t: TestContext) {
     }
   });
   t.after(async () => {
-    await app.close();
     await new Promise<void>((resolve, reject) => {
       server.close((error) => (error ? reject(error) : resolve()));
       server.closeAllConnections();
     });
-    rmSync(dir, { recursive: true, force: true });
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
@@ -154,14 +152,14 @@ test('chat routes require an administrator and same-origin writes; settings prot
     await (await f.fetch('/api/admin/settings')).json(),
     expected,
   );
-  const db = new DatabaseSync(f.config.databasePath);
+  const db = await createDatabase(f.config.databaseURL);
   try {
-    const row = db.prepare('SELECT * FROM rove_model').get();
+    const row = await db.get('SELECT * FROM rove_model', []);
     assert.ok(row?.api_key);
     assert.notEqual(row.api_key, apiKey);
     assert.equal(JSON.stringify(row).includes(apiKey), false);
   } finally {
-    db.close();
+    await db.close();
   }
   assert.equal(
     (
@@ -566,11 +564,13 @@ test('a corrupt saved key fails safely and replacing the key restores the same r
   const f = await fixture(t);
   assert.equal((await f.fetch('/api/admin/settings', f.settings)).status, 200);
   const conversation = await f.conversation();
-  const db = new DatabaseSync(f.config.databasePath);
+  const db = await createDatabase(f.config.databaseURL);
   try {
-    db.prepare('UPDATE rove_model SET api_key = ?').run('corrupted-ciphertext');
+    await db.run('UPDATE rove_model SET api_key = $1', [
+      'corrupted-ciphertext',
+    ]);
   } finally {
-    db.close();
+    await db.close();
   }
   const message = {
     content: 'A question after restoring the key',

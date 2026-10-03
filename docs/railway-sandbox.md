@@ -72,7 +72,7 @@ Before plugin import, the runner:
 2. Builds a read-only chroot containing only Node, the privilege-drop executable,
    the fixed compiled launcher, their dynamic libraries, and the reviewed
    operation files. It does not mount
-   `/usr`, the sandbox filesystem, the core volume or credentials into the guest.
+   `/usr`, the sandbox filesystem, the core filesystem or credentials into the guest.
    The writable temporary directory is a separate 1 MiB filesystem.
 3. Starts plugin code as UID/GID 65534, clears supplementary groups and all
    capabilities, and requires `no_new_privs`. The environment contains only
@@ -97,7 +97,7 @@ image capabilities or lifecycle behavior.
 
 ## Ownership, cleanup and recovery
 
-Rove persists a creation intent before contacting Railway and records the sandbox
+Rove persists a creation intent in PostgreSQL before contacting Railway and records the sandbox
 ID from the create response before readiness polling. A later readiness failure
 can therefore still be cleaned up. The VM receives only a non-secret run marker,
 never the core process environment. A two-minute core deadline bounds the complete
@@ -107,8 +107,8 @@ Success is returned only after a separate, bounded connection confirms the VM is
 destroyed or absent. An accepted destruction request alone is insufficient. On
 restart, Rove destroys recorded owned VMs and never resumes operations or repeats
 their effects. Failed cleanup remains visible and blocks new executions. This
-version supports one core instance per persistent database; distributed execution
-leases are not implemented.
+version supports one active core per deployment, enforced through Redis ownership.
+It does not distribute sandbox execution across replicas.
 
 The SDK can allocate a received output chunk before the core callback sees it;
 the callback limit alone is not a process-memory proof. The guest runner bounds

@@ -1,35 +1,25 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
-import { type TestContext, test } from 'node:test';
+import { test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
+import { Client } from 'pg';
 import { createApplication } from '../src/app.js';
 import { HttpError } from '../src/auth.js';
 import { createChannels } from '../src/channels.js';
 import { createChat } from '../src/chat.js';
+import { testConfig, testRuntime } from './storage.js';
 
 const origin = 'https://rove.example';
-function configFor(t: TestContext) {
-  const dir = mkdtempSync(join(tmpdir(), 'rove-channel-'));
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
-  return {
-    baseURL: origin,
-    authSecret: 'local-test-auth-secret-at-least-32-characters',
-    setupSecret: 'local-test-setup-secret-at-least-32-characters',
-    databasePath: join(dir, 'rove.sqlite'),
-  };
-}
-
 test('an optional channel initialization failure leaves setup, admin and web chat usable and can be retried', async (t) => {
-  const config = configFor(t);
-  const exec = DatabaseSync.prototype.exec;
+  let app: Awaited<ReturnType<typeof createApplication>>;
+  t.after(() => app?.close());
+  const config = { ...(await testConfig(t)), baseURL: origin };
+  const query = Client.prototype.query;
   let fail = true;
   t.mock.method(
-    DatabaseSync.prototype,
-    'exec',
-    function (this: DatabaseSync, sql: string) {
+    Client.prototype,
+    'query',
+    function (this: Client, ...args: unknown[]) {
+      const sql = typeof args[0] === 'string' ? args[0] : '';
       if (
         fail &&
         (sql.includes('rove_slack_job') ||
@@ -38,11 +28,10 @@ test('an optional channel initialization failure leaves setup, admin and web cha
         throw new Error(
           'Simulated failure containing private provider details',
         );
-      return exec.call(this, sql);
+      return Reflect.apply(query, this, args);
     },
   );
-  const app = await createApplication(config);
-  t.after(() => app.close());
+  app = await createApplication(config);
   let cookie = '';
   const request = (path: string, body?: unknown) =>
     app.fetch(
@@ -98,31 +87,29 @@ test('an optional channel initialization failure leaves setup, admin and web cha
 });
 
 test('unexpected channel worker failures stop its ingress without stopping web conversations', async (t) => {
-  const config = configFor(t);
-  const chat = createChat(config);
-  const channels = createChannels(config, chat);
+  let chat: Awaited<ReturnType<typeof createChat>>;
+  let channels: Awaited<ReturnType<typeof createChannels>>;
   t.after(async () => {
-    await channels.close();
-    chat.close();
+    await channels?.close();
+    chat?.close();
   });
-  const prepare = DatabaseSync.prototype.prepare;
+  const config = await testRuntime(t);
+  chat = await createChat(config);
+  channels = await createChannels(config, chat);
+  const get = config.db.get;
   let fail = true;
-  t.mock.method(
-    DatabaseSync.prototype,
-    'prepare',
-    function (this: DatabaseSync, sql: string) {
-      if (fail && sql.includes('SELECT job.*'))
-        throw new Error('Worker storage failed');
-      return prepare.call(this, sql);
-    },
-  );
+  t.mock.method(config.db, 'get', async (sql: string, params?: unknown[]) => {
+    if (fail && sql.includes('SELECT job.*'))
+      throw new Error('Worker storage failed');
+    return get(sql, params);
+  });
   t.mock.method(console, 'error', () => {});
   channels.start();
   for (let i = 0; i < 50 && channels.status().state !== 'failed'; i++)
     await delay(20);
   assert.equal(channels.status().state, 'failed');
-  const conversation = chat.create();
-  assert.equal(chat.get(conversation.id).id, conversation.id);
+  const conversation = await chat.create();
+  assert.equal((await chat.get(conversation.id)).id, conversation.id);
   await assert.rejects(
     channels.handle(
       new Request(`${origin}/api/slack/events`, { method: 'POST' }),
@@ -141,16 +128,18 @@ test('unexpected channel worker failures stop its ingress without stopping web c
 });
 
 test('the versioned channel boundary rejects unknown channels and has no arbitrary scope entry point', async (t) => {
-  const config = configFor(t);
-  const chat = createChat(config);
-  const channels = createChannels(config, chat);
+  let chat: Awaited<ReturnType<typeof createChat>>;
+  let channels: Awaited<ReturnType<typeof createChannels>>;
   t.after(async () => {
-    await channels.close();
-    chat.close();
+    await channels?.close();
+    chat?.close();
   });
+  const config = await testRuntime(t);
+  chat = await createChat(config);
+  channels = await createChannels(config, chat);
   assert.equal(channels.status().apiVersion, 1);
-  assert.throws(
-    () => channels.settings('unknown'),
+  await assert.rejects(
+    channels.settings('unknown'),
     (error: unknown) => error instanceof HttpError && error.status === 404,
   );
   await assert.rejects(

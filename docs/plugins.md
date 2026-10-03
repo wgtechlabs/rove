@@ -167,7 +167,7 @@ with different bytes is rejected; publish a new version instead. Identical
 artifact bytes cannot be claimed by a second repository in the same deployment.
 
 Immutable artifact bytes, settings, encrypted secrets, source identity and audit
-records are stored in the volume-backed SQLite database. The browser receives
+records are stored in PostgreSQL. The browser receives
 content and secret status, never secret values. Imported Agent Plugins retain
 their original format, source commit and per-file digests separately from the
 normalized Rove manifest; they are not labeled native release assets.
@@ -187,18 +187,13 @@ not imply that chat can generate or stage a package of that size.
 
 ## Upgrading existing deployments
 
-Stop the old service and back up the complete SQLite database before upgrading.
-Keep `BETTER_AUTH_SECRET`. New tables and the AIP workflow setting are additive;
-existing skill/MCP IDs, encrypted credentials, conversations, Slack state and
-proposal IDs remain. Local skill bundles are labeled **Local bundles**.
-Installed content is read-only in the local editors.
+This release requires a fresh PostgreSQL database and Redis. There is no SQLite
+importer. Keep any previous database, backup, authentication secret and matching
+old image together; starting the new image does not transfer an existing account,
+conversation history, installed release or proposal.
 
-Previously adopted AIPs remain legacy local content. Pending published or
-interrupted-adoption AIPs cannot use the removed direct-adoption tool; they must
-pass final review and release verification. Legacy single-file proposals need a
-new compatible package proposal. Uncertain publications cannot auto-republish.
-
-Database compatibility does not make downgrading safe: older Rove versions do
-not understand managed ownership or the new release gate. For recovery, stop
-Rove and restore the pre-upgrade backup with its matching old container. A plugin
-rollback changes future behavior only and never reverses external writes.
+For subsequent PostgreSQL deployments, back up the database and keep
+`BETTER_AUTH_SECRET` before updating core. An application rollback must use a
+compatible schema or restore its matching backup. A plugin rollback only changes
+future plugin behavior; it does not restore database state or reverse external
+writes. Installed release content remains read-only in the local editors.

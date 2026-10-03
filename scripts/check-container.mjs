@@ -1,4 +1,4 @@
-// Isolated Docker smoke test. Uses only disposable local containers and a new volume.
+// Isolated Docker smoke test. Uses only disposable local containers and fresh PostgreSQL and Redis volumes.
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -8,7 +8,10 @@ const image = process.argv[2] || 'rove:foundation';
 const suffix = randomUUID().slice(0, 8);
 const name = `rove-check-${suffix}`;
 const drainName = `rove-drain-${suffix}`;
-const volume = `rove-check-data-${suffix}`;
+const postgres = `rove-postgres-${suffix}`;
+const redis = `rove-redis-${suffix}`;
+const network = `rove-network-${suffix}`;
+const volumes = [`rove-pg-data-${suffix}`, `rove-redis-data-${suffix}`];
 const origin = 'http://localhost:3000';
 const setupSecret = 'container-test-setup-secret-not-production';
 const authSecret = 'container-test-auth-secret-not-production';
@@ -34,8 +37,12 @@ async function start(setup) {
     name,
     '-p',
     '127.0.0.1::3000',
-    '-v',
-    `${volume}:/data`,
+    '--network',
+    network,
+    '-e',
+    `DATABASE_URL=postgres://rove:rove@${postgres}:5432/rove`,
+    '-e',
+    `REDIS_URL=redis://${redis}:6379`,
     '-e',
     `ROVE_URL=${origin}`,
     '-e',
@@ -55,8 +62,74 @@ async function start(setup) {
   throw new Error('Container did not become healthy.');
 }
 try {
-  docker('volume', 'create', volume);
+  docker('network', 'create', network);
+  for (const volume of volumes) docker('volume', 'create', volume);
+  docker(
+    'run',
+    '-d',
+    '--name',
+    postgres,
+    '--network',
+    network,
+    '-v',
+    `${volumes[0]}:/var/lib/postgresql/data`,
+    '-e',
+    'POSTGRES_USER=rove',
+    '-e',
+    'POSTGRES_PASSWORD=rove',
+    '-e',
+    'POSTGRES_DB=rove',
+    'pgvector/pgvector:pg17',
+  );
+  docker(
+    'run',
+    '-d',
+    '--name',
+    redis,
+    '--network',
+    network,
+    '-v',
+    `${volumes[1]}:/data`,
+    'redis:7-alpine',
+    'redis-server',
+    '--appendonly',
+    'yes',
+  );
+  for (let i = 0; i < 100; i++) {
+    try {
+      docker(
+        'exec',
+        postgres,
+        'pg_isready',
+        '-h',
+        '127.0.0.1',
+        '-U',
+        'rove',
+        '-d',
+        'rove',
+      );
+      docker('exec', redis, 'redis-cli', 'ping');
+      break;
+    } catch {
+      if (i === 99) throw new Error('Storage did not become ready.');
+      await delay(100);
+    }
+  }
   await start(true);
+  assert.equal(
+    docker(
+      'exec',
+      postgres,
+      'psql',
+      '-U',
+      'rove',
+      '-d',
+      'rove',
+      '-Atc',
+      "SELECT extname FROM pg_extension WHERE extname='vector'",
+    ),
+    'vector',
+  );
   const processStatus = docker('exec', name, 'cat', '/proc/1/status');
   assert.match(docker('exec', name, 'cat', '/proc/1/cmdline'), /^node\0/);
   assert.match(processStatus, /Uid:\s+1000\s+1000/);
@@ -159,6 +232,27 @@ try {
   docker('stop', '-t', '12', name);
   assert.equal(docker('inspect', '-f', '{{.State.ExitCode}}', name), '0');
   docker('rm', name);
+  docker('restart', postgres, redis);
+  for (let i = 0; i < 100; i++) {
+    try {
+      docker(
+        'exec',
+        postgres,
+        'pg_isready',
+        '-h',
+        '127.0.0.1',
+        '-U',
+        'rove',
+        '-d',
+        'rove',
+      );
+      docker('exec', redis, 'redis-cli', 'ping');
+      break;
+    } catch {
+      if (i === 99) throw new Error('PostgreSQL restart failed.');
+      await delay(100);
+    }
+  }
   await start(false);
   assert.deepEqual(await (await call('/api/setup')).json(), {
     required: false,
@@ -196,15 +290,22 @@ try {
   assert.match(docker('logs', drainName), /drained/);
   assert.equal(docker('inspect', '-f', '{{.State.ExitCode}}', drainName), '0');
   console.log(
-    'PASS: health, non-root PID 1, admin login, body limit, model reply, saved chat, persistent volume, restart without setup secret, graceful shutdown.',
+    'PASS: health, non-root PID 1, admin login, body limit, model reply, saved chat, PostgreSQL + pgvector + Redis, storage restart without setup secret, graceful shutdown.',
   );
 } finally {
-  for (const container of [name, drainName]) {
+  for (const container of [name, drainName, postgres, redis]) {
     try {
       docker('rm', '-f', container);
     } catch {
       /* already removed */
     }
   }
-  docker('volume', 'rm', volume);
+  for (const volume of volumes) {
+    try {
+      docker('volume', 'rm', volume);
+    } catch {}
+  }
+  try {
+    docker('network', 'rm', network);
+  } catch {}
 }

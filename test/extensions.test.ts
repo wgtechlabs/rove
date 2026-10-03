@@ -5,16 +5,13 @@ import {
   randomBytes,
   randomUUID,
 } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
 import { createServer, type ServerResponse } from 'node:http';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
 import { type TestContext, test } from 'node:test';
 import { HttpError } from '../src/auth.js';
 import { createExtensions } from '../src/extensions.js';
 import { mcpURL } from '../src/mcp.js';
 import { createSecrets } from '../src/secrets.js';
+import { testRuntime } from './storage.js';
 
 const signal = () => AbortSignal.timeout(5000);
 const secret = 'local-extension-encryption-test-secret-32-characters';
@@ -29,13 +26,12 @@ const skill = {
 };
 
 async function fixture(t: TestContext) {
-  const dir = mkdtempSync(join(tmpdir(), 'rove-extensions-'));
   const config = {
+    ...(await testRuntime(t)),
     baseURL: 'http://localhost:3000',
     authSecret: secret,
-    databasePath: join(dir, 'rove.sqlite'),
   };
-  let extensions = createExtensions(config);
+  let extensions = await createExtensions(config);
   const tool = {
     name: 'lookup.order',
     description: 'Look up an order',
@@ -144,7 +140,6 @@ async function fixture(t: TestContext) {
       server.close((error) => (error ? reject(error) : resolve()));
       server.closeAllConnections();
     });
-    rmSync(dir, { force: true, recursive: true });
   });
   return {
     get extensions() {
@@ -154,12 +149,12 @@ async function fixture(t: TestContext) {
     calls,
     service,
     entry,
-    restart() {
+    async restart() {
       extensions.close();
-      extensions = createExtensions(config);
+      extensions = await createExtensions(config);
     },
     async connect() {
-      const saved = extensions.save(entry).servers[0];
+      const saved = (await extensions.save(entry)).servers[0];
       assert.ok(saved);
       await extensions.probe(saved.id, signal());
       const discovered = (await extensions.tools(signal()))[0];
@@ -171,63 +166,65 @@ async function fixture(t: TestContext) {
 
 test('declarative skills and plugins persist, enable explicitly and reject scripts and excess instructions', async (t) => {
   const f = await fixture(t);
-  const first = f.extensions.save(skill).skills[0];
+  const first = (await f.extensions.save(skill)).skills[0];
   assert.ok(first);
-  f.extensions.save({
+  await f.extensions.save({
     kind: 'plugin',
     name: 'Support',
     enabled: false,
     skills: [{ name: 'Tone', markdown: 'Use plain English.' }],
   });
   assert.equal(
-    f.extensions.instructions(),
+    await f.extensions.instructions(),
     '### Company handbook\nBe concise.',
   );
-  const plugin = f.extensions.list().plugins[0];
+  const plugin = (await f.extensions.list()).plugins[0];
   assert.ok(plugin);
-  f.extensions.save({
+  await f.extensions.save({
     kind: 'plugin',
     id: plugin.id,
     name: plugin.name,
     skills: plugin.skills,
     enabled: true,
   });
-  assert.match(f.extensions.instructions(), /Use plain English/);
-  f.extensions.save({ ...skill, id: first.id, enabled: false });
-  assert.doesNotMatch(f.extensions.instructions(), /Be concise/);
-  const expected = f.extensions.list();
-  f.restart();
-  assert.deepEqual(f.extensions.list(), expected);
+  assert.match(await f.extensions.instructions(), /Use plain English/);
+  await f.extensions.save({ ...skill, id: first.id, enabled: false });
+  assert.doesNotMatch(await f.extensions.instructions(), /Be concise/);
+  const expected = await f.extensions.list();
+  await f.restart();
+  assert.deepEqual(await f.extensions.list(), expected);
   const adopted = {
     id: randomUUID(),
     name: 'Reviewed skill',
     content: 'Follow the adopted policy.',
     enabled: true,
   };
-  assert.throws(
-    () => f.extensions.save({ ...skill, id: adopted.id }),
+  await assert.rejects(
+    async () => await f.extensions.save({ ...skill, id: adopted.id }),
     status(404),
   );
-  f.extensions.adoptSkill(adopted);
-  f.extensions.adoptSkill(adopted);
+  await f.extensions.adoptSkill(adopted);
+  await f.extensions.adoptSkill(adopted);
   assert.equal(
-    f.extensions.list().skills.filter((entry) => entry.id === adopted.id)
-      .length,
+    (await f.extensions.list()).skills.filter(
+      (entry) => entry.id === adopted.id,
+    ).length,
     1,
   );
-  assert.match(f.extensions.instructions(), /Follow the adopted policy/);
-  const beforeInvalid = f.extensions.list();
-  assert.throws(
-    () => f.extensions.save({ ...skill, script: 'run shell' }),
+  assert.match(await f.extensions.instructions(), /Follow the adopted policy/);
+  const beforeInvalid = await f.extensions.list();
+  await assert.rejects(
+    async () => await f.extensions.save({ ...skill, script: 'run shell' }),
     status(400),
   );
-  assert.throws(
-    () => f.extensions.save({ ...skill, markdown: 'x'.repeat(8001) }),
+  await assert.rejects(
+    async () =>
+      await f.extensions.save({ ...skill, markdown: 'x'.repeat(8001) }),
     status(400),
   );
-  assert.throws(
-    () =>
-      f.extensions.save({
+  await assert.rejects(
+    async () =>
+      await f.extensions.save({
         kind: 'plugin',
         name: 'Huge',
         enabled: true,
@@ -238,30 +235,29 @@ test('declarative skills and plugins persist, enable explicitly and reject scrip
       }),
     status(400),
   );
-  assert.deepEqual(f.extensions.list(), beforeInvalid);
+  assert.deepEqual(await f.extensions.list(), beforeInvalid);
 });
 
 test('credentials remain encrypted and secret redaction survives restart and endpoint changes', async (t) => {
   const f = await fixture(t);
-  const saved = f.extensions.save(f.entry).servers[0];
+  const saved = (await f.extensions.save(f.entry)).servers[0];
   assert.ok(saved);
   assert.equal(saved.configured, true);
-  assert.equal(JSON.stringify(f.extensions.list()).includes(bearer), false);
-  const db = new DatabaseSync(f.config.databasePath);
-  try {
-    const row = db
-      .prepare('SELECT * FROM rove_extension WHERE id=?')
-      .get(saved.id);
-    assert.ok(row);
-    assert.equal(JSON.stringify(row).includes(bearer), false);
-    assert.equal(createSecrets(secret).decrypt(String(row.credential)), bearer);
-  } finally {
-    db.close();
-  }
-  f.restart();
-  assert.throws(
-    () =>
-      f.extensions.save({
+  assert.equal(
+    JSON.stringify(await f.extensions.list()).includes(bearer),
+    false,
+  );
+  const db = f.config.db;
+  const row = await db.get('SELECT * FROM rove_extension WHERE id=$1', [
+    saved.id,
+  ]);
+  assert.ok(row);
+  assert.equal(JSON.stringify(row).includes(bearer), false);
+  assert.equal(createSecrets(secret).decrypt(String(row.credential)), bearer);
+  await f.restart();
+  await assert.rejects(
+    async () =>
+      await f.extensions.save({
         ...f.entry,
         id: saved.id,
         url: `${f.entry.url}/other`,
@@ -269,15 +265,15 @@ test('credentials remain encrypted and secret redaction survives restart and end
       }),
     status(400),
   );
-  f.extensions.save({ ...f.entry, id: saved.id, bearerToken: '' });
-  assert.equal(f.extensions.list().servers[0]?.configured, true);
-  f.extensions.save({
+  await f.extensions.save({ ...f.entry, id: saved.id, bearerToken: '' });
+  assert.equal((await f.extensions.list()).servers[0]?.configured, true);
+  await f.extensions.save({
     ...f.entry,
     id: saved.id,
     bearerToken: '',
     clearToken: true,
   });
-  assert.equal(f.extensions.list().servers[0]?.configured, false);
+  assert.equal((await f.extensions.list()).servers[0]?.configured, false);
   for (const url of [
     'file:///tmp/mcp',
     'https://name:key@example.com/mcp',
@@ -287,12 +283,14 @@ test('credentials remain encrypted and secret redaction survives restart and end
   ])
     assert.throws(() => mcpURL(url, f.config.baseURL), status(400));
   assert.throws(() => mcpURL(f.entry.url, 'https://rove.example'), status(400));
-  const privateServer = f.extensions.save({
-    ...f.entry,
-    id: saved.id,
-    url: 'https://169.254.169.254/mcp',
-    bearerToken: '',
-  }).servers[0];
+  const privateServer = (
+    await f.extensions.save({
+      ...f.entry,
+      id: saved.id,
+      url: 'https://169.254.169.254/mcp',
+      bearerToken: '',
+    })
+  ).servers[0];
   assert.ok(privateServer);
   await assert.rejects(
     f.extensions.probe(privateServer.id, signal()),
@@ -306,7 +304,7 @@ test('MCP discovery and execution use HTTP bearer auth, validate arguments and i
   const { saved, discovered } = await f.connect();
   assert.match(discovered.name, /^[a-zA-Z0-9_-]{1,64}$/);
   assert.deepEqual(discovered.parameters, f.service.tools[0]?.inputSchema);
-  f.restart();
+  await f.restart();
   assert.deepEqual(await f.extensions.tools(signal()), [discovered]);
   await assert.rejects(
     f.extensions.execute(
@@ -335,7 +333,7 @@ test('MCP discovery and execution use HTTP bearer auth, validate arguments and i
     f.calls.find((call) => call.method === 'tools/call')?.params,
     { name: 'lookup.order', arguments: { id: 'A-1' } },
   );
-  f.extensions.save(skill);
+  await f.extensions.save(skill);
   await assert.rejects(
     f.extensions.execute(
       discovered.name,
@@ -363,7 +361,7 @@ test('MCP discovery and execution use HTTP bearer auth, validate arguments and i
     f.calls.filter((call) => call.method === 'tools/call').length,
     1,
   );
-  f.extensions.save({
+  await f.extensions.save({
     ...f.entry,
     id: saved.id,
     bearerToken: '',
@@ -383,7 +381,7 @@ test('MCP discovery and execution use HTTP bearer auth, validate arguments and i
 
 test('MCP redirects, invalid catalogs and oversized responses fail without exposing provider errors', async (t) => {
   const f = await fixture(t);
-  const saved = f.extensions.save(f.entry).servers[0];
+  const saved = (await f.extensions.save(f.entry)).servers[0];
   assert.ok(saved);
   for (const failure of [
     'redirect',
@@ -413,6 +411,50 @@ test('MCP redirects, invalid catalogs and oversized responses fail without expos
   first.inputSchema.properties.id = { type: 'string' };
   f.service.tools.push({ ...first });
   await assert.rejects(f.extensions.probe(saved.id, signal()), status(502));
+});
+
+test('MCP discovery rejects a saved configuration change before invalidating its catalog', async (t) => {
+  const f = await fixture(t);
+  const saved = (await f.extensions.save(f.entry)).servers[0];
+  assert.ok(saved);
+  let notify!: () => void;
+  const entered = new Promise<void>((resolve) => {
+    notify = resolve;
+  });
+  let resume!: () => void;
+  const released = new Promise<void>((resolve) => {
+    resume = resolve;
+  });
+  const original = f.config.db.all;
+  let paused = false;
+  const mock = t.mock.method(
+    f.config.db,
+    'all',
+    async (sql: string, params?: unknown[]) => {
+      const rows = await original(sql, params);
+      if (!paused && sql.startsWith('SELECT e.*')) {
+        paused = true;
+        notify();
+        await released;
+      }
+      return rows;
+    },
+  );
+  const rejected = assert.rejects(
+    f.extensions.probe(saved.id, signal()),
+    status(409),
+  );
+  await entered;
+  const updated = await f.extensions.save({
+    ...f.entry,
+    id: saved.id,
+    url: `${f.entry.url}/replacement`,
+  });
+  resume();
+  await rejected;
+  mock.mock.restore();
+  assert.deepEqual(await f.extensions.list(), updated);
+  assert.equal(f.calls.length, 0);
 });
 
 test('MCP accepts Streamable HTTP SSE replies and validates structured tool output', async (t) => {
@@ -521,4 +563,48 @@ test('shared encryption opens the previous model format and rejects tampering or
   assert.throws(() => createSecrets(secret).decrypt('corrupted'), status(503));
   const secrets = createSecrets(secret);
   assert.notEqual(secrets.encrypt(bearer), secrets.encrypt(bearer));
+});
+
+test('managed content and its release callback roll back together after an asynchronous failure', async (t) => {
+  const f = await fixture(t);
+  const owner = randomUUID();
+  const id = randomUUID();
+  const entry = {
+    id,
+    entry: {
+      kind: 'skill' as const,
+      name: 'Managed policy',
+      markdown: 'Original policy',
+      enabled: true,
+    },
+    credential: '',
+    tools: [],
+  };
+  await f.config.db.exec('CREATE TABLE release_fixture(version TEXT NOT NULL)');
+  await f.extensions.replaceManaged(owner, [entry], async (tx) => {
+    await tx.run('INSERT INTO release_fixture VALUES($1)', ['v1']);
+  });
+  const before = await f.extensions.list();
+  const fail = async (tx: import('../src/database.js').Sql) => {
+    await tx.run('UPDATE release_fixture SET version=$1', ['v2']);
+    throw new Error('Simulated release commit failure');
+  };
+  await assert.rejects(
+    f.extensions.replaceManaged(
+      owner,
+      [{ ...entry, entry: { ...entry.entry, markdown: 'Replacement policy' } }],
+      fail,
+    ),
+    /release commit failure/,
+  );
+  assert.deepEqual(await f.extensions.list(), before);
+  await assert.rejects(
+    f.extensions.deactivateManaged(owner, fail),
+    /release commit failure/,
+  );
+  assert.deepEqual(await f.extensions.list(), before);
+  assert.equal(
+    (await f.config.db.get('SELECT version FROM release_fixture'))?.version,
+    'v1',
+  );
 });
