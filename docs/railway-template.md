@@ -1,10 +1,10 @@
 # Railway template configuration
 
-The saved template uses **Rove v1.0.0**, Railway's native **PostgreSQL 18**
+The saved template uses **Rove v1.0.1**, Railway's native **PostgreSQL 18**
 service with pgvector, and native **Redis 8.2**. Its configuration has been saved
-and read back; a fresh live installation still needs verification. The template
-is not yet listed in Railway's marketplace. The configuration below also supports
-manual installation without a marketplace listing.
+and read back; a fresh live installation still needs verification. Deploy from
+the [published Railway template](https://railway.com/deploy/rove), or use the
+configuration below for manual installation.
 
 ## Services
 
@@ -15,7 +15,7 @@ services on private networking; only Rove needs a public HTTP domain.
 | --- | --- | --- | --- |
 | `Postgres` | `ghcr.io/railwayapp-templates/postgres-ssl:18` | `/var/lib/postgresql/data` | Private port `5432`; keep `PGDATA=/var/lib/postgresql/data/pgdata`. The native image includes pgvector. |
 | `Redis` | `redis:8.2` | `/data` | Private port `6379`; preserve the generated password and enable append-only persistence. |
-| `rove` | `wgtechlabs/rove:1.0.0` or `ghcr.io/wgtechlabs/rove:1.0.0` | None | Public HTTP port `3000`, healthcheck `/health`, one replica. |
+| `rove` | `wgtechlabs/rove:1.0.1` or `ghcr.io/wgtechlabs/rove:1.0.1` | None | Public HTTP port `3000`, healthcheck `/health`, one replica. |
 
 The checked-in `railway.json` sets the Dockerfile and healthcheck for source
 builds. Set the health path separately when configuring an image deployment.
