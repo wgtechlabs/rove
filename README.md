@@ -101,7 +101,7 @@ PostgreSQL and Redis need persistent volumes; Rove does not need a volume.
    includes pgvector. Keep their generated credentials and persistent volumes;
    enable Redis append-only persistence while retaining its authenticated start
    command. Keep both services on private networking.
-2. Use `wgtechlabs/rove:1.0.0` or `ghcr.io/wgtechlabs/rove:1.0.0` for Rove.
+2. Use `wgtechlabs/rove:1.0.1` or `ghcr.io/wgtechlabs/rove:1.0.1` for Rove.
    Set `DATABASE_URL=${{Postgres.DATABASE_URL}}` and
    `REDIS_URL=${{Redis.REDIS_URL}}`, matching the database service names.
    Configure HTTP port `3000` and healthcheck `/health`.
@@ -113,8 +113,9 @@ PostgreSQL and Redis need persistent volumes; Rove does not need a volume.
 
 See [Railway template configuration](docs/railway-template.md) for volumes,
 reference variables and generated secrets. The saved template is configured for
-this three-service layout and Rove v1.0.0. A fresh live template installation
-still needs verification; the template is not yet listed in the marketplace.
+this three-service layout and Rove v1.0.1. A fresh live template installation
+still needs verification. The template is
+[published in Railway's marketplace](https://railway.com/deploy/rove).
 
 Run **one Rove replica**. Redis coordinates core ownership, active turns and
 credential attempt limits. Rove refuses to start without PostgreSQL, pgvector or
