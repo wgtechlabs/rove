@@ -43,8 +43,17 @@ revocation blocks future dispatch once accepted; it cannot undo an external
 request already sent. Changes require any current plugin call to finish first. A single
 process and replica are required.
 
-Every switch, configuration change and rollback creates new approval revisions.
-Previously approved calls cannot silently authorize changed behavior. A process
+Use **Remove cached download → Remove this cached version** to prune an inactive
+release payload. The active
+release and most recent distinct activated release remain cached for rollback;
+when inactive, the most recently activated release stays protected. Pruning is
+refused while plugin operations are running; retry after they finish. It requires
+the displayed installation revision. It does not change active content or settings. Pruned versions remain
+listed with their release identity; download the exact original repository, tag,
+format, commit, asset and bytes before reviewing or activating them again.
+
+Every switch, configuration change, rollback and cache prune creates new approval
+revisions. Previously approved calls cannot silently authorize changed behavior. A process
 exit after dispatch leaves an uncertain outcome that is never replayed.
 
 ## Native API v1 package
@@ -166,17 +175,27 @@ auto-install or auto-activate releases. Replacing an already installed version
 with different bytes is rejected; publish a new version instead. Identical
 artifact bytes cannot be claimed by a second repository in the same deployment.
 
-Immutable artifact bytes, settings, encrypted secrets, source identity and audit
+Cached artifact bytes, settings, encrypted secrets, source identity and audit
 records are stored in PostgreSQL. The browser receives
 content and secret status, never secret values. Imported Agent Plugins retain
 their original format, source commit and per-file digests separately from the
-normalized Rove manifest; they are not labeled native release assets.
+normalized Rove manifest; they are not labeled native release assets. Pruning
+removes the cached payload while retaining a lightweight receipt with immutable
+version, digest, source and provenance, including required notices. Audit records
+and separate AIP review/release evidence remain. Reusing a version with changed
+bytes, changing its source identity or claiming its bytes from another repository
+is still rejected after pruning.
 
-Limits: 16 sources, 16 installations, 16 retained releases per installation,
+Limits: 16 sources, 16 installations, 16 cached release payloads per installation,
 128 KB native manifests, 8 skills, 8 MCP connections, 16 ordinary settings and
 8 secrets per package. Existing shared limits remain: 32 extension records,
 24,000 instruction characters, 8 MCP servers and 32 combined MCP tools and plugin operations. Limits include
-local and installed contributions. Cache pruning is not yet exposed.
+local and installed contributions. Lightweight release receipts do not count
+against the cache limit, so pruning frees room for another release. Receipts and
+audit history continue to accumulate; the cache limit is not a total storage cap.
+Version selectors show all cached releases and one page of up to 16 removed
+downloads. Use **Load older versions** to browse earlier receipts, or **Latest
+versions** to return to recent ones; paging keeps the cached releases available.
 Configuration requests have a 512 KiB aggregate JSON limit, including settings,
 secret bindings and channel access rules.
 

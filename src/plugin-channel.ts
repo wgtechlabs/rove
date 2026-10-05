@@ -142,6 +142,10 @@ interface Job {
 const hash = (value: string) =>
   createHash('sha256').update(value).digest('hex');
 export const MAX_CHANNEL_BODY = 65536;
+// Request signatures expire, but providers may sign retries of any event again.
+// Keep event identities permanently; terminal jobs no longer need their payload.
+const compactJobFields = `scope='', actor='', destination='', thread='', content='',
+  decision='', approval='', snapshot='', fingerprint='', conversation='', reply=''`;
 
 function at(body: unknown, path: string | undefined) {
   if (!path) return undefined;
@@ -192,11 +196,23 @@ export async function createPluginChannels(
         destination TEXT NOT NULL, thread TEXT NOT NULL, content TEXT NOT NULL,
         decision TEXT NOT NULL, approval TEXT NOT NULL, snapshot TEXT NOT NULL, fingerprint TEXT NOT NULL,
         conversation TEXT NOT NULL DEFAULT '', reply TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending',
+        finished_at BIGINT,
         UNIQUE(installation,event));
-      CREATE INDEX IF NOT EXISTS rove_plugin_channel_queue ON rove_plugin_channel_job(status,sequence);`);
+      ALTER TABLE rove_plugin_channel_job ADD COLUMN IF NOT EXISTS finished_at BIGINT;
+      CREATE INDEX IF NOT EXISTS rove_plugin_channel_active_queue ON rove_plugin_channel_job(sequence)
+        WHERE status IN ('pending','processing','ready','delivering');
+      CREATE INDEX IF NOT EXISTS rove_plugin_channel_unfinished ON rove_plugin_channel_job(sequence)
+        WHERE finished_at IS NULL;
+      CREATE INDEX IF NOT EXISTS rove_plugin_channel_recent ON rove_plugin_channel_job(installation,sequence DESC)
+        WHERE finished_at IS NOT NULL;
+      DROP INDEX IF EXISTS rove_plugin_channel_queue;`);
   await config.state.assertOwned();
-  await db.exec(`UPDATE rove_plugin_channel_job SET status='uncertain', snapshot='', content='', reply=''
-    WHERE status IN ('processing','delivering');`);
+  await db.run(
+    `UPDATE rove_plugin_channel_job SET ${compactJobFields}, finished_at=$1,
+      status=CASE WHEN status IN ('processing','delivering') THEN 'uncertain' ELSE status END
+      WHERE finished_at IS NULL AND status NOT IN ('pending','ready')`,
+    [Date.now()],
+  );
   const secrets = createSecrets(config.authSecret);
   let timer: ReturnType<typeof setInterval> | undefined;
   let running: Promise<void> | undefined;
@@ -235,8 +251,8 @@ export async function createPluginChannels(
   }
   async function finish(job: Job, status: string) {
     await db.run(
-      "UPDATE rove_plugin_channel_job SET status=$1, snapshot='', content='', reply='' WHERE id=$2",
-      [status, job.id],
+      `UPDATE rove_plugin_channel_job SET status=$1, ${compactJobFields}, finished_at=$2 WHERE id=$3`,
+      [status, Date.now(), job.id],
     );
   }
   async function handle(request: Request, installation: string) {
@@ -361,15 +377,7 @@ export async function createPluginChannels(
         )
       )
         return new Response(null, { status: 200 });
-      // ponytail: retain 10,000 event tombstones forever; archival needs an explicit provider retry horizon.
       if (
-        Number(
-          (
-            await tx.get(
-              'SELECT COUNT(*) AS count FROM rove_plugin_channel_job',
-            )
-          )?.count,
-        ) >= 10000 ||
         Number(
           (
             await tx.get(
@@ -586,9 +594,17 @@ export async function createPluginChannels(
       return {
         state: failed ? 'failed' : stopping ? 'stopped' : 'ready',
         jobs: await db.all(
-          'SELECT status, COUNT(*) AS count FROM rove_plugin_channel_job WHERE installation=$1 GROUP BY status',
+          `SELECT status, COUNT(*) AS count FROM (
+            SELECT status FROM rove_plugin_channel_job
+              WHERE installation=$1 AND status IN ('pending','processing','ready','delivering')
+            UNION ALL
+            (SELECT status FROM rove_plugin_channel_job
+              WHERE installation=$1 AND finished_at IS NOT NULL
+              ORDER BY sequence DESC LIMIT 500)
+          ) AS recent_jobs GROUP BY status ORDER BY status`,
           [installation],
         ),
+        recentLimit: 500,
       };
     },
     start() {

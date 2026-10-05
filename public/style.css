@@ -454,6 +454,26 @@ button:disabled {
   margin-block-start: 4px;
   overflow-wrap: anywhere;
 }
+.chat-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-block-start: 16px;
+}
+.chat-actions button {
+  font-size: 0.8125rem;
+}
+#retention-notice {
+  margin-block-start: 16px;
+  max-inline-size: 72ch;
+}
+#conversation-notice:not([hidden]) {
+  padding: 12px 16px;
+  margin-block-start: 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--tint);
+}
 .messages {
   display: flex;
   flex-direction: column;
@@ -734,10 +754,6 @@ noscript {
   }
 }
 
-#proposals-open {
-  margin-block-start: 16px;
-  font-size: 0.8125rem;
-}
 .proposal-content {
   white-space: pre-wrap;
   overflow-wrap: anywhere;

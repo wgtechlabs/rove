@@ -223,7 +223,11 @@ test('plugin management keeps package text inert and saves explicit grants befor
     if (path === '/api/admin/runtime')
       return { configured: false, pendingCleanup: [] };
     if (path.endsWith('/channel'))
-      return { state: 'ready', jobs: [{ status: 'uncertain', count: 1 }] };
+      return {
+        state: 'ready',
+        recentLimit: 500,
+        jobs: [{ status: 'uncertain', count: 1 }],
+      };
     return state;
   };
   const manager = (await management(Element))(
@@ -297,7 +301,13 @@ test('plugin management keeps package text inert and saves explicit grants befor
   button('Check channel deliveries').onclick();
   await pending;
   assert.ok(
-    root.all().some((element) => element.textContent === '1 uncertain'),
+    root
+      .all()
+      .some(
+        (element) =>
+          element.textContent ===
+          'Active jobs and latest 500 completed events: 1 uncertain',
+      ),
   );
   const company = root.querySelector('#manage-plugin-installation-id-company');
   company.value = 'Example company';
@@ -550,5 +560,173 @@ test('plugin pages keep content inert and route reviewed JSON with the displayed
       arguments: { title: 'A report' },
     },
   ]);
+  manager.dispose();
+});
+
+test('plugin history replaces older receipt pages, pins cached choices and restores a missing selection safely', async () => {
+  const { Element, root, focused } = dom();
+  const cached = Array.from({ length: 16 }, (_, index) => ({
+    digest: `cached-${index}`,
+    name: 'Company agent',
+    description: 'Company instructions',
+    category: 'agent',
+    version: `1.0.${index}`,
+    tag: `v1.0.${index}`,
+    cached: true,
+  }));
+  const receipts = Array.from({ length: 40 }, (_, index) => ({
+    digest: `receipt-${index}`,
+    name: 'Company agent',
+    description: 'Retained release identity',
+    category: 'agent',
+    version: `2.0.${index}`,
+    tag: `v2.0.${index}`,
+    cached: false,
+    format: 'rove',
+  }));
+  const installation = {
+    id: 'history-installation',
+    repo: 'example/plugins',
+    active: cached[0].digest,
+    revision: 'revision',
+    values: {},
+    secrets: {},
+    grants: [],
+    versions: [...cached, ...receipts.slice(0, 16)],
+    versionsCursor: 'older-one',
+    audit: [],
+  };
+  const state = {
+    sources: [{ repo: 'example/plugins', approved: true }],
+    installations: [installation],
+    executable: { reason: 'No execution configured.' },
+  };
+  const writes = [];
+  const detailsCalls = [];
+  let pending;
+  let failHistory = true;
+  const api = async (path, body) => {
+    if (path === '/api/admin/extensions')
+      return { skills: [], plugins: [], servers: [] };
+    if (path === '/api/admin/runtime')
+      return { configured: false, pendingCleanup: [] };
+    if (body) {
+      writes.push({ path, body });
+      return state;
+    }
+    if (path.endsWith('/releases?cursor=older-one')) {
+      if (failHistory) {
+        failHistory = false;
+        throw new Error('Retry history lookup.');
+      }
+      return { versions: receipts.slice(16, 32), nextCursor: 'older-two' };
+    }
+    if (path.endsWith('/releases?cursor=older-two'))
+      return { versions: receipts.slice(32), nextCursor: null };
+    if (path.endsWith('/releases'))
+      return { versions: receipts.slice(0, 16), nextCursor: 'older-one' };
+    if (path.includes('/releases/')) {
+      detailsCalls.push(path);
+      const release = cached.find((version) => path.endsWith(version.digest));
+      assert.ok(
+        release,
+        'version details must never receive an empty or missing selection',
+      );
+      return {
+        digest: release.digest,
+        tag: release.tag,
+        commit: 'a'.repeat(40),
+        manifest: {
+          ...release,
+          settings: [],
+          secrets: [],
+          servers: [],
+          skills: [],
+          operations: [],
+          capabilities: [],
+          pages: [],
+          instructions: '',
+        },
+      };
+    }
+    return state;
+  };
+  const manager = (await management(Element))(
+    root,
+    api,
+    (action) => {
+      pending = action();
+      return pending;
+    },
+    () => {},
+  );
+  await manager.load();
+  const button = (text) =>
+    root
+      .all()
+      .find(
+        (element) => element.tag === 'button' && element.textContent === text,
+      );
+  button('Plugins').onclick();
+  await pending;
+  const review = root
+    .all()
+    .find(
+      (element) =>
+        element.tag === 'details' &&
+        element.children[0]?.textContent === 'Review versions and settings',
+    );
+  review.open = true;
+  await review.ontoggle();
+  const choices = () =>
+    root.querySelector('#manage-version-history-installation');
+  assert.equal(choices().children.length, 32);
+  button('Load older versions').onclick();
+  await pending;
+  assert.ok(
+    root
+      .all()
+      .some((element) => element.textContent === 'Retry history lookup.'),
+  );
+  assert.equal(choices().children.length, 32);
+  assert.equal(button('Load older versions').disabled, false);
+  button('Load older versions').onclick();
+  await pending;
+  assert.equal(choices().children.length, 32);
+  assert.equal(
+    choices().children.some((option) => option.value === 'receipt-0'),
+    false,
+  );
+  assert.equal(
+    choices().children.filter((option) => option.value.startsWith('cached-'))
+      .length,
+    16,
+  );
+  assert.equal(focused(), choices());
+  button('Load older versions').onclick();
+  await pending;
+  assert.equal(choices().children.length, 24);
+  assert.equal(button('Load older versions').disabled, true);
+  button('Latest versions').onclick();
+  await pending;
+  assert.equal(choices().children.length, 32);
+  assert.equal(
+    choices().children.some((option) => option.value === 'receipt-0'),
+    true,
+  );
+  button('Load older versions').onclick();
+  await pending;
+  choices().value = 'receipt-16';
+  await choices().onchange();
+  button('Download original release').onclick();
+  await pending;
+  assert.equal(writes[0].path, '/api/admin/plugins/install');
+  assert.deepEqual(JSON.parse(JSON.stringify(writes[0].body)), {
+    repo: 'example/plugins',
+    tag: 'v2.0.16',
+    format: 'rove',
+  });
+  assert.equal(choices().value, cached[0].digest);
+  assert.ok(detailsCalls.every((path) => path.includes('/releases/cached-')));
   manager.dispose();
 });
