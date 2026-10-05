@@ -331,7 +331,9 @@ export function mountChat(main, admin, api, expire, signout) {
       updateConversation(result);
       renderMessages();
       await loadList();
-      find('#archive-chat').focus();
+      requestAnimationFrame(() => {
+        if (alive) find('#archive-chat').focus();
+      });
     });
 
   find('#proposals-open').onclick = () =>

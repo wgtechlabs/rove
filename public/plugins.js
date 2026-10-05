@@ -605,7 +605,7 @@ export function renderPlugins(content, state, runtime, ui) {
             ),
           );
         }
-        versions.focus();
+        requestAnimationFrame(() => versions.focus());
       } catch (error) {
         if (error.status === 401) onError(error);
         else
