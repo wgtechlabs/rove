@@ -80,7 +80,7 @@ export function renderPlugins(content, state, runtime, ui) {
       'Prepared version',
       item.versions.map((version) => [
         version.digest,
-        `${version.version} · ${version.tag}${version.digest === item.active ? ' · active' : ''}`,
+        `${version.version} · ${version.tag}${version.digest === item.active ? ' · active' : ''}${version.cached === false ? ' · download removed' : ''}`,
       ]),
       selected,
     );
@@ -88,6 +88,9 @@ export function renderPlugins(content, state, runtime, ui) {
     details.append(body);
     const renderVersion = (version) => {
       body.replaceChildren();
+      const summary = item.versions.find(
+        (entry) => entry.digest === version.digest,
+      );
       const manifest = version.manifest;
       const target = {
         id: item.id,
@@ -128,6 +131,27 @@ export function renderPlugins(content, state, runtime, ui) {
         }
       }
       if (version.blocked) body.append(node('p', version.blocked, 'error'));
+      if (summary?.prunable) {
+        const cleanup = disclosure(body, 'Remove cached download');
+        cleanup.append(
+          node(
+            'p',
+            'Free space by removing this unused download. Its version fingerprint and review history stay saved. To use it again, the exact original release must still be available from GitHub.',
+            'hint',
+          ),
+        );
+        cleanup.append(
+          button('Remove this cached version', () =>
+            change(
+              path('prune'),
+              target,
+              'Cached download removed. Version identity and review history retained.',
+            ),
+          ),
+        );
+      } else if (summary?.pruneReason) {
+        body.append(node('p', summary.pruneReason, 'hint'));
+      }
       const preview = disclosure(body, 'Preview package contents');
       preview.append(
         node('pre', JSON.stringify(manifest, null, 2), 'plugin-preview'),
@@ -440,7 +464,40 @@ export function renderPlugins(content, state, runtime, ui) {
     const loadVersion = async () => {
       const digest = versions.value;
       if (digest === loadedDigest || digest === loadingDigest) return;
+      const summary = item.versions.find((entry) => entry.digest === digest);
       const current = ++request;
+      if (summary?.cached === false) {
+        loadedDigest = digest;
+        loadingDigest = undefined;
+        selectedVersions.set(item.id, { digest, open: details.open });
+        body.setAttribute('aria-busy', 'false');
+        body.replaceChildren(
+          node(
+            'p',
+            'This cached download was removed. The version fingerprint and review history remain. Download the original release again before configuring or activating it.',
+            'hint',
+          ),
+        );
+        const restore = button('Download original release', () =>
+          change(
+            path('install'),
+            {
+              repo: item.repo,
+              tag: summary.tag,
+              format: summary.format || 'rove',
+            },
+            'Original release downloaded. Review before activation.',
+          ),
+        );
+        unavailable(
+          restore,
+          !state.sources.some(
+            (source) => source.repo === item.repo && source.approved,
+          ),
+        );
+        body.append(restore);
+        return;
+      }
       loadingDigest = digest;
       loadedDigest = undefined;
       selectedVersions.set(item.id, { digest, open: details.open });

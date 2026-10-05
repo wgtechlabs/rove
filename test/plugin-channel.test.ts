@@ -8,6 +8,7 @@ import { type TestContext, test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { HttpError } from '../src/auth.js';
 import { createChat } from '../src/chat.js';
+import type { Database } from '../src/database.js';
 import {
   type ActiveChannel,
   channelAccess,
@@ -92,10 +93,15 @@ async function until(predicate: () => boolean | Promise<boolean>) {
   }
   assert.fail('Timed out waiting for installed channel processing.');
 }
-async function fixture(t: TestContext, realChat = false) {
+async function fixture(
+  t: TestContext,
+  realChat = false,
+  beforeGateway?: (database: Database) => Promise<void>,
+) {
   let cleanup: (() => Promise<void>) | undefined;
   t.after(() => cleanup?.());
   const config = await testRuntime(t);
+  await beforeGateway?.(config.db);
   const posts: Record<string, unknown>[] = [];
   let deliveryStatus = 200;
   let dropDelivery = false;
@@ -325,6 +331,14 @@ async function fixture(t: TestContext, realChat = false) {
         'SELECT * FROM rove_plugin_channel_job ORDER BY sequence',
       );
     },
+    async thread(installation: string) {
+      const row = await database.get<{ conversation: string; scope: string }>(
+        'SELECT conversation, scope FROM rove_plugin_channel_thread WHERE scope LIKE $1',
+        [`plugin-channel:${installation}:%`],
+      );
+      assert.ok(row);
+      return row;
+    },
     setPending() {
       pending = true;
     },
@@ -356,9 +370,10 @@ async function fixture(t: TestContext, realChat = false) {
     },
     async simulateCrashPhase(phase: string) {
       await gateway.close();
-      await database.run('UPDATE rove_plugin_channel_job SET status=$1', [
-        phase,
-      ]);
+      await database.run(
+        'UPDATE rove_plugin_channel_job SET status=$1, finished_at=NULL',
+        [phase],
+      );
       gateway = await makeGateway();
     },
   };
@@ -367,6 +382,26 @@ async function fixture(t: TestContext, realChat = false) {
 function status(expected: number) {
   return (error: unknown) =>
     error instanceof HttpError && error.status === expected;
+}
+
+function assertCompacted(job: Record<string, unknown> | undefined) {
+  assert.ok(job);
+  for (const field of [
+    'scope',
+    'actor',
+    'destination',
+    'thread',
+    'content',
+    'decision',
+    'approval',
+    'snapshot',
+    'fingerprint',
+    'conversation',
+    'reply',
+  ])
+    assert.equal(job[field], '', field);
+  assert.equal(typeof job.finished_at, 'number');
+  assert.ok(Number(job.finished_at) > 0);
 }
 
 test('channel manifests admit only bounded data bindings and dashboard access rules', () => {
@@ -436,26 +471,30 @@ test('signed messages use the actual core chat and local model, deduplicate, and
     text: 'Local model answer 1.',
   });
   assert.equal(f.modelCalls, 1);
+  assertCompacted((await f.jobs())[0]);
+  assert.equal((await f.gateway.handle(signed(input), 'one')).status, 200);
+  await delay(150);
+  assert.equal(f.modelCalls, 1);
+  assert.equal(f.posts.length, 1);
   assert.equal((await f.actualChat?.list())?.length, 0);
   assert.equal((await f.gateway.handle(signed(input), 'two')).status, 202);
   await until(async () => (await f.jobs())[1]?.status === 'sent');
-  assert.notEqual((await f.jobs())[0]?.scope, (await f.jobs())[1]?.scope);
-  assert.notEqual(
-    (await f.jobs())[0]?.conversation,
-    (await f.jobs())[1]?.conversation,
-  );
+  const first = await f.thread('one');
+  const second = await f.thread('two');
+  assert.notEqual(first.scope, second.scope);
+  assert.notEqual(first.conversation, second.conversation);
   assert.ok(f.actualChat);
   await assert.rejects(
-    f.actualChat.get(
-      String((await f.jobs())[0]?.conversation),
-      String((await f.jobs())[1]?.scope),
-    ),
+    f.actualChat.get(first.conversation, second.scope),
     status(404),
   );
   await f.restart();
   f.gateway.start();
   assert.equal((await f.gateway.handle(signed(input), 'one')).status, 200);
+  await delay(150);
   assert.equal(f.modelCalls, 2);
+  assert.equal(f.posts.length, 2);
+  assertCompacted((await f.jobs())[0]);
 });
 
 test('accepted channel messages wait for a busy web model call and then deliver once', async (t) => {
@@ -491,6 +530,108 @@ test('accepted channel messages wait for a busy web model call and then deliver 
   await delay(150);
   assert.equal(f.modelCalls, 2);
   assert.equal(f.posts.length, 1);
+});
+
+test('terminal history does not limit admission and a full active queue still accepts duplicates', async (t) => {
+  const f = await fixture(t);
+  await f.config.db.run(
+    `INSERT INTO rove_plugin_channel_job
+      (id,installation,event,scope,actor,destination,thread,content,decision,approval,snapshot,fingerprint,status,finished_at)
+      SELECT 'history-' || n, 'one', 'history-' || n, '', '', '', '', '', '', '', '', '',
+        CASE WHEN n <= 10001 THEN 'sent' ELSE 'pending' END,
+        CASE WHEN n <= 10001 THEN $1::bigint ELSE NULL END
+      FROM generate_series(1, 10500) AS n`,
+    [Date.now()],
+  );
+  const input = event();
+  assert.equal((await f.gateway.handle(signed(input), 'one')).status, 202);
+  await assert.rejects(f.gateway.handle(signed(event()), 'one'), status(503));
+  assert.equal((await f.gateway.handle(signed(input), 'one')).status, 200);
+  assert.equal(
+    (await f.gateway.handle(signed(event({ event: 'history-1' })), 'one'))
+      .status,
+    200,
+  );
+  assert.equal((await f.jobs()).length, 10501);
+  assert.equal(f.sends.length, 0);
+  assert.equal(f.posts.length, 0);
+});
+
+test('legacy channel jobs migrate once without deleting identities or pending work', async (t) => {
+  const states = [
+    'sent',
+    'failed',
+    'cancelled',
+    'uncertain',
+    'processing',
+    'delivering',
+    'pending',
+    'ready',
+  ];
+  const f = await fixture(t, false, async (database) => {
+    await database.exec(`
+      CREATE TABLE rove_plugin_channel_job(
+        sequence BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, id TEXT UNIQUE NOT NULL,
+        installation TEXT NOT NULL, event TEXT NOT NULL, scope TEXT NOT NULL, actor TEXT NOT NULL,
+        destination TEXT NOT NULL, thread TEXT NOT NULL, content TEXT NOT NULL,
+        decision TEXT NOT NULL, approval TEXT NOT NULL, snapshot TEXT NOT NULL, fingerprint TEXT NOT NULL,
+        conversation TEXT NOT NULL DEFAULT '', reply TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending',
+        UNIQUE(installation,event));
+      CREATE INDEX rove_plugin_channel_queue ON rove_plugin_channel_job(status,sequence);`);
+    for (const phase of states)
+      await database.run(
+        `INSERT INTO rove_plugin_channel_job
+          (id,installation,event,scope,actor,destination,thread,content,decision,approval,snapshot,fingerprint,conversation,reply,status)
+          VALUES($1,'one',$1,'private-scope','alice','room','thread','private content','approve',
+            'approval-id','encrypted credentials','fingerprint','conversation-id','private reply',$2)`,
+        [`legacy-${phase}`, phase],
+      );
+  });
+  const migrated = await f.jobs();
+  assert.equal(migrated.length, states.length);
+  for (const job of migrated) {
+    if (['pending', 'ready'].includes(String(job.status))) {
+      assert.equal(job.content, 'private content');
+      assert.equal(job.snapshot, 'encrypted credentials');
+      assert.equal(job.finished_at, null);
+    } else {
+      assertCompacted(job);
+      assert.equal(job.installation, 'one');
+      assert.match(String(job.event), /^legacy-/);
+    }
+  }
+  assert.equal(migrated[4]?.status, 'uncertain');
+  assert.equal(migrated[5]?.status, 'uncertain');
+  const indexes = await f.config.db.all<{
+    indexname: string;
+    indexdef: string;
+  }>(
+    "SELECT indexname, indexdef FROM pg_indexes WHERE tablename='rove_plugin_channel_job'",
+  );
+  assert.equal(
+    indexes.some((index) => index.indexname === 'rove_plugin_channel_queue'),
+    false,
+  );
+  assert.match(
+    indexes.find(
+      (index) => index.indexname === 'rove_plugin_channel_active_queue',
+    )?.indexdef || '',
+    /WHERE .*status/,
+  );
+  await f.restart();
+  assert.deepEqual(await f.jobs(), migrated);
+  for (const phase of states)
+    assert.equal(
+      (
+        await f.gateway.handle(
+          signed(event({ event: `legacy-${phase}` })),
+          'one',
+        )
+      ).status,
+      200,
+    );
+  assert.equal(f.sends.length, 0);
+  assert.equal(f.posts.length, 0);
 });
 
 test('forged signatures, timestamps, tenant, actor, destinations and administrator claims never enter the inbox', async (t) => {
@@ -534,7 +675,7 @@ test('only dashboard administrators can decide approvals in their installation a
   await f.gateway.handle(signed(event()), 'one');
   await until(async () => (await f.jobs())[0]?.status === 'sent');
   const conversation = f.conversations.get(
-    String((await f.jobs())[0]?.conversation),
+    (await f.thread('one')).conversation,
   );
   assert.ok(conversation?.pending);
   const approval = conversation.pending.id;
@@ -608,7 +749,7 @@ test('uncertain dispatch is durable and neither webhook retries nor restarts rep
   await delay(150);
   assert.equal(f.posts.length, 1);
   assert.equal(f.sends.length, 1);
-  assert.equal((await f.jobs())[0]?.snapshot, '');
+  assertCompacted((await f.jobs())[0]);
 });
 
 test('restart seals both unfinished core execution and unfinished delivery as uncertain', async (t) => {
@@ -617,9 +758,11 @@ test('restart seals both unfinished core execution and unfinished delivery as un
   await f.gateway.handle(signed(input), 'one');
   await f.simulateCrashPhase('processing');
   assert.equal((await f.jobs())[0]?.status, 'uncertain');
+  assertCompacted((await f.jobs())[0]);
   await f.simulateCrashPhase('delivering');
   f.gateway.start();
   assert.equal((await f.jobs())[0]?.status, 'uncertain');
+  assertCompacted((await f.jobs())[0]);
   assert.equal((await f.gateway.handle(signed(input), 'one')).status, 200);
   await delay(150);
   assert.equal(f.sends.length, 0);
@@ -660,12 +803,8 @@ test('actual core approvals execute once and administrator continuation does not
   f.gateway.start();
   await f.gateway.handle(signed(event()), 'one');
   await until(async () => (await f.jobs())[0]?.status === 'sent');
-  const job = (await f.jobs())[0];
-  assert.ok(job);
-  const conversation = await f.actualChat?.get(
-    String(job.conversation),
-    String(job.scope),
-  );
+  const job = await f.thread('one');
+  const conversation = await f.actualChat?.get(job.conversation, job.scope);
   assert.ok(conversation?.pending);
   const approval = conversation.pending.id;
   assert.match(String(f.posts[0]?.text), /approved write/);
@@ -685,22 +824,35 @@ test('actual core approvals execute once and administrator continuation does not
   assert.match(String(f.posts[1]?.text), /decision resume/);
   assert.equal(f.toolExecutions, 1);
   assert.equal(
-    (await f.actualChat?.get(String(job.conversation), String(job.scope)))
-      ?.pending?.status,
+    (await f.actualChat?.get(job.conversation, job.scope))?.pending?.status,
     'ready',
   );
+  assertCompacted((await f.jobs())[1]);
+  const modelCallsAfterApproval = f.modelCalls;
+  await f.restart();
+  f.gateway.start();
   assert.equal((await f.gateway.handle(signed(approved), 'one')).status, 200);
-  await f.gateway.handle(
-    signed(event({ approval, decision: 'resume', actor: 'admin' })),
-    'one',
-  );
+  await delay(150);
+  assert.equal(f.modelCalls, modelCallsAfterApproval);
+  assert.equal(f.toolExecutions, 1);
+  assert.equal(f.posts.length, 2);
+  const resumed = event({ approval, decision: 'resume', actor: 'admin' });
+  await f.gateway.handle(signed(resumed), 'one');
   await until(async () => (await f.jobs())[2]?.status === 'sent');
   assert.equal(f.toolExecutions, 1);
   assert.equal(
-    (await f.actualChat?.get(String(job.conversation), String(job.scope)))
-      ?.pending,
+    (await f.actualChat?.get(job.conversation, job.scope))?.pending,
     undefined,
   );
+  assertCompacted((await f.jobs())[2]);
+  const modelCallsAfterResume = f.modelCalls;
+  await f.restart();
+  f.gateway.start();
+  assert.equal((await f.gateway.handle(signed(resumed), 'one')).status, 200);
+  await delay(150);
+  assert.equal(f.modelCalls, modelCallsAfterResume);
+  assert.equal(f.toolExecutions, 1);
+  assert.equal(f.posts.length, 3);
 });
 
 test('revocation while the signed body is arriving rejects the event before persistence', async (t) => {

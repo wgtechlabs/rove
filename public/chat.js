@@ -6,6 +6,8 @@ export function mountChat(main, admin, api, expire, signout) {
   let settings;
   let current;
   let conversations = [];
+  let listState = 'active';
+  let nextCursor = null;
   let manager;
   const drafts = new Map();
   const actionRequests = new Map();
@@ -16,14 +18,18 @@ export function mountChat(main, admin, api, expire, signout) {
   main.innerHTML = `
     <aside class="sidebar" aria-label="Conversations">
       <div class="sidebar-heading"><h2>Conversations</h2><button id="new-chat" class="secondary" type="button">New chat</button></div>
+      <label class="small" for="conversation-filter">Show conversations</label><select id="conversation-filter"><option value="active">Active</option><option value="archived">Archived</option></select>
       <p id="list-status" class="small" role="status">Loading conversations…</p>
       <nav id="conversation-list" aria-label="Saved conversations"></nav>
+      <button id="load-conversations" class="secondary" type="button" hidden>Load more conversations</button>
       <div class="sidebar-account"><button id="manage-open" class="secondary" type="button">Customize Rove</button><button id="settings-open" class="secondary" type="button">Model settings</button><strong id="account-name"></strong><span id="account-email" class="small"></span><span class="small">Administrator</span></div>
     </aside>
     <div class="workspace-content">
       <p id="workspace-error" class="error" role="alert" tabindex="-1"></p><button id="reload-workspace" class="secondary" type="button" hidden>Reload workspace</button>
       <section id="chat-view" class="chat-view" aria-labelledby="chat-title">
-        <div class="chat-heading"><h1 id="chat-title" tabindex="-1">Start a conversation</h1><p id="model-label" class="small">Loading model settings…</p><button id="proposals-open" class="secondary" type="button">View proposals</button></div><div id="proposal-list" hidden></div>
+        <div class="chat-heading"><h1 id="chat-title" tabindex="-1">Start a conversation</h1><p id="model-label" class="small">Loading model settings…</p><div class="chat-actions"><button id="archive-chat" class="secondary" type="button" hidden>Archive conversation</button><button id="proposals-open" class="secondary" type="button">View proposals</button></div></div><div id="proposal-list" hidden></div>
+        <p id="conversation-notice" class="hint" role="status" hidden></p>
+        <p id="retention-notice" class="small">Private chat content expires after 14 days of inactivity. Archiving does not change this period.</p>
         <div id="messages" class="messages" role="log" aria-label="Messages" aria-live="polite" aria-relevant="additions"></div>
         <div id="chat-empty" class="chat-empty"><h2>A place to think things through.</h2><p id="empty-description">Connect a model, then start a conversation with Rove.</p><button id="connect-model" class="primary" type="button" hidden>Connect a model</button></div>
         <form id="composer" class="composer"><label for="message">Message Rove</label><textarea id="message" name="content" rows="3" maxlength="4000" placeholder="What would you like to work on?" required aria-describedby="composer-hint"></textarea><div class="composer-actions"><p id="composer-hint" class="small">Enter for a new line. Ctrl or ⌘ + Enter to send.</p><button id="send-message" class="primary" type="submit">Send message</button></div><p id="send-status" class="small" role="status"></p></form>
@@ -63,6 +69,7 @@ export function mountChat(main, admin, api, expire, signout) {
     find('#settings-open').disabled = value || !settings;
     find('#new-chat').disabled = value || !settings;
     find('#proposals-open').disabled = value || !current;
+    find('#archive-chat').disabled = value || !current;
     message.disabled =
       value || !settings?.configured || Boolean(current?.pending);
     send.disabled = value || !settings?.configured || Boolean(current?.pending);
@@ -108,7 +115,10 @@ export function mountChat(main, admin, api, expire, signout) {
     list.replaceChildren();
     find('#list-status').textContent = conversations.length
       ? ''
-      : 'Your conversations will appear here.';
+      : listState === 'archived'
+        ? 'No archived conversations.'
+        : 'Your active conversations will appear here.';
+    find('#load-conversations').hidden = !nextCursor;
     for (const conversation of conversations) {
       const button = document.createElement('button');
       button.type = 'button';
@@ -132,11 +142,32 @@ export function mountChat(main, admin, api, expire, signout) {
     }
   }
 
+  async function loadList(append = false, state = listState) {
+    const query = `?state=${state}${append && nextCursor ? `&cursor=${encodeURIComponent(nextCursor)}` : ''}`;
+    const result = await api(`/api/admin/conversations${query}`);
+    if (!alive) return;
+    listState = state;
+    find('#conversation-filter').value = state;
+    const incoming = result.conversations;
+    conversations = append
+      ? [
+          ...conversations,
+          ...incoming.filter(
+            (item) => !conversations.some((saved) => saved.id === item.id),
+          ),
+        ]
+      : incoming;
+    nextCursor = result.nextCursor;
+    renderList();
+  }
+
   function updateConversation(conversation) {
     current = conversation;
     find('#proposal-list').hidden = true;
     conversations = [
-      conversation,
+      ...(Boolean(conversation.archivedAt) === (listState === 'archived')
+        ? [conversation]
+        : []),
       ...conversations.filter((item) => item.id !== conversation.id),
     ];
     renderList();
@@ -212,6 +243,23 @@ export function mountChat(main, admin, api, expire, signout) {
       current?.messages.length || current?.pending,
     );
     find('#chat-title').textContent = current?.title || 'Start a conversation';
+    const archive = find('#archive-chat');
+    archive.hidden = !current;
+    archive.textContent = current?.archivedAt
+      ? 'Restore conversation'
+      : 'Archive conversation';
+    const notice = find('#conversation-notice');
+    notice.textContent = [
+      current?.archivedAt
+        ? 'Archived. Restore it or send a new message to return it to Active.'
+        : '',
+      current?.expiredAt
+        ? 'Earlier messages expired under the retention policy. They cannot be restored. You can continue with a new message.'
+        : '',
+    ]
+      .filter(Boolean)
+      .join(' ');
+    notice.hidden = !notice.textContent;
     message.value = drafts.get(current?.id)?.content || '';
     send.textContent = drafts.get(current?.id)?.requestId
       ? 'Retry message'
@@ -259,6 +307,32 @@ export function mountChat(main, admin, api, expire, signout) {
     document.title = 'Model settings · Rove';
     find('#settings-title').focus();
   }
+
+  find('#conversation-filter').onchange = () =>
+    run(async () => {
+      try {
+        await loadList(false, find('#conversation-filter').value);
+      } catch (failure) {
+        find('#conversation-filter').value = listState;
+        throw failure;
+      }
+    });
+  find('#load-conversations').onclick = () => run(() => loadList(true));
+  find('#archive-chat').onclick = () =>
+    run(async () => {
+      const result = await api(
+        `/api/admin/conversations/${current.id}/archive`,
+        {
+          archived: !current.archivedAt,
+          expectedUpdatedAt: current.updatedAt,
+        },
+      );
+      if (!alive) return;
+      updateConversation(result);
+      renderMessages();
+      await loadList();
+      find('#archive-chat').focus();
+    });
 
   find('#proposals-open').onclick = () =>
     run(async () => {
@@ -455,6 +529,7 @@ export function mountChat(main, admin, api, expire, signout) {
       settings = config;
       find('#reload-workspace').hidden = true;
       conversations = result.conversations;
+      nextCursor = result.nextCursor;
       renderSettings();
       renderList();
       find('#chat-title').focus();

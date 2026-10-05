@@ -123,6 +123,7 @@ test('chat routes require an administrator and same-origin writes; settings prot
     ['/api/admin/conversations', undefined],
     ['/api/admin/conversations', {}],
     [conversation, undefined],
+    [`${conversation}/archive`, { archived: true, expectedUpdatedAt: 0 }],
     [`${conversation}/messages`, { content: 'Hello', requestId: randomUUID() }],
   ] as const) {
     assert.equal((await f.raw(request(path, body))).status, 401, path);
@@ -588,4 +589,85 @@ test('a corrupt saved key fails safely and replacing the key restores the same r
   );
   assert.equal(f.calls.length, 1);
   assert.equal(f.calls[0]?.authorization, `Bearer ${apiKey}`);
+});
+
+test('archive HTTP routes preserve history, filter pages, protect stale writes and restore across restart', async (t) => {
+  const f = await fixture(t);
+  assert.equal((await f.fetch('/api/admin/settings', f.settings)).status, 200);
+  const path = await f.conversation();
+  const sent = await f.fetch(`${path}/messages`, {
+    content: 'Keep this conversation history',
+    requestId: randomUUID(),
+  });
+  assert.equal(sent.status, 200);
+  const original = await sent.json();
+  const archivedResponse = await f.fetch(`${path}/archive`, {
+    archived: true,
+    expectedUpdatedAt: original.updatedAt,
+  });
+  assert.equal(archivedResponse.status, 200);
+  const archived = await archivedResponse.json();
+  assert.ok(archived.archivedAt);
+  assert.deepEqual(archived.messages, original.messages);
+  assert.equal(archived.lastActivityAt, original.lastActivityAt);
+  const activePage = await (
+    await f.fetch('/api/admin/conversations?state=active')
+  ).json();
+  assert.equal(
+    activePage.conversations.some(
+      (item: { id: string }) => item.id === original.id,
+    ),
+    false,
+  );
+  const archivedPage = await (
+    await f.fetch('/api/admin/conversations?state=archived')
+  ).json();
+  assert.equal(archivedPage.conversations[0]?.id, original.id);
+  assert.equal(archivedPage.nextCursor, null);
+  assert.equal(
+    (await f.fetch('/api/admin/conversations?state=invalid')).status,
+    400,
+  );
+  assert.equal(
+    (await f.fetch('/api/admin/conversations?cursor=not-a-cursor')).status,
+    400,
+  );
+  assert.equal(
+    (
+      await f.fetch(`${path}/archive`, {
+        archived: false,
+        expectedUpdatedAt: original.updatedAt,
+      })
+    ).status,
+    409,
+  );
+  const restoredResponse = await f.fetch(`${path}/archive`, {
+    archived: false,
+    expectedUpdatedAt: archived.updatedAt,
+  });
+  assert.equal(restoredResponse.status, 200);
+  const restored = await restoredResponse.json();
+  assert.equal(restored.archivedAt, null);
+  await f.restart();
+  assert.deepEqual(await (await f.fetch(path)).json(), restored);
+  assert.equal(
+    (
+      await f.fetch(`${path}/archive`, {
+        archived: true,
+        expectedUpdatedAt: restored.updatedAt,
+      })
+    ).status,
+    200,
+  );
+  const resumedResponse = await f.fetch(`${path}/messages`, {
+    content: 'A new human message',
+    requestId: randomUUID(),
+  });
+  assert.equal(resumedResponse.status, 200);
+  const resumed = await resumedResponse.json();
+  assert.equal(resumed.archivedAt, null);
+  assert.deepEqual(resumed.messages.slice(0, 2), original.messages);
+  assert.equal(resumed.messages.length, 4);
+  assert.ok(resumed.lastActivityAt >= original.lastActivityAt);
+  assert.equal(f.calls.length, 2);
 });

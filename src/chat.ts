@@ -2,6 +2,11 @@ import { randomUUID } from 'node:crypto';
 import { type AgentTools, createAgent } from './agent.js';
 import { HttpError, textField } from './auth.js';
 import {
+  createConversationRetention,
+  type VisibilityResolver,
+} from './conversation-retention.js';
+import type { Sql } from './database.js';
+import {
   type Message,
   type ProviderSettings,
   providerURL,
@@ -42,10 +47,12 @@ export async function createChat(
       prompt TEXT NOT NULL, reply TEXT NOT NULL
     );`);
   const agent = await createAgent(config, tools);
+  const purgeTranscripts = await createConversationRetention(config);
   const { encrypt, decrypt } = createSecrets(config.authSecret);
   let stopping = false;
   let active: AbortController | undefined;
   const pending = new Set<Promise<unknown>>();
+  const retentionControllers = new Set<AbortController>();
 
   async function work<T>(
     metadata: TurnMetadata,
@@ -139,10 +146,127 @@ export async function createChat(
       return settings();
     });
   }
-  function list(scope = 'web') {
-    return db.all(
-      'SELECT id,title,updated_at AS "updatedAt" FROM rove_conversation WHERE scope=$1 ORDER BY updated_at DESC,id',
-      [scope],
+  async function listPage(
+    scope = 'web',
+    options: {
+      state?: 'active' | 'archived' | 'all';
+      limit?: number;
+      cursor?: string;
+    } = {},
+  ) {
+    const filter = options.state ?? 'active';
+    const limit = options.limit ?? 50;
+    if (
+      !['active', 'archived', 'all'].includes(filter) ||
+      !Number.isInteger(limit) ||
+      limit < 1 ||
+      limit > 100
+    )
+      throw new HttpError(
+        400,
+        'Choose active, archived or all and a page size from 1 to 100.',
+      );
+    let after: { updatedAt: number; id: string } | undefined;
+    if (options.cursor) {
+      try {
+        if (options.cursor.length > 1000) throw new Error('Invalid cursor');
+        const value = JSON.parse(
+          Buffer.from(options.cursor, 'base64url').toString(),
+        );
+        if (
+          value.scope !== scope ||
+          value.state !== filter ||
+          !Number.isSafeInteger(value.updatedAt) ||
+          typeof value.id !== 'string' ||
+          value.id.length > 100
+        )
+          throw new Error('Invalid cursor');
+        after = value;
+      } catch {
+        throw new HttpError(400, 'Invalid conversation page cursor.');
+      }
+    }
+    const items = await db.all<{
+      id: string;
+      title: string;
+      updatedAt: number;
+      archivedAt: number | null;
+      lastActivityAt: number;
+      expiredAt: number | null;
+    }>(
+      `SELECT id,title,updated_at AS "updatedAt",archived_at AS "archivedAt",
+       last_activity_at AS "lastActivityAt",expired_at AS "expiredAt"
+       FROM rove_conversation WHERE scope=$1
+       ${filter === 'active' ? 'AND archived_at IS NULL' : filter === 'archived' ? 'AND archived_at IS NOT NULL' : ''}
+       ${after ? 'AND (updated_at < $3 OR (updated_at=$3 AND id > $4))' : ''}
+       ORDER BY updated_at DESC,id LIMIT $2`,
+      after
+        ? [scope, limit + 1, after.updatedAt, after.id]
+        : [scope, limit + 1],
+    );
+    const hasMore = items.length > limit;
+    if (hasMore) items.pop();
+    const last = items.at(-1);
+    return {
+      items,
+      nextCursor:
+        hasMore && last
+          ? Buffer.from(
+              JSON.stringify({
+                scope,
+                state: filter,
+                updatedAt: last.updatedAt,
+                id: last.id,
+              }),
+            ).toString('base64url')
+          : null,
+    };
+  }
+  async function list(scope = 'web') {
+    return (await listPage(scope)).items;
+  }
+  async function archive(
+    id: string,
+    body: Record<string, unknown>,
+    scope = 'web',
+  ) {
+    if (
+      typeof body.archived !== 'boolean' ||
+      !Number.isSafeInteger(body.expectedUpdatedAt) ||
+      Object.keys(body).some(
+        (key) => !['archived', 'expectedUpdatedAt'].includes(key),
+      )
+    )
+      throw new HttpError(
+        400,
+        'Provide an archive choice and the current conversation timestamp.',
+      );
+    await state.assertOwned();
+    const changed = await db.run(
+      `UPDATE rove_conversation SET archived_at=CASE WHEN $1 THEN $2::bigint ELSE NULL END,
+       updated_at=GREATEST(updated_at+1,$2) WHERE id=$3 AND scope=$4 AND updated_at=$5`,
+      [body.archived, Date.now(), id, scope, body.expectedUpdatedAt],
+    );
+    if (!changed) {
+      if (
+        !(await db.get(
+          'SELECT 1 FROM rove_conversation WHERE id=$1 AND scope=$2',
+          [id, scope],
+        ))
+      )
+        throw new HttpError(404, 'Conversation not found.');
+      throw new HttpError(
+        409,
+        'This conversation changed. Reload it before changing its archive status.',
+      );
+    }
+    return get(id, scope);
+  }
+  async function acceptInput(tx: Sql, id: string, restore = true) {
+    await tx.run(
+      `UPDATE rove_conversation SET archived_at=CASE WHEN $3 THEN NULL ELSE archived_at END,expired_at=NULL,title_redacted=FALSE,
+       last_activity_at=$1,updated_at=GREATEST(updated_at+1,$1),retention_checked_at=0 WHERE id=$2`,
+      [Date.now(), id, restore],
     );
   }
   async function readMessages(
@@ -151,7 +275,7 @@ export async function createChat(
   ): Promise<Message[]> {
     return (
       await db.all(
-        'SELECT request_id,prompt,reply FROM rove_exchange WHERE conversation_id=$1 ORDER BY sequence',
+        'SELECT request_id,prompt,reply FROM rove_exchange WHERE conversation_id=$1 AND NOT expired ORDER BY sequence LIMIT 100',
         [id],
       )
     )
@@ -174,6 +298,12 @@ export async function createChat(
         [id],
       );
       if (!conversation) throw new HttpError(404, 'Conversation not found.');
+      if (
+        await tx.get('SELECT 1 FROM rove_run WHERE id=$1 AND expired', [
+          requestId,
+        ])
+      )
+        return;
       const inserted = await tx.run(
         `INSERT INTO rove_exchange(request_id,conversation_id,prompt,reply)
         VALUES($1,$2,$3,$4) ON CONFLICT(request_id) DO NOTHING`,
@@ -181,11 +311,11 @@ export async function createChat(
       );
       if (!inserted) return;
       const count = await tx.get(
-        'SELECT COUNT(*) AS count FROM rove_exchange WHERE conversation_id=$1',
+        'SELECT COUNT(*) AS count FROM rove_exchange WHERE conversation_id=$1 AND NOT expired',
         [id],
       );
       await tx.run(
-        'UPDATE rove_conversation SET title=$1,updated_at=$2 WHERE id=$3',
+        'UPDATE rove_conversation SET title=$1,updated_at=GREATEST(updated_at+1,$2) WHERE id=$3',
         [
           Number(count?.count) === 1
             ? content.slice(0, 80)
@@ -212,7 +342,7 @@ export async function createChat(
         await persist(id, run.id, run.prompt, run.answer || '');
     }
     const row = await db.get(
-      'SELECT id,title,updated_at AS "updatedAt" FROM rove_conversation WHERE id=$1 AND scope=$2',
+      'SELECT id,title,updated_at AS "updatedAt",archived_at AS "archivedAt",last_activity_at AS "lastActivityAt",expired_at AS "expiredAt" FROM rove_conversation WHERE id=$1 AND scope=$2',
       [id, scope],
     );
     if (!row) throw new HttpError(404, 'Conversation not found.');
@@ -223,6 +353,9 @@ export async function createChat(
       id: String(row.id),
       title: String(row.title),
       updatedAt: Number(row.updatedAt),
+      archivedAt: row.archivedAt === null ? null : Number(row.archivedAt),
+      lastActivityAt: Number(row.lastActivityAt),
+      expiredAt: row.expiredAt === null ? null : Number(row.expiredAt),
       messages: pending
         ? [...messages, { role: 'user' as const, content: pending.prompt }]
         : messages,
@@ -231,24 +364,10 @@ export async function createChat(
   async function create(scope = 'web') {
     await state.assertOwned();
     const id = randomUUID();
-    await db.transaction(async (tx) => {
-      // Creation is short; serialize its preview quota across concurrent requests.
-      await tx.exec('LOCK TABLE rove_conversation IN EXCLUSIVE MODE');
-      if (
-        Number(
-          (await tx.get('SELECT COUNT(*) AS count FROM rove_conversation'))
-            ?.count,
-        ) >= 200
-      )
-        throw new HttpError(
-          409,
-          'This preview supports up to 200 conversations.',
-        );
-      await tx.run(
-        'INSERT INTO rove_conversation(id,title,updated_at,scope) VALUES($1,$2,$3,$4)',
-        [id, 'New conversation', Date.now(), scope],
-      );
-    });
+    await db.run(
+      'INSERT INTO rove_conversation(id,title,updated_at,scope,last_activity_at) VALUES($1,$2,$3,$4,$3)',
+      [id, 'New conversation', Date.now(), scope],
+    );
     return get(id, scope);
   }
   async function send(
@@ -270,10 +389,15 @@ export async function createChat(
             .map((run) => run.id),
         );
         const previous = await db.get(
-          'SELECT conversation_id,prompt FROM rove_exchange WHERE request_id=$1',
+          'SELECT conversation_id,prompt,expired FROM rove_exchange WHERE request_id=$1',
           [requestId],
         );
         if (previous) {
+          if (previous.expired)
+            throw new HttpError(
+              410,
+              'This request has expired and cannot be replayed. Send a new message.',
+            );
           if (
             previous.conversation_id !== id ||
             previous.prompt !== content ||
@@ -308,6 +432,7 @@ export async function createChat(
           history,
           model,
           signal,
+          (tx) => acceptInput(tx, id),
         );
         if (result.status === 'done')
           await persist(id, requestId, content, result.answer || '');
@@ -358,6 +483,7 @@ export async function createChat(
           body.arguments,
           signal,
           revision,
+          (tx) => acceptInput(tx, id),
         );
         return get(id);
       },
@@ -377,6 +503,7 @@ export async function createChat(
           decision,
           provider,
           signal,
+          (tx) => acceptInput(tx, id, false),
         );
         if (result.status === 'done')
           await persist(id, result.id, result.prompt, result.answer || '');
@@ -387,12 +514,40 @@ export async function createChat(
   function cancelPending() {
     stopping = true;
     active?.abort();
+    for (const controller of retentionControllers) controller.abort();
   }
   return {
     settings,
     saveSettings,
     disconnect,
     list,
+    listPage,
+    archive,
+    async purgeExpired(
+      now = Date.now(),
+      resolveVisibility?: VisibilityResolver,
+    ) {
+      if (stopping) throw new ChatBusyError(503, 'Rove is restarting.');
+      const controller = new AbortController();
+      retentionControllers.add(controller);
+      const running = purgeTranscripts(
+        now,
+        resolveVisibility,
+        AbortSignal.any([
+          state.signal,
+          controller.signal,
+          AbortSignal.timeout(30_000),
+        ]),
+        (action) => work({ kind: 'retention' }, action),
+      );
+      pending.add(running);
+      try {
+        return await running;
+      } finally {
+        retentionControllers.delete(controller);
+        pending.delete(running);
+      }
+    },
     get,
     create,
     send,

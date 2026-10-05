@@ -4,7 +4,7 @@ Rove can install a released **Channel Plugin** containing a declarative signed
 JSON adapter. Core owns signature verification, access checks, conversation
 isolation, approvals and delivery. No package JavaScript runs. This is a protocol
 for a separately operated integration, not a claim that Telegram, Discord or a
-separately released Slack plugin is supported. Bundled Slack remains unchanged.
+separately released Slack plugin is supported. Bundled Slack remains available.
 
 Use the normal approved-repository installation and version lifecycle. A native
 package with `category: "channel"` declares:
@@ -72,7 +72,10 @@ A new event returns `202` after durable storage. A repeated event ID for the sam
 installation returns `200` without repeating execution or delivery. Keep provider
 event IDs stable across retries. Other installations and web/Slack conversations
 have separate identities and history. Events in a permitted workspace,
-destination and thread share a conversation.
+destination and thread share a conversation. Channel Plugin conversations use
+the private [14-day inactivity retention policy](../README.md#conversation-retention);
+this protocol does not establish public visibility. Active turns, pending approvals
+and unfinished jobs are protected from transcript expiry.
 
 Approvals reference the exact pending approval ID and use `approve`, `deny` or
 `resume`. Only configured approval users may send them, in the original thread.
@@ -95,8 +98,15 @@ approval ID so an administrator can request `resume`.
 
 An interrupted `processing` or `delivering` job becomes `uncertain` at restart.
 Pending and prepared replies survive restart, subject to current permissions.
-Event tombstones are retained: 10,000 total events and 500 outstanding jobs per
-deployment. Reaching either bound rejects new events; no automatic archival is
-implemented. Use one active core per deployment; PostgreSQL stores the durable
-queue and Redis enforces core ownership. Do not treat a controlled
-local integration test as proof of delivery to a live provider.
+The deployment admits at most 500 outstanding jobs. At that limit, new events
+are rejected while recognized duplicates still return `200`. There is no lifetime
+event ceiling. Terminal jobs clear message/reply content, routing and conversation
+references, approval details and credential snapshots, while keeping compact
+installation/event identities, outcome and completion-time receipts permanently.
+This preserves deduplication across old retries and restarts; it does not bound
+total database storage. Upgrades compact existing terminal jobs without discarding
+pending or prepared work.
+
+Use one active core per deployment; PostgreSQL stores the durable queue and Redis
+enforces core ownership. Do not treat a controlled local integration test as
+proof of delivery to a live provider.

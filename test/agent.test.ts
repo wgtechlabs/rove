@@ -416,3 +416,154 @@ test('completed approval recovers after exchange persistence failure and cannot 
   assert.equal(f.executions.length, 1);
   await assert.rejects(f.chat.decide(conversation.id, approval), /not found/);
 });
+
+test('accepted human input restores archived conversations and pending input advances retention activity', async (t) => {
+  const f = await fixture(t);
+  const conversation = await f.chat.create();
+  const old = Date.now() - 30 * 86_400_000;
+  await f.config.db.run(
+    'UPDATE rove_conversation SET last_activity_at=$1 WHERE id=$2',
+    [old, conversation.id],
+  );
+  const archived = await f.chat.archive(conversation.id, {
+    archived: true,
+    expectedUpdatedAt: conversation.updatedAt,
+  });
+  const request = { content: 'A new human request', requestId: randomUUID() };
+  const waiting = await f.chat.send(conversation.id, request);
+  assert.ok(waiting.pending);
+  assert.equal(waiting.archivedAt, null);
+  assert.ok(waiting.lastActivityAt > old);
+  assert.ok(waiting.updatedAt > archived.updatedAt);
+  const archivedPending = await f.chat.archive(conversation.id, {
+    archived: true,
+    expectedUpdatedAt: waiting.updatedAt,
+  });
+  const retried = await f.chat.send(conversation.id, request);
+  assert.equal(retried.archivedAt, archivedPending.archivedAt);
+  assert.equal(retried.lastActivityAt, waiting.lastActivityAt);
+  await assert.rejects(
+    f.chat.send(conversation.id, {
+      content: 'Conflicting request',
+      requestId: randomUUID(),
+    }),
+    /pending action/,
+  );
+  assert.equal(
+    (await f.chat.get(conversation.id)).archivedAt,
+    archivedPending.archivedAt,
+  );
+});
+
+test('a new message can resume an expired conversation without reviving prior transcripts or requests', async (t) => {
+  const f = await fixture(t);
+  f.answer();
+  const conversation = await f.chat.create();
+  const first = { content: 'Old private request', requestId: randomUUID() };
+  await f.chat.send(conversation.id, first);
+  const now = Date.now();
+  await f.config.db.run(
+    'UPDATE rove_conversation SET last_activity_at=$1 WHERE id=$2',
+    [now - 15 * 86_400_000, conversation.id],
+  );
+  assert.deepEqual(await f.chat.purgeExpired(now), { checked: 1, expired: 1 });
+  const resumed = await f.chat.send(conversation.id, {
+    content: 'New human request',
+    requestId: randomUUID(),
+  });
+  assert.equal(resumed.title, 'New human request');
+  assert.equal(resumed.expiredAt, null);
+  assert.deepEqual(resumed.messages, [
+    { role: 'user', content: 'New human request' },
+    { role: 'assistant', content: 'Verified answer.' },
+  ]);
+  assert.equal(
+    f.requests
+      .at(-1)
+      ?.messages.some((message) => message.content === first.content),
+    false,
+  );
+  const calls = f.requests.length;
+  await assert.rejects(f.chat.send(conversation.id, first), /expired/);
+  assert.equal(f.requests.length, calls);
+  await f.restart();
+  assert.deepEqual(
+    (await f.chat.get(conversation.id)).messages,
+    resumed.messages,
+  );
+});
+
+test('startup recovery materializes bounded unfinished batches as completed history grows', async (t) => {
+  const f = await fixture(t);
+  await f.config.db.exec(`INSERT INTO rove_run(id,conversation,scope,data)
+    SELECT 'historical-' || n,'historical-conversation','historical-scope',
+      jsonb_build_object('id','historical-' || n,'conversation','historical-conversation','scope','historical-scope',
+        'status','done','prompt','old prompt','history','[]'::jsonb,'steps',0)::text
+    FROM generate_series(1,1000) AS n;
+    INSERT INTO rove_run(id,conversation,scope,data)
+    SELECT 'executing-' || n,'recover-conversation','recover-scope',
+      jsonb_build_object('id','executing-' || n,'conversation','recover-conversation','scope','recover-scope',
+        'status','executing','prompt','old action','history','[]'::jsonb,'steps',1,'direct',true)::text
+    FROM generate_series(1,201) AS n;`);
+  const original = f.config.db.all;
+  const batchSizes: number[] = [];
+  f.config.db.all = async <T>(
+    sql: string,
+    params?: unknown[],
+  ): Promise<T[]> => {
+    const rows = await original<T>(sql, params);
+    if (sql.includes('rove_run')) batchSizes.push(rows.length);
+    return rows;
+  };
+  try {
+    await f.restart();
+  } finally {
+    f.config.db.all = original;
+  }
+  assert.deepEqual(batchSizes, [200, 1, 0]);
+  assert.equal(
+    (
+      await f.config.db.get(
+        "SELECT COUNT(*) AS count FROM rove_run WHERE status='executing'",
+      )
+    )?.count,
+    0,
+  );
+  assert.equal(
+    (
+      await f.config.db.get(
+        "SELECT COUNT(*) AS count FROM rove_run WHERE status='done'",
+      )
+    )?.count,
+    1201,
+  );
+  assert.equal(f.executions.length, 0);
+  assert.equal(f.requests.length, 0);
+});
+
+test('a fresh decision renews old pending activity while completed decision retries do not', async (t) => {
+  const f = await fixture(t);
+  const conversation = await f.chat.create();
+  const waiting = await f.chat.send(conversation.id, {
+    content: 'Review an old request',
+    requestId: randomUUID(),
+  });
+  assert.ok(waiting.pending);
+  const old = Date.now() - 20 * 86_400_000;
+  await f.config.db.run(
+    'UPDATE rove_conversation SET last_activity_at=$1 WHERE id=$2',
+    [old, conversation.id],
+  );
+  f.answer();
+  const approval = { approvalId: waiting.pending.id, decision: 'deny' };
+  const decided = await f.chat.decide(conversation.id, approval);
+  assert.ok(decided.lastActivityAt > old);
+  assert.equal(decided.pending, undefined);
+  assert.deepEqual(await f.chat.purgeExpired(Date.now()), {
+    checked: 0,
+    expired: 0,
+  });
+  const duplicate = await f.chat.decide(conversation.id, approval);
+  assert.equal(duplicate.lastActivityAt, decided.lastActivityAt);
+  assert.equal(f.executions.length, 0);
+});

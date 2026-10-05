@@ -9,6 +9,7 @@ import { createExtensions } from './extensions.js';
 import { createPluginChannels } from './plugin-channel.js';
 import { createPlugins } from './plugins.js';
 import { createRailwayRuntime } from './railway.js';
+import { createRetentionScheduler } from './retention-scheduler.js';
 import { closeRuntime, openRuntime } from './runtime.js';
 
 export const MAX_BODY = 32768;
@@ -46,6 +47,9 @@ export async function createApplication(
   let slack: Awaited<ReturnType<typeof createChannels>>;
   let plugins: Awaited<ReturnType<typeof createPlugins>>;
   let runtime: Awaited<ReturnType<typeof createRailwayRuntime>>;
+  let retention:
+    | Awaited<ReturnType<typeof createRetentionScheduler>>
+    | undefined;
   let installedChannels:
     | Awaited<ReturnType<typeof createPluginChannels>>
     | undefined;
@@ -123,6 +127,13 @@ export async function createApplication(
     } catch {
       console.error('Installed channels are unavailable.');
     }
+    retention = await createRetentionScheduler(config, () =>
+      chat.purgeExpired(Date.now(), ({ scope }, signal) =>
+        slack.retentionVisibility(scope, signal),
+      ),
+    );
+    cleanup.push(() => retention?.close());
+    retention.start();
   } catch (error) {
     for (const close of cleanup.reverse())
       await Promise.resolve()
@@ -133,7 +144,8 @@ export async function createApplication(
   }
   const json = (body: unknown, status = 200) => Response.json(body, { status });
   async function route(request: Request): Promise<Response> {
-    const path = new URL(request.url).pathname;
+    const url = new URL(request.url);
+    const path = url.pathname;
     if (path.startsWith('/api/')) await config.state.assertOwned();
     const channelRoute = /^\/api\/channels\/([a-f0-9-]{36})\/events$/.exec(
       path,
@@ -194,8 +206,22 @@ export async function createApplication(
           return json({ aips: await aips.list(`web:${aipRoute[1]}`) });
         }
         if (path === '/api/admin/settings') return json(await chat.settings());
-        if (path === '/api/admin/conversations')
-          return json({ conversations: await chat.list() });
+        if (path === '/api/admin/conversations') {
+          const state = url.searchParams.get('state') ?? 'active';
+          if (state !== 'active' && state !== 'archived' && state !== 'all')
+            throw new HttpError(
+              400,
+              'Choose active, archived or all conversations.',
+            );
+          const page = await chat.listPage('web', {
+            state,
+            cursor: url.searchParams.get('cursor') ?? undefined,
+          });
+          return json({
+            conversations: page.items,
+            nextCursor: page.nextCursor,
+          });
+        }
         const match = /^\/api\/admin\/conversations\/([a-f0-9-]{36})$/.exec(
           path,
         );
@@ -235,6 +261,8 @@ export async function createApplication(
         return json(await plugins.activate(values));
       if (path === '/api/admin/plugins/deactivate')
         return json(await plugins.deactivate(values));
+      if (path === '/api/admin/plugins/prune')
+        return json(await plugins.prune(values));
       if (path === '/api/admin/extensions')
         return json(await extensions.save(values));
       if (path === '/api/admin/extensions/probe') {
@@ -247,6 +275,10 @@ export async function createApplication(
       if (path === '/api/admin/slack') return json(await slack.save(values));
       if (path === '/api/admin/github')
         return json(await aips.saveSettings(values));
+      const archiveRoute =
+        /^\/api\/admin\/conversations\/([a-f0-9-]{36})\/archive$/.exec(path);
+      if (archiveRoute?.[1])
+        return json(await chat.archive(archiveRoute[1], values));
       const approvalRoute =
         /^\/api\/admin\/conversations\/([a-f0-9-]{36})\/approval$/.exec(path);
       if (approvalRoute?.[1])
@@ -303,6 +335,7 @@ export async function createApplication(
     throw new HttpError(404, 'Not found.');
   }
   function cancelPending() {
+    retention?.cancelPending();
     // Start the sandbox cleanup deadline before HTTP, channel, and chat drains.
     void runtime.close();
     installedChannels?.cancelPending();

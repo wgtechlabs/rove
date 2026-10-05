@@ -127,6 +127,14 @@ export async function createChannels(
         );
       }
     },
+    async retentionVisibility(
+      scope: string,
+      signal?: AbortSignal,
+    ): Promise<'public' | 'private'> {
+      return slack && !stopping
+        ? slack.retentionVisibility(scope, signal)
+        : 'private';
+    },
     async handle(request: Request) {
       if (
         request.method !== 'POST' ||

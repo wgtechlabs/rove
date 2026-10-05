@@ -11,7 +11,13 @@ const release = `if redis.call('GET', KEYS[1]) == ARGV[1] then
 export class RuntimeBusyError extends HttpError {}
 
 export interface TurnMetadata {
-  kind: 'message' | 'action' | 'approval' | 'settings';
+  kind:
+    | 'message'
+    | 'action'
+    | 'approval'
+    | 'settings'
+    | 'retention'
+    | 'archive';
   conversation?: string;
   scope?: string;
   requestId?: string;
