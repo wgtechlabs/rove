@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 
+## [2.0.0] - 2026-10-05
+
+### Changed
+
+- fix retention fairness and lifecycle focus
+- **BREAKING:** 📦 new! (core): add retention and lifecycle controls (#14)
+- sync railway 1.0.1 release and deploy link (#12)
+
 ## [1.0.1] - 2026-10-03
 
 ### Changed
