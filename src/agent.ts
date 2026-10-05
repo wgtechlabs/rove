@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { HttpError } from './auth.js';
+import type { Sql } from './database.js';
 import {
   complete,
   type ProviderSettings,
@@ -35,6 +36,7 @@ interface Run {
   steps: number;
   answer?: string;
   direct?: true;
+  expired?: true;
   pending?: {
     id: string;
     name: string;
@@ -52,37 +54,63 @@ export async function createAgent(config: RuntimeConfig, tools: AgentTools) {
   await db.migrate(`CREATE TABLE IF NOT EXISTS rove_run(
     sequence BIGINT GENERATED ALWAYS AS IDENTITY UNIQUE,
     id TEXT PRIMARY KEY, conversation TEXT NOT NULL, scope TEXT NOT NULL, data TEXT NOT NULL
-  )`);
+  );
+  ALTER TABLE rove_run ADD COLUMN IF NOT EXISTS status TEXT GENERATED ALWAYS AS ((data::jsonb)->>'status') STORED;
+  ALTER TABLE rove_run ADD COLUMN IF NOT EXISTS expired BOOLEAN NOT NULL DEFAULT FALSE;
+  CREATE INDEX IF NOT EXISTS rove_run_active ON rove_run(conversation,scope,sequence) WHERE status IS DISTINCT FROM 'done';
+  CREATE INDEX IF NOT EXISTS rove_run_recovery ON rove_run(sequence) WHERE status = 'executing';
+  CREATE INDEX IF NOT EXISTS rove_run_completed ON rove_run(conversation,scope,sequence) WHERE status = 'done' AND NOT expired;
+  CREATE INDEX IF NOT EXISTS rove_run_approval ON rove_run(conversation,scope,((data::jsonb)->'pending'->>'id')) WHERE status = 'done' AND NOT expired;`);
   const read = async (id: string): Promise<Run | undefined> => {
     const row = await db.get('SELECT data FROM rove_run WHERE id=$1', [id]);
-    return row ? JSON.parse(String(row.data)) : undefined;
+    const run = row ? (JSON.parse(String(row.data)) as Run) : undefined;
+    if (run?.expired)
+      throw new HttpError(
+        410,
+        'This request has expired and cannot be replayed. Send a new message.',
+      );
+    return run;
   };
-  async function save(run: Run, expected?: string) {
+  async function save(
+    run: Run,
+    expected?: string,
+    onAccepted?: (tx: Sql) => Promise<void>,
+  ) {
     await state.assertOwned();
     const data = JSON.stringify(run);
-    const changed =
+    const write = (tx: Sql) =>
       expected === undefined
-        ? await db.run(
+        ? tx.run(
             'INSERT INTO rove_run(id,conversation,scope,data) VALUES($1,$2,$3,$4) ON CONFLICT(id) DO NOTHING',
             [run.id, run.conversation, run.scope, data],
           )
-        : await db.run('UPDATE rove_run SET data=$1 WHERE id=$2 AND data=$3', [
-            data,
-            run.id,
-            expected,
-          ]);
+        : tx.run(
+            'UPDATE rove_run SET data=$1 WHERE id=$2 AND data::jsonb=$3::jsonb',
+            [data, run.id, expected],
+          );
+    const changed = onAccepted
+      ? await db.transaction(async (tx) => {
+          const inserted = await write(tx);
+          if (inserted) await onAccepted(tx);
+          return inserted;
+        })
+      : await write(db);
     if (!changed)
       throw new HttpError(
         409,
         'The saved action changed. Reload this conversation.',
       );
   }
-  async function toolResult(run: Run, result: string) {
+  async function toolResult(
+    run: Run,
+    result: string,
+    onAccepted?: (tx: Sql) => Promise<void>,
+  ) {
     const expected = JSON.stringify(run);
     if (run.direct) {
       run.answer = result.slice(0, 24000);
       run.status = 'done';
-      await save(run, expected);
+      await save(run, expected, onAccepted);
       return;
     }
     const last = run.history.at(-1);
@@ -94,25 +122,26 @@ export async function createAgent(config: RuntimeConfig, tools: AgentTools) {
       content: result.slice(0, 24000),
     });
     run.status = 'ready';
-    await save(run, expected);
+    await save(run, expected, onAccepted);
   }
-  for (const row of await db.all('SELECT data FROM rove_run', [])) {
-    const run: Run = JSON.parse(String(row.data));
-    if (run.status === 'executing')
+  // Recovery reads only unfinished executions in bounded batches, never lifetime history.
+  for (;;) {
+    const rows = await db.all(
+      "SELECT data FROM rove_run WHERE status='executing' ORDER BY sequence LIMIT 200",
+    );
+    if (!rows.length) break;
+    for (const row of rows)
       await toolResult(
-        run,
+        JSON.parse(String(row.data)) as Run,
         'Action outcome unknown after restart. Check the external system before proposing another action. This call will not be repeated.',
       );
   }
   async function active(conversation: string, scope: string) {
-    for (const row of await db.all(
-      'SELECT data FROM rove_run WHERE conversation=$1 AND scope=$2',
+    const row = await db.get(
+      "SELECT data FROM rove_run WHERE conversation=$1 AND scope=$2 AND status IS DISTINCT FROM 'done' ORDER BY sequence LIMIT 1",
       [conversation, scope],
-    )) {
-      const run: Run = JSON.parse(String(row.data));
-      if (run.status !== 'done') return run;
-    }
-    return undefined;
+    );
+    return row ? (JSON.parse(String(row.data)) as Run) : undefined;
   }
   function view(run: Run) {
     return run.status === 'done' || !run.pending
@@ -124,6 +153,7 @@ export async function createAgent(config: RuntimeConfig, tools: AgentTools) {
     provider: ProviderSettings,
     signal: AbortSignal,
     initial = false,
+    onAccepted?: (tx: Sql) => Promise<void>,
   ) {
     if (run.status === 'waiting' || run.status === 'done') return run;
     const available = (await tools.tools(run.scope, signal)).filter((tool) =>
@@ -187,7 +217,7 @@ export async function createAgent(config: RuntimeConfig, tools: AgentTools) {
       run.answer = result.content;
       run.status = 'done';
     }
-    await save(run, initial ? undefined : expected);
+    await save(run, initial ? undefined : expected, onAccepted);
     return run;
   }
   async function completed(
@@ -196,7 +226,7 @@ export async function createAgent(config: RuntimeConfig, tools: AgentTools) {
   ): Promise<Run[]> {
     return (
       await db.all(
-        'SELECT data FROM rove_run WHERE conversation=$1 AND scope=$2 ORDER BY sequence',
+        "SELECT data FROM rove_run WHERE conversation=$1 AND scope=$2 AND status='done' AND NOT expired ORDER BY sequence LIMIT 100",
         [conversation, scope],
       )
     )
@@ -213,6 +243,7 @@ export async function createAgent(config: RuntimeConfig, tools: AgentTools) {
       args: unknown,
       signal: AbortSignal,
       expectedRevision?: string,
+      onAccepted?: (tx: Sql) => Promise<void>,
     ) {
       if (scope !== `web:${conversation}`)
         throw new HttpError(
@@ -298,7 +329,7 @@ export async function createAgent(config: RuntimeConfig, tools: AgentTools) {
           description: definition.description,
         },
       };
-      await save(run);
+      await save(run, undefined, onAccepted);
       return run;
     },
     async pending(conversation: string, scope: string) {
@@ -313,6 +344,7 @@ export async function createAgent(config: RuntimeConfig, tools: AgentTools) {
       history: WireMessage[],
       provider: ProviderSettings,
       signal: AbortSignal,
+      onAccepted?: (tx: Sql) => Promise<void>,
     ) {
       const previous = await read(id);
       if (
@@ -341,7 +373,13 @@ export async function createAgent(config: RuntimeConfig, tools: AgentTools) {
         status: 'ready' as const,
         steps: 0,
       };
-      return advance(run, provider, signal, !previous);
+      return advance(
+        run,
+        provider,
+        signal,
+        !previous,
+        previous ? undefined : onAccepted,
+      );
     },
     async decide(
       conversation: string,
@@ -350,10 +388,13 @@ export async function createAgent(config: RuntimeConfig, tools: AgentTools) {
       decision: string,
       provider: () => Promise<ProviderSettings>,
       signal: AbortSignal,
+      onAccepted?: (tx: Sql) => Promise<void>,
     ) {
-      const done = (await completed(conversation, scope)).find(
-        (run) => run.pending?.id === approvalId,
+      const row = await db.get(
+        "SELECT data FROM rove_run WHERE conversation=$1 AND scope=$2 AND status='done' AND NOT expired AND (data::jsonb)->'pending'->>'id'=$3 LIMIT 1",
+        [conversation, scope, approvalId],
       );
+      const done = row ? (JSON.parse(String(row.data)) as Run) : undefined;
       if (done) {
         if (!done.direct) await provider();
         return done;
@@ -366,12 +407,14 @@ export async function createAgent(config: RuntimeConfig, tools: AgentTools) {
         throw new HttpError(400, 'Choose approve or deny.');
       if (run.status === 'executing')
         throw new HttpError(409, 'This action is already running.');
+      const resumed = run.status === 'ready';
       if (run.status === 'waiting') {
         const pending = run.pending;
         if (decision === 'deny')
           await toolResult(
             run,
             'Administrator denied this action. Do not repeat it without a new explicit request.',
+            onAccepted,
           );
         else {
           if (Date.now() - pending.created > 15 * 60_000)
@@ -398,7 +441,7 @@ export async function createAgent(config: RuntimeConfig, tools: AgentTools) {
             );
           const expected = JSON.stringify(run);
           run.status = 'executing';
-          await save(run, expected); // Consume the approval before the first external side effect.
+          await save(run, expected, onAccepted); // Consume the approval before the first external side effect.
           let result: string;
           try {
             await state.assertOwned();
@@ -422,7 +465,13 @@ export async function createAgent(config: RuntimeConfig, tools: AgentTools) {
       }
       if (!model) return run;
       // A failed model continuation resumes from the saved result, never from the action.
-      return advance(run, model, signal);
+      return advance(
+        run,
+        model,
+        signal,
+        false,
+        resumed ? onAccepted : undefined,
+      );
     },
   };
 }

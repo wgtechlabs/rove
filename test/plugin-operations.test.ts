@@ -391,6 +391,15 @@ test('in-flight calls block configuration, release and source changes, and shutd
       }),
     /current plugin call/,
   );
+  const current = await f.current();
+  await assert.rejects(
+    f.plugins.prune({
+      id: current.id,
+      revision: current.revision,
+      digest: current.versions[0]?.digest,
+    }),
+    /current plugin call/,
+  );
   await assert.rejects(f.activate(), /current plugin call/);
   await assert.rejects(
     f.plugins.install({ repo, tag: 'v2.0.0' }),

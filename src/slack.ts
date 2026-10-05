@@ -154,12 +154,14 @@ export async function createSlack(
     method: string,
     token: string,
     body: Record<string, unknown>,
+    requestSignal?: AbortSignal,
   ) {
     await config.state.assertOwned();
     if (stopping) throw new HttpError(503, 'Rove is restarting.');
     const signal = AbortSignal.any([
       config.state.signal,
       AbortSignal.timeout(10000),
+      ...(requestSignal ? [requestSignal] : []),
       ...(active ? [active.signal] : []),
     ]);
     const response = await fetch(`https://slack.com/api/${method}`, {
@@ -301,6 +303,44 @@ export async function createSlack(
       active = undefined;
       finishSave();
       saveDone = undefined;
+    }
+  }
+  async function retentionVisibility(
+    scope: string,
+    signal?: AbortSignal,
+  ): Promise<'public' | 'private'> {
+    const [, team, channel, thread, extra] = scope.split(':');
+    if (
+      !scope.startsWith('slack:') ||
+      extra ||
+      !team ||
+      !channel ||
+      !thread ||
+      !slackId(channel) ||
+      !timestamp(thread) ||
+      channel.startsWith('D')
+    )
+      return 'private';
+    try {
+      const state = await saved();
+      if (state.teamId !== team || !state.botToken) return 'private';
+      const response = await api(
+        'conversations.info',
+        secrets.decrypt(state.botToken),
+        { channel },
+        signal,
+      );
+      const info = object(response.channel);
+      // Only current provider metadata can select the longer public retention window.
+      return info.id === channel &&
+        info.is_channel === true &&
+        info.is_private === false &&
+        info.is_im !== true &&
+        info.is_mpim !== true
+        ? 'public'
+        : 'private';
+    } catch {
+      return 'private';
     }
   }
   async function verify(request: Request, state: Settings) {
@@ -764,6 +804,7 @@ export async function createSlack(
   }
   return {
     settings,
+    retentionVisibility,
     save,
     handle,
     start,

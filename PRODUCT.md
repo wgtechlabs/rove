@@ -18,6 +18,23 @@ Rove is a company-neutral agent framework that companies teach their workflows t
 
 Web is the default setup, administration and conversation surface. Slack is the first optional external channel. No CLI for the MVP. Docker and Railway deployment must work without mandatory Vercel services. One company per deployment; one initial admin. Email/password login, deployment-secret-protected setup, no public registration, and account recovery are agreed. This implementation includes authentication, an administrator-only web chat, saved conversations, and web configuration of an OpenAI-compatible model endpoint and system instructions. The MVP includes administrator approval for each tool call, Markdown skills, local skill bundles, versioned Agent Plugin releases from approved GitHub repositories, remote Streamable HTTP MCP, optional signed Slack events/interactivity, and source-conversation AIPs finalized through GitHub draft PRs. AIP activation requires explicit review of the final PR revision, a matching merged commit and verified release workflow/artifact, followed by separate activation. Plugin settings and secret bindings are owned by the dashboard; release content is immutable. Installed releases can be deactivated, upgraded or rolled back independently of core. User Plugins provide offline tools, dashboard actions, text pages and agent workflow steps through the shared approval path. Execution uses fresh Railway sandboxes and checks containment before loading source; live Railway compatibility remains unverified. Channel Plugins support an installed signed JSON gateway. Bundled Slack remains the transitional channel implementation; external plugin repositories and the marketplace come later. Chat uses bounded, non-streaming text requests and one active reply per deployment.
 
+Conversation lists are paginated with archive and restore, without a lifetime
+conversation ceiling. Automatic retention checks at most 200 candidates per daily
+04:00 UTC sweep, rotates candidates fairly, catches up after downtime and retries
+failures. Private content expires after 14 days of inactivity; Slack channels
+verified public through current metadata use 90 days. Web and unknown channels
+are private. Active turns, pending approvals and unfinished jobs are protected.
+Archiving does not extend retention. Expiration clears transcript and copied tool
+content, redacts private titles and keeps minimal identity receipts plus separate
+AIP evidence. Existing old conversations are eligible after upgrade.
+
+Plugin installations cache at most 16 release payloads. Administrators can prune
+inactive versions while preserving active and previous activated rollback versions,
+immutable source identities, provenance and AIP evidence; downloading a pruned
+release again requires its exact original identity. Channel Plugins allow 500
+active jobs and retain compact event deduplication receipts permanently, with no
+lifetime event ceiling. Receipt storage therefore continues to grow.
+
 PostgreSQL with pgvector is the durable store; Redis coordinates core ownership,
 active turns and credential attempt limits. Both are required. Deploy one active
 Rove core with persistent PostgreSQL and Redis services; the app container needs

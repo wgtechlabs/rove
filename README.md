@@ -32,7 +32,7 @@ supplies the knowledge, policies and workflows.
 | Web interface with Rove’s cyan identity | Available |
 | Protected first-admin setup, sign-in and account recovery | Available |
 | PostgreSQL storage, pgvector readiness, Redis runtime state and Docker configuration | Available |
-| AI web chat with saved conversations | Available |
+| AI web chat with saved conversations, archive and retention | Available |
 | Web configuration for model connection and system instructions | Available |
 | Optional Slack channel, activated from the web interface | Implemented |
 | Installable signed JSON channel gateway | Implemented; provider plugins are separate |
@@ -184,11 +184,33 @@ approvals survive reloads and interrupted replies can continue without repeating
 seconds for a reply and cancels pending requests on shutdown with a retryable
 error. Drafts are held in the current browser page and are lost on reload.
 
-This preview runs one reply at a time, supports 200 conversations with up to 100
-replies each, and accepts messages up to 4,000 characters. Each request includes
+This preview runs one reply at a time, supports up to 100 retained replies per
+conversation, and accepts messages up to 4,000 characters. Each request includes
 at most the latest 20 exchanges within a 60,000-character history budget. Older
-history remains visible but may not be sent to the model. Start a new conversation
-when you reach its limit. Conversation deletion is not available yet.
+retained history remains visible but may not be sent to the model. Conversation
+lists are paginated, with no lifetime conversation ceiling. Use **Archive
+conversation** to remove a chat from the active list, then **Archived** to find
+and restore it. Archiving and restoring do not reset its retention period.
+
+### Conversation retention
+
+Content expires after 14 days of inactivity for private conversations, or 90 days
+for Slack channels verified as public through current Slack metadata. Web chats,
+Channel Plugin conversations, and unknown or inaccessible Slack channels use the
+private window. Archiving does not preserve content past these limits.
+
+Automatic cleanup runs daily at 04:00 UTC, checks at most 200 candidates per
+sweep, and rotates checked conversations so an older backlog keeps progressing.
+The scheduler catches up after downtime and retries failed sweeps. Active turns,
+pending approvals and unfinished channel jobs are protected. Expiration clears
+transcripts and copied prompts, arguments and tool results; private conversation
+titles are also redacted. Minimal conversation/request receipts and separately
+saved AIP evidence remain. Restoring an archived chat cannot recover expired
+messages; new messages can continue the conversation.
+
+**Upgrade note:** this policy also applies to existing conversations using their
+saved activity timestamps. Old transcripts may be eligible on the first catch-up
+sweep after an upgrade. Preserve any needed database backup before updating.
 
 ## Customize your agent
 
@@ -198,7 +220,8 @@ Open **Customize Rove** after signing in:
   characters per skill and 24,000 across saved skills and bundles.
 - **Plugins:** approve an exact GitHub repository, prepare a release, review its
   contents and permissions, configure settings and secrets, then activate it.
-  Keep previous versions for rollback. See the [package contract](docs/plugins.md)
+  Prune inactive cached versions when needed; the active and previous activated
+  rollback versions stay protected. See the [package contract](docs/plugins.md)
   and [supported imports](docs/compatibility.md).
 - **Pages & actions:** open company pages and request actions from active plugins.
   Review and approve each action in chat; dashboard actions need no model connection.
@@ -226,8 +249,10 @@ a connection. Only connect servers your company trusts.
 ### Enable Slack
 
 1. Create and install a Slack app with `app_mentions:read`, `im:history`, and
-   `chat:write`. Subscribe to `app_mention` and `message.im`; enable the App Home
-   Messages tab.
+   `chat:write`. Add `channels:read` and `groups:read` for current channel metadata
+   used by retention classification. Without usable metadata, Rove applies the
+   private 14-day window. Subscribe to `app_mention` and `message.im`; enable the
+   App Home Messages tab.
 2. Under **Customize Rove → Slack**, save the bot token, signing secret, allowed
    user IDs, allowed channel IDs, and explicit administrator user IDs. Every Slack
    administrator must also be an allowed user. Enable DMs only if wanted.
@@ -247,9 +272,10 @@ Use an allowed channel with an administrator for that work.
 Slack events are acknowledged into a durable queue and deduplicated. Delivered
 queue payloads are cleared immediately; terminal job metadata and failed or
 uncertain deliveries expire after seven days. Older approval buttons expire with
-their origin record. Active work and conversation history are retained. Rate-limited
-responses retry from the saved reply. Unknown delivery outcomes are retained for
-manual checking instead of blindly posting duplicates. Run one replica.
+their origin record. Active work is protected; conversation history follows the
+[retention policy](#conversation-retention). Rate-limited responses retry from the
+saved reply. Unknown delivery outcomes are retained for manual checking instead
+of blindly posting duplicates. Run one replica.
 
 ### Improve through AIPs
 

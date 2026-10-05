@@ -203,6 +203,62 @@ async function fixture(t: TestContext) {
   };
 }
 
+test('retention uses current verified Slack visibility and defaults unknown channels to private', async (t) => {
+  const f = await fixture(t);
+  let calls = 0;
+  let channel: Record<string, unknown> = {
+    id: 'CROOM',
+    is_channel: true,
+    is_private: false,
+  };
+  let fail = false;
+  t.mock.method(
+    globalThis,
+    'fetch',
+    async (url: string | URL | Request, init?: RequestInit) => {
+      calls++;
+      assert.equal(String(url), 'https://slack.com/api/conversations.info');
+      assert.equal(
+        new Headers(init?.headers).get('authorization'),
+        `Bearer ${token}`,
+      );
+      assert.deepEqual(JSON.parse(String(init?.body)), { channel: 'CROOM' });
+      init?.signal?.throwIfAborted();
+      return Response.json(
+        fail ? { ok: false, error: 'missing_scope' } : { ok: true, channel },
+      );
+    },
+  );
+  const scope = 'slack:TTEAM:CROOM:1000.000001';
+  assert.equal(await f.slack.retentionVisibility(scope), 'public');
+  channel.is_private = true;
+  assert.equal(await f.slack.retentionVisibility(scope), 'private');
+  channel = { id: 'CROOM', is_channel: true };
+  assert.equal(await f.slack.retentionVisibility(scope), 'private');
+  channel = { id: 'COTHER', is_channel: true, is_private: false };
+  assert.equal(await f.slack.retentionVisibility(scope), 'private');
+  channel = { id: 'CROOM', is_channel: true, is_private: false, is_mpim: true };
+  assert.equal(await f.slack.retentionVisibility(scope), 'private');
+  fail = true;
+  assert.equal(await f.slack.retentionVisibility(scope), 'private');
+  const before = calls;
+  for (const privateScope of [
+    'web',
+    'slack:TOTHER:CROOM:1000.000001',
+    'slack:TTEAM:DROOM:1000.000001',
+    'slack:TTEAM:CROOM:invalid',
+  ]) {
+    assert.equal(await f.slack.retentionVisibility(privateScope), 'private');
+  }
+  assert.equal(calls, before);
+  fail = false;
+  channel = { id: 'CROOM', is_channel: true, is_private: false };
+  assert.equal(
+    await f.slack.retentionVisibility(scope, AbortSignal.abort()),
+    'private',
+  );
+});
+
 test('Slack configuration encrypts credentials and validates signed challenges without browser Origin', async (t) => {
   const f = await fixture(t);
   const visible = await f.slack.settings();

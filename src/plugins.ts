@@ -11,6 +11,7 @@ import {
   type ManagedExtension,
 } from './extensions.js';
 import { mcpURL } from './mcp.js';
+import { createPluginCache } from './plugin-cache.js';
 import { type ActiveChannel, channelAccess } from './plugin-channel.js';
 import {
   compatibility,
@@ -77,10 +78,6 @@ interface Installation {
   environmentFingerprint?: string;
   channelAccess?: z.infer<typeof channelAccess>;
 }
-type ReleaseSummary = Pick<
-  PluginPackage,
-  'name' | 'description' | 'category' | 'version'
-> & { tag: string };
 const hash = (value: string) =>
   createHash('sha256').update(value).digest('hex');
 function parse<T>(schema: z.ZodType<T>, value: unknown): T {
@@ -106,13 +103,11 @@ export async function createPlugins(
   await db.migrate(`
     CREATE TABLE IF NOT EXISTS rove_plugin_source(repo TEXT PRIMARY KEY, token TEXT NOT NULL, approved INTEGER NOT NULL, revision TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS rove_plugin_installation(id TEXT PRIMARY KEY, repo TEXT NOT NULL, plugin_id TEXT NOT NULL, data TEXT NOT NULL, sequence BIGINT GENERATED ALWAYS AS IDENTITY, UNIQUE(repo,plugin_id));
-    CREATE TABLE IF NOT EXISTS rove_plugin_artifact(digest TEXT PRIMARY KEY, repo TEXT NOT NULL, plugin_id TEXT NOT NULL, version TEXT NOT NULL, data TEXT NOT NULL, summary TEXT, sequence BIGINT GENERATED ALWAYS AS IDENTITY, UNIQUE(repo,plugin_id,version));
     CREATE TABLE IF NOT EXISTS rove_plugin_audit(id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, installation TEXT NOT NULL, event TEXT NOT NULL, digest TEXT, at BIGINT NOT NULL);
-    UPDATE rove_plugin_artifact SET summary=jsonb_build_object(
-      'name',data::jsonb->'manifest'->>'name',
-      'description',data::jsonb->'manifest'->>'description',
-      'category',data::jsonb->'manifest'->>'category',
-      'version',version,'tag',data::jsonb->>'tag')::text WHERE summary IS NULL;`);
+    CREATE INDEX IF NOT EXISTS rove_plugin_audit_recent ON rove_plugin_audit(installation,id DESC);
+    CREATE INDEX IF NOT EXISTS rove_plugin_audit_activated ON rove_plugin_audit(installation,id DESC) WHERE event='activated';
+    `);
+  const cache = await createPluginCache(db);
   const lifetime = new AbortController();
   const shutdown = AbortSignal.any([lifetime.signal, config.state.signal]);
   let closed = false;
@@ -187,22 +182,8 @@ export async function createPlugins(
       [item.id, event, digest, Date.now()],
     );
   }
-  async function artifact(digest: string): Promise<VerifiedRelease> {
-    const row = await db.get(
-      'SELECT data FROM rove_plugin_artifact WHERE digest=$1',
-      [digest],
-    );
-    if (!row) throw new HttpError(404, 'Plugin release not found.');
-    const release = JSON.parse(String(row.data)) as VerifiedRelease;
-    if (hash(release.bytes) !== digest)
-      throw new HttpError(
-        409,
-        'The cached artifact failed its integrity check. Restore a verified backup.',
-      );
-    return { ...release, manifest: parsePackage(JSON.parse(release.bytes)) };
-  }
   async function selected(item: Installation, digest: string) {
-    const release = await artifact(digest);
+    const release = await cache.artifact(digest);
     if (
       release.repo.toLowerCase() !== item.repo ||
       release.manifest.id !== item.pluginId
@@ -271,15 +252,7 @@ export async function createPlugins(
               },
             ]),
           ),
-          versions: (
-            await db.all(
-              'SELECT digest,summary FROM rove_plugin_artifact WHERE repo=$1 AND plugin_id=$2 ORDER BY sequence DESC',
-              [item.repo, item.pluginId],
-            )
-          ).map((row) => ({
-            digest: String(row.digest),
-            ...(JSON.parse(String(row.summary)) as ReleaseSummary),
-          })),
+          ...(await cache.versions(item)),
           audit: await db.all(
             'SELECT event,digest,at FROM rove_plugin_audit WHERE installation=$1 ORDER BY id DESC LIMIT 30',
             [item.id],
@@ -344,43 +317,7 @@ export async function createPlugins(
     const repo = parse(repositoryName, release.repo);
     await assertApproved(repo);
     const manifest = parsePackage(JSON.parse(release.bytes));
-    if (hash(release.bytes) !== release.digest)
-      throw new HttpError(409, 'Release digest does not match its bytes.');
-    const sameBytes = await db.get(
-      'SELECT repo,plugin_id FROM rove_plugin_artifact WHERE digest=$1',
-      [release.digest],
-    );
-    if (
-      sameBytes &&
-      (sameBytes.repo !== repo || sameBytes.plugin_id !== manifest.id)
-    )
-      throw new HttpError(
-        409,
-        'These identical artifact bytes are already associated with another source.',
-      );
     for (const server of manifest.servers) mcpURL(server.url, config.baseURL);
-    const previous = await db.get(
-      'SELECT digest FROM rove_plugin_artifact WHERE repo=$1 AND plugin_id=$2 AND version=$3',
-      [repo, manifest.id, manifest.version],
-    );
-    if (previous && previous.digest !== release.digest)
-      throw new HttpError(
-        409,
-        'This version was already installed with different bytes. Publish a new version.',
-      );
-    if (previous) {
-      const pinned = await artifact(String(previous.digest));
-      if (
-        pinned.tag !== release.tag ||
-        pinned.commit !== release.commit ||
-        pinned.assetId !== release.assetId ||
-        JSON.stringify(pinned.origin) !== JSON.stringify(release.origin)
-      )
-        throw new HttpError(
-          409,
-          'This version is already pinned to a different release identity. Publish a new version rather than replacing its source or notices.',
-        );
-    }
     let item = (await installations()).find(
       (entry) => entry.repo === repo && entry.pluginId === manifest.id,
     );
@@ -389,39 +326,8 @@ export async function createPlugins(
         409,
         'This deployment supports 16 plugin installations.',
       );
-    if (
-      !previous &&
-      Number(
-        (
-          await db.get(
-            'SELECT COUNT(*) AS count FROM rove_plugin_artifact WHERE repo=$1 AND plugin_id=$2',
-            [repo, manifest.id],
-          )
-        )?.count,
-      ) >= 16
-    )
-      throw new HttpError(
-        409,
-        'This installation retains at most 16 releases. Export a backup before pruning through a future maintenance release.',
-      );
     return db.transaction(async (tx) => {
-      await tx.run(
-        'INSERT INTO rove_plugin_artifact(digest,repo,plugin_id,version,data,summary) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(digest) DO NOTHING',
-        [
-          release.digest,
-          repo,
-          manifest.id,
-          manifest.version,
-          JSON.stringify({ ...release, repo, manifest }),
-          JSON.stringify({
-            name: manifest.name,
-            description: manifest.description,
-            category: manifest.category,
-            version: manifest.version,
-            tag: release.tag,
-          } satisfies ReleaseSummary),
-        ],
-      );
+      const downloaded = await cache.store(tx, release);
       if (!item) {
         item = {
           id: randomUUID(),
@@ -434,7 +340,7 @@ export async function createPlugins(
           grants: [],
         };
         await write(tx, item, 'installed', release.digest);
-      } else if (!previous)
+      } else if (downloaded)
         await write(tx, item, 'release-prepared', release.digest);
       return item;
     });
@@ -695,6 +601,16 @@ export async function createPlugins(
     );
     return await list();
   }
+  async function prune(body: unknown) {
+    mutable();
+    const input = parse(activation, body);
+    const item = await current(input.id, input.revision);
+    await db.transaction(async (tx) => {
+      await cache.prune(tx, item, input.digest);
+      await write(tx, item, 'cache-pruned', input.digest);
+    });
+    return await list();
+  }
   async function activeChannel(id: string): Promise<ActiveChannel | undefined> {
     if (closed) return;
     const item = (await installations()).find((entry) => entry.id === id);
@@ -917,9 +833,13 @@ export async function createPlugins(
   return {
     list,
     detail,
+    async releaseHistory(id: string, cursor?: string) {
+      return cache.releaseHistory(await get(parse(z.uuid(), id)), cursor);
+    },
     saveSource: (body: unknown) => change(() => saveSource(body)),
     configure: (body: unknown) => change(() => configure(body)),
     deactivate: (body: unknown) => change(() => deactivate(body)),
+    prune: (body: unknown) => run(() => change(() => prune(body))),
     activeChannel,
     contributions,
     tools: async (signal: AbortSignal) => {
