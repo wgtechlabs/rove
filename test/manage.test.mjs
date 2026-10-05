@@ -24,7 +24,7 @@ function dom() {
     }
     setAttribute() {}
     focus() {
-      focused = this;
+      if (!this.disabled) focused = this;
     }
     querySelector(selector) {
       return this.all().find((el) =>
@@ -53,13 +53,19 @@ function dom() {
   }
   return { Element, root: new Element('section'), focused: () => focused };
 }
-async function management(Element) {
+async function management(
+  Element,
+  requestAnimationFrame = (callback) => setImmediate(callback),
+) {
   const source = await readFile('public/manage.js', 'utf8');
   const plugins = await readFile('public/plugins.js', 'utf8');
   const pages = await readFile('public/plugin-pages.js', 'utf8');
   return runInNewContext(
     `${plugins.replace('export function', 'function')}\n${pages.replace('export function', 'function')}\n${source.replace(/^import[^\n]*\n/gm, '').replace('export function', 'function')}; mountManage`,
-    { document: { createElement: (tag) => new Element(tag) } },
+    {
+      document: { createElement: (tag) => new Element(tag) },
+      requestAnimationFrame,
+    },
   );
 }
 
@@ -651,11 +657,29 @@ test('plugin history replaces older receipt pages, pins cached choices and resto
     }
     return state;
   };
-  const manager = (await management(Element))(
+  const frames = [];
+  const setBusy = (value) => {
+    for (const control of root
+      .all()
+      .filter((element) =>
+        ['button', 'input', 'textarea', 'select'].includes(element.tag),
+      ))
+      control.disabled = value || control.dataset.unavailable === 'true';
+  };
+  const manager = (
+    await management(Element, (callback) => frames.push(callback))
+  )(
     root,
     api,
     (action) => {
-      pending = action();
+      setBusy(true);
+      pending = (async () => {
+        try {
+          return await action();
+        } finally {
+          setBusy(false);
+        }
+      })();
       return pending;
     },
     () => {},
@@ -690,8 +714,22 @@ test('plugin history replaces older receipt pages, pins cached choices and resto
   );
   assert.equal(choices().children.length, 32);
   assert.equal(button('Load older versions').disabled, false);
+  button('Load older versions').focus();
   button('Load older versions').onclick();
+  assert.equal(choices().disabled, true);
   await pending;
+  assert.equal(choices().disabled, false);
+  assert.notEqual(
+    focused(),
+    choices(),
+    'disabled selects cannot receive focus during the action',
+  );
+  assert.equal(
+    frames.length,
+    1,
+    'focus is deferred until the shared runner releases controls',
+  );
+  frames.shift()();
   assert.equal(choices().children.length, 32);
   assert.equal(
     choices().children.some((option) => option.value === 'receipt-0'),
@@ -729,4 +767,116 @@ test('plugin history replaces older receipt pages, pins cached choices and resto
   assert.equal(choices().value, cached[0].digest);
   assert.ok(detailsCalls.every((path) => path.includes('/releases/cached-')));
   manager.dispose();
+});
+
+test('chat archive and restore focus only after the shared runner enables the control', async () => {
+  let focused;
+  const elements = new Map();
+  const created = [];
+  const frames = [];
+  const element = (tag = 'div') => ({
+    tag,
+    dataset: {},
+    value: '',
+    textContent: '',
+    setAttribute() {},
+    replaceChildren() {},
+    append() {},
+    focus() {
+      if (!this.disabled) focused = this;
+    },
+  });
+  const controlTags = new Map([
+    ['#archive-chat', 'button'],
+    ['#new-chat', 'button'],
+    ['#message', 'textarea'],
+    ['#send-message', 'button'],
+  ]);
+  const find = (selector) => {
+    if (!elements.has(selector))
+      elements.set(selector, element(controlTags.get(selector)));
+    return elements.get(selector);
+  };
+  const main = {
+    ...element(),
+    querySelector: find,
+    querySelectorAll: () =>
+      [...elements.values(), ...created].filter((node) =>
+        ['button', 'input', 'textarea', 'select'].includes(node.tag),
+      ),
+  };
+  let conversation = {
+    id: 'conversation',
+    title: 'Saved chat',
+    messages: [],
+    updatedAt: 1,
+    archivedAt: null,
+  };
+  const api = async (path, body) => {
+    if (path === '/api/admin/settings')
+      return {
+        configured: true,
+        baseURL: 'http://localhost',
+        model: 'local',
+        systemPrompt: '',
+      };
+    if (path.endsWith('/archive')) {
+      conversation = {
+        ...conversation,
+        archivedAt: body.archived ? 2 : null,
+        updatedAt: conversation.updatedAt + 1,
+      };
+      return conversation;
+    }
+    if (path === '/api/admin/conversations' && body) return conversation;
+    if (path.startsWith('/api/admin/conversations'))
+      return {
+        conversations: conversation.archivedAt ? [] : [conversation],
+        nextCursor: null,
+      };
+    assert.fail(`Unexpected route: ${path}`);
+  };
+  const source = await readFile('public/chat.js', 'utf8');
+  const mount = runInNewContext(
+    `${source.replace(/^import .*;\n/, '').replace('export function', 'function')}; mountChat`,
+    {
+      document: {
+        querySelector: () => element(),
+        createElement: (tag) => {
+          const node = element(tag);
+          created.push(node);
+          return node;
+        },
+      },
+      crypto,
+      requestAnimationFrame: (callback) => frames.push(callback),
+    },
+  );
+  const dispose = mount(main, {}, api, () => {}, element('button'));
+  await new Promise((resolve) => setImmediate(resolve));
+  find('#new-chat').onclick();
+  await new Promise((resolve) => setImmediate(resolve));
+  for (const callback of frames.splice(0)) callback();
+  const archive = find('#archive-chat');
+  for (const label of ['Restore conversation', 'Archive conversation']) {
+    find('#message').focus();
+    const running = archive.onclick();
+    assert.equal(archive.disabled, true);
+    await running;
+    assert.equal(archive.textContent, label);
+    assert.equal(archive.disabled, false);
+    assert.notEqual(
+      focused,
+      archive,
+      'focus on a disabled button must be ignored',
+    );
+    assert.equal(frames.length, 1);
+    frames.shift()();
+    assert.equal(focused, archive);
+  }
+  find('#message').focus();
+  await archive.onclick();
+  dispose();
+  for (const callback of frames.splice(0)) callback();
+  assert.notEqual(focused, archive, 'disposed chats must not reclaim focus');
 });

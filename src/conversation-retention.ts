@@ -58,11 +58,26 @@ export async function createConversationRetention(config: RuntimeConfig) {
     if (!Number.isSafeInteger(now) || now < 0)
       throw new Error('Retention requires a valid timestamp.');
     await state.assertOwned();
-    // Old public rows rotate behind unchecked rows even before their 90-day cutoff.
+    // Interleave bounded queues so new arrivals and due rechecks each make progress.
     const candidates = await db.all<{ id: string; scope: string }>(
-      `SELECT id,scope FROM rove_conversation
-       WHERE (expired_at IS NULL OR NOT title_redacted) AND last_activity_at <= $1
-       ORDER BY retention_checked_at,last_activity_at,id LIMIT 200`,
+      `WITH unchecked AS MATERIALIZED (
+         SELECT id,scope,last_activity_at FROM rove_conversation
+         WHERE (expired_at IS NULL OR NOT title_redacted) AND last_activity_at <= $1
+           AND retention_checked_at=0
+         ORDER BY last_activity_at,id LIMIT 200
+       ), rechecks AS MATERIALIZED (
+         SELECT id,scope,last_activity_at,retention_checked_at FROM rove_conversation
+         WHERE (expired_at IS NULL OR NOT title_redacted) AND last_activity_at <= $1
+           AND retention_checked_at>0
+         ORDER BY retention_checked_at,last_activity_at,id LIMIT 200
+       )
+       SELECT id,scope FROM (
+         SELECT id,scope,row_number() OVER (ORDER BY last_activity_at,id) AS position,0 AS cohort
+         FROM unchecked
+         UNION ALL
+         SELECT id,scope,row_number() OVER (ORDER BY retention_checked_at,last_activity_at,id) AS position,1 AS cohort
+         FROM rechecks
+       ) AS candidates ORDER BY position,cohort LIMIT 200`,
       [now - 14 * DAY],
     );
     const tables: string[] = [];

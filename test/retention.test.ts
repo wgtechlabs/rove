@@ -346,6 +346,49 @@ test('retention batches never exceed 200 and young public rows cannot starve old
   assert.equal((await f.chat.get(privateOld.id)).expiredAt, f.now);
 });
 
+test('newly eligible public arrivals cannot starve previously checked conversations', async (t) => {
+  const f = await fixture(t);
+  const old = await f.seed('slack:team:old:thread', 89);
+  assert.deepEqual(await f.chat.purgeExpired(f.now, async () => 'public'), {
+    checked: 1,
+    expired: 0,
+  });
+  for (let day = 2; day <= 4; day++) {
+    const now = f.now + day * DAY;
+    const prefix = `arrival-${day}-`;
+    await f.config.db.run(
+      `INSERT INTO rove_conversation(id,title,updated_at,scope,last_activity_at)
+       SELECT $1 || n,'Public conversation',$2,'slack:team:public:' || $1 || n,$2
+       FROM generate_series(1,200) AS n`,
+      [prefix, now - 15 * DAY],
+    );
+    const previouslyChecked = new Set(
+      (
+        await f.config.db.all<{ id: string }>(
+          'SELECT id FROM rove_conversation WHERE retention_checked_at > 0',
+        )
+      ).map((row) => row.id),
+    );
+    const visited: string[] = [];
+    const result = await f.chat.purgeExpired(now, async ({ id }) => {
+      visited.push(id);
+      return 'public';
+    });
+    assert.deepEqual(result, { checked: 200, expired: day === 2 ? 1 : 0 });
+    assert.equal(new Set(visited).size, 200);
+    const rechecked = visited.filter((id) => previouslyChecked.has(id)).length;
+    assert.equal(rechecked, Math.min(100, previouslyChecked.size));
+    assert.ok(
+      visited.some((id) => !previouslyChecked.has(id)),
+      'unchecked candidates still make progress',
+    );
+    assert.equal(
+      (await f.chat.get(old.id, old.scope)).expiredAt,
+      f.now + 2 * DAY,
+    );
+  }
+});
+
 test('slow public visibility sweeps complete and checkpoint instead of retrying each minute', async (t) => {
   const f = await fixture(t);
   await f.seed('slack:team:public:first', 30);
