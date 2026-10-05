@@ -53,6 +53,10 @@ export function renderPlugins(content, state, runtime, ui) {
       ),
     );
   for (const item of state.installations) {
+    let availableVersions = item.versions;
+    const cachedVersions = item.versions.filter(
+      (version) => version.cached !== false,
+    );
     const latest = item.versions[0];
     if (!latest) continue;
     const row = node('section', null, 'configuration-row');
@@ -72,13 +76,17 @@ export function renderPlugins(content, state, runtime, ui) {
       selectedVersions.get(item.id)?.open || false,
     );
     details.name = 'plugin-review';
-    const selected =
-      selectedVersions.get(item.id)?.digest || item.active || latest.digest;
+    const savedSelection = selectedVersions.get(item.id)?.digest;
+    const selected = availableVersions.some(
+      (version) => version.digest === savedSelection,
+    )
+      ? savedSelection
+      : item.active || latest.digest;
     const versions = choose(
       details,
       `version-${item.id}`,
       'Prepared version',
-      item.versions.map((version) => [
+      availableVersions.map((version) => [
         version.digest,
         `${version.version} · ${version.tag}${version.digest === item.active ? ' · active' : ''}${version.cached === false ? ' · download removed' : ''}`,
       ]),
@@ -88,7 +96,7 @@ export function renderPlugins(content, state, runtime, ui) {
     details.append(body);
     const renderVersion = (version) => {
       body.replaceChildren();
-      const summary = item.versions.find(
+      const summary = availableVersions.find(
         (entry) => entry.digest === version.digest,
       );
       const manifest = version.manifest;
@@ -221,10 +229,8 @@ export function renderPlugins(content, state, runtime, ui) {
                 result.state !== 'ready'
                   ? 'Channel processing is unavailable. Check the deployment logs, then restart Rove.'
                   : result.jobs.length
-                    ? result.jobs
-                        .map((job) => `${job.count} ${job.status}`)
-                        .join(' · ')
-                    : 'No events received yet.';
+                    ? `${result.recentLimit ? `Active jobs and latest ${result.recentLimit} completed events: ` : ''}${result.jobs.map((job) => `${job.count} ${job.status}`).join(' · ')}`
+                    : 'No channel deliveries yet.';
               health.focus();
             }),
           ),
@@ -464,7 +470,9 @@ export function renderPlugins(content, state, runtime, ui) {
     const loadVersion = async () => {
       const digest = versions.value;
       if (digest === loadedDigest || digest === loadingDigest) return;
-      const summary = item.versions.find((entry) => entry.digest === digest);
+      const summary = availableVersions.find(
+        (entry) => entry.digest === digest,
+      );
       const current = ++request;
       if (summary?.cached === false) {
         loadedDigest = digest;
@@ -533,6 +541,84 @@ export function renderPlugins(content, state, runtime, ui) {
         }
       }
     };
+    let historyCursor = item.versionsCursor ?? null;
+    let olderPage = false;
+    let loadingHistory = false;
+    const historyControls = node('div', null, 'settings-actions');
+    const historyStatus = node('p', '', 'hint');
+    historyStatus.setAttribute('role', 'status');
+    const older = button('Load older versions', () =>
+      run(() => loadHistory(historyCursor)),
+    );
+    const newest = button('Latest versions', () => run(() => loadHistory()));
+    function historyState() {
+      historyControls.hidden = !historyCursor && !olderPage;
+      unavailable(older, !historyCursor || loadingHistory);
+      unavailable(newest, !olderPage || loadingHistory);
+    }
+    async function loadHistory(cursor) {
+      if (loadingHistory) return;
+      loadingHistory = true;
+      historyState();
+      historyStatus.textContent = 'Loading release history…';
+      try {
+        const page = await api(
+          path(
+            `${item.id}/releases${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`,
+          ),
+        );
+        const previous = versions.value;
+        availableVersions = [...cachedVersions, ...page.versions];
+        versions.replaceChildren(
+          ...availableVersions.map((version) => {
+            const option = node(
+              'option',
+              `${version.version} · ${version.tag}${version.digest === item.active ? ' · active' : ''}${version.cached === false ? ' · download removed' : ''}`,
+            );
+            option.value = version.digest;
+            return option;
+          }),
+        );
+        versions.value = availableVersions.some(
+          (version) => version.digest === previous,
+        )
+          ? previous
+          : item.active ||
+            page.versions[0]?.digest ||
+            cachedVersions[0]?.digest ||
+            '';
+        historyCursor = page.nextCursor;
+        olderPage = Boolean(cursor);
+        historyStatus.textContent = page.versions.length
+          ? 'Showing a page of removed downloads. Cached versions stay available.'
+          : 'No older removed downloads.';
+        if (versions.value) await loadVersion();
+        else {
+          ++request;
+          loadedDigest = undefined;
+          loadingDigest = undefined;
+          body.replaceChildren(
+            node(
+              'p',
+              'Select Latest versions to return to recent releases.',
+              'hint',
+            ),
+          );
+        }
+        versions.focus();
+      } catch (error) {
+        if (error.status === 401) onError(error);
+        else
+          historyStatus.textContent =
+            error.message || 'Release history could not be loaded. Try again.';
+      } finally {
+        loadingHistory = false;
+        historyState();
+      }
+    }
+    historyControls.append(older, newest);
+    details.append(historyControls, historyStatus);
+    historyState();
     versions.onchange = loadVersion;
     details.ontoggle = () => {
       selectedVersions.set(item.id, {

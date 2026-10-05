@@ -193,6 +193,9 @@ Limits: 16 sources, 16 installations, 16 cached release payloads per installatio
 local and installed contributions. Lightweight release receipts do not count
 against the cache limit, so pruning frees room for another release. Receipts and
 audit history continue to accumulate; the cache limit is not a total storage cap.
+Version selectors show all cached releases and one page of up to 16 removed
+downloads. Use **Load older versions** to browse earlier receipts, or **Latest
+versions** to return to recent ones; paging keeps the cached releases available.
 Configuration requests have a 512 KiB aggregate JSON limit, including settings,
 secret bindings and channel access rules.
 

@@ -104,6 +104,8 @@ export async function createPlugins(
     CREATE TABLE IF NOT EXISTS rove_plugin_source(repo TEXT PRIMARY KEY, token TEXT NOT NULL, approved INTEGER NOT NULL, revision TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS rove_plugin_installation(id TEXT PRIMARY KEY, repo TEXT NOT NULL, plugin_id TEXT NOT NULL, data TEXT NOT NULL, sequence BIGINT GENERATED ALWAYS AS IDENTITY, UNIQUE(repo,plugin_id));
     CREATE TABLE IF NOT EXISTS rove_plugin_audit(id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, installation TEXT NOT NULL, event TEXT NOT NULL, digest TEXT, at BIGINT NOT NULL);
+    CREATE INDEX IF NOT EXISTS rove_plugin_audit_recent ON rove_plugin_audit(installation,id DESC);
+    CREATE INDEX IF NOT EXISTS rove_plugin_audit_activated ON rove_plugin_audit(installation,id DESC) WHERE event='activated';
     `);
   const cache = await createPluginCache(db);
   const lifetime = new AbortController();
@@ -250,7 +252,7 @@ export async function createPlugins(
               },
             ]),
           ),
-          versions: await cache.versions(item),
+          ...(await cache.versions(item)),
           audit: await db.all(
             'SELECT event,digest,at FROM rove_plugin_audit WHERE installation=$1 ORDER BY id DESC LIMIT 30',
             [item.id],
@@ -831,6 +833,9 @@ export async function createPlugins(
   return {
     list,
     detail,
+    async releaseHistory(id: string, cursor?: string) {
+      return cache.releaseHistory(await get(parse(z.uuid(), id)), cursor);
+    },
     saveSource: (body: unknown) => change(() => saveSource(body)),
     configure: (body: unknown) => change(() => configure(body)),
     deactivate: (body: unknown) => change(() => deactivate(body)),

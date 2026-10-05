@@ -13,6 +13,13 @@ type ReleaseSummary = Pick<
   PluginPackage,
   'name' | 'description' | 'category' | 'version'
 > & { tag: string };
+interface ReleaseRow {
+  digest: string;
+  summary: string;
+  format: string;
+  cached: boolean;
+  sequence: number;
+}
 interface CacheOwner {
   id: string;
   repo: string;
@@ -29,6 +36,8 @@ export async function createPluginCache(db: Database) {
     ALTER TABLE rove_plugin_artifact ALTER COLUMN data DROP NOT NULL;
     ALTER TABLE rove_plugin_artifact ADD COLUMN IF NOT EXISTS identity TEXT;
     ALTER TABLE rove_plugin_artifact ADD COLUMN IF NOT EXISTS summary TEXT;
+    CREATE INDEX IF NOT EXISTS rove_plugin_artifact_cached ON rove_plugin_artifact(repo,plugin_id,sequence DESC) WHERE data IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS rove_plugin_artifact_history ON rove_plugin_artifact(repo,plugin_id,sequence DESC) WHERE data IS NULL;
     UPDATE rove_plugin_artifact SET identity=(data::jsonb - 'bytes' - 'manifest')::text WHERE identity IS NULL AND data IS NOT NULL;
     UPDATE rove_plugin_artifact SET summary=jsonb_build_object(
       'name',data::jsonb->'manifest'->>'name',
@@ -133,54 +142,120 @@ export async function createPluginCache(db: Database) {
     return true;
   }
 
-  async function versions(item: CacheOwner, connection: Sql = db) {
+  async function rollbackDigest(item: CacheOwner, connection: Sql = db) {
     const rollback = await connection.get(
       "SELECT digest FROM rove_plugin_audit WHERE installation=$1 AND event='activated' AND digest IS DISTINCT FROM $2 ORDER BY id DESC LIMIT 1",
       [item.id, item.active],
     );
-    const rows = await connection.all(
-      "SELECT digest,summary,coalesce(identity::jsonb->'origin'->>'format','rove') AS format,data IS NOT NULL AS cached FROM rove_plugin_artifact WHERE repo=$1 AND plugin_id=$2 ORDER BY sequence DESC",
-      [item.repo, item.pluginId],
-    );
-    return rows.map((row) => {
-      const digest = String(row.digest);
-      const cached = Boolean(row.cached);
-      const pruneReason = !cached
-        ? 'Payload already pruned; release identity retained.'
-        : digest === item.active
-          ? 'The active version must remain cached.'
-          : digest === rollback?.digest
-            ? 'The previous activated version is kept for rollback.'
-            : null;
-      return {
-        digest,
-        ...(JSON.parse(String(row.summary)) as ReleaseSummary),
-        cached,
-        format: String(row.format),
-        prunable: pruneReason === null,
-        pruneReason,
-      };
-    });
+    return rollback ? String(rollback.digest) : undefined;
   }
-
+  function pruneReason(
+    item: CacheOwner,
+    digest: string,
+    cached: boolean,
+    rollback?: string,
+  ) {
+    return !cached
+      ? 'Payload already pruned; release identity retained.'
+      : digest === item.active
+        ? 'The active version must remain cached.'
+        : digest === rollback
+          ? 'The previous activated version is kept for rollback.'
+          : null;
+  }
+  function summary(row: ReleaseRow, item: CacheOwner, rollback?: string) {
+    const reason = pruneReason(item, row.digest, row.cached, rollback);
+    return {
+      digest: row.digest,
+      ...(JSON.parse(row.summary) as ReleaseSummary),
+      cached: row.cached,
+      format: row.format,
+      prunable: reason === null,
+      pruneReason: reason,
+    };
+  }
+  const summaryColumns =
+    "digest,summary,coalesce(identity::jsonb->'origin'->>'format','rove') AS format,data IS NOT NULL AS cached,sequence";
+  async function historyRows(item: CacheOwner, cursor?: string) {
+    let before: number | undefined;
+    if (cursor !== undefined) {
+      try {
+        if (cursor.length > 1000) throw new Error('Invalid cursor');
+        const value = JSON.parse(Buffer.from(cursor, 'base64url').toString());
+        if (
+          value.id !== item.id ||
+          !Number.isSafeInteger(value.sequence) ||
+          value.sequence < 1
+        )
+          throw new Error('Invalid cursor');
+        before = value.sequence;
+      } catch {
+        throw new HttpError(400, 'Invalid release history cursor.');
+      }
+    }
+    const rows = await db.all<ReleaseRow>(
+      `SELECT ${summaryColumns} FROM rove_plugin_artifact
+       WHERE repo=$1 AND plugin_id=$2 AND data IS NULL ${before ? 'AND sequence < $3' : ''}
+       ORDER BY sequence DESC LIMIT 17`,
+      before ? [item.repo, item.pluginId, before] : [item.repo, item.pluginId],
+    );
+    const hasMore = rows.length > 16;
+    if (hasMore) rows.pop();
+    const last = rows.at(-1);
+    return {
+      rows,
+      nextCursor:
+        hasMore && last
+          ? Buffer.from(
+              JSON.stringify({ id: item.id, sequence: last.sequence }),
+            ).toString('base64url')
+          : null,
+    };
+  }
+  async function releaseHistory(item: CacheOwner, cursor?: string) {
+    const page = await historyRows(item, cursor);
+    return {
+      versions: page.rows.map((row) => summary(row, item)),
+      nextCursor: page.nextCursor,
+    };
+  }
+  async function versions(item: CacheOwner) {
+    const [rollback, cached, history] = await Promise.all([
+      rollbackDigest(item),
+      db.all<ReleaseRow>(
+        `SELECT ${summaryColumns} FROM rove_plugin_artifact WHERE repo=$1 AND plugin_id=$2 AND data IS NOT NULL ORDER BY sequence DESC LIMIT 16`,
+        [item.repo, item.pluginId],
+      ),
+      historyRows(item),
+    ]);
+    return {
+      versions: [...cached, ...history.rows]
+        .sort((a, b) => b.sequence - a.sequence)
+        .map((row) => summary(row, item, rollback)),
+      versionsCursor: history.nextCursor,
+    };
+  }
   async function prune(tx: Sql, item: CacheOwner, digest: string) {
-    const release = (await versions(item, tx)).find(
-      (entry) => entry.digest === digest,
+    const release = await tx.get<{ cached: boolean }>(
+      'SELECT data IS NOT NULL AS cached FROM rove_plugin_artifact WHERE digest=$1 AND repo=$2 AND plugin_id=$3',
+      [digest, item.repo, item.pluginId],
     );
     if (!release)
       throw new HttpError(
         404,
         'Plugin release not found for this installation.',
       );
-    if (!release.prunable)
-      throw new HttpError(
-        409,
-        release.pruneReason ?? 'Release cannot be pruned.',
-      );
+    const reason = pruneReason(
+      item,
+      digest,
+      release.cached,
+      await rollbackDigest(item, tx),
+    );
+    if (reason) throw new HttpError(409, reason);
     await tx.run('UPDATE rove_plugin_artifact SET data=NULL WHERE digest=$1', [
       digest,
     ]);
   }
 
-  return { artifact, store, versions, prune };
+  return { artifact, store, versions, releaseHistory, prune };
 }

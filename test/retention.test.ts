@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { type TestContext, test } from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
 import { createChat } from '../src/chat.js';
+import { createRetentionScheduler } from '../src/retention-scheduler.js';
 import { testRuntime } from './storage.js';
 
 const DAY = 86_400_000;
@@ -342,6 +344,33 @@ test('retention batches never exceed 200 and young public rows cannot starve old
     expired: 1,
   });
   assert.equal((await f.chat.get(privateOld.id)).expiredAt, f.now);
+});
+
+test('slow public visibility sweeps complete and checkpoint instead of retrying each minute', async (t) => {
+  const f = await fixture(t);
+  await f.seed('slack:team:public:first', 30);
+  await f.seed('slack:team:public:second', 30);
+  // Compress the former aggregate deadline without changing per-request timeouts.
+  const timeout = AbortSignal.timeout;
+  t.mock.method(AbortSignal, 'timeout', (milliseconds: number) =>
+    timeout(milliseconds === 30_000 ? 1 : milliseconds),
+  );
+  let lookups = 0;
+  const scheduler = await createRetentionScheduler(f.config, async () => {
+    const result = await f.chat.purgeExpired(f.now, async () => {
+      lookups++;
+      await delay(10);
+      return 'public';
+    });
+    assert.deepEqual(result, { checked: 2, expired: 0 });
+  });
+  t.after(() => scheduler.close());
+  await scheduler.tick(f.now);
+  await scheduler.tick(f.now + 60_000);
+  assert.equal(lookups, 2);
+  assert.ok(
+    await f.config.db.get('SELECT last_run FROM rove_retention_schedule'),
+  );
 });
 
 test('visibility lookup does not hold the core turn and shutdown cancels an unresponsive lookup', async (t) => {

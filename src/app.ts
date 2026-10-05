@@ -176,6 +176,15 @@ export async function createApplication(
       if (request.method === 'GET' && path === '/api/admin/me')
         return json(admin);
       if (request.method === 'GET') {
+        const historyRoute =
+          /^\/api\/admin\/plugins\/([a-f0-9-]{36})\/releases$/.exec(path);
+        if (historyRoute?.[1])
+          return json(
+            await plugins.releaseHistory(
+              historyRoute[1],
+              url.searchParams.get('cursor') ?? undefined,
+            ),
+          );
         const releaseRoute =
           /^\/api\/admin\/plugins\/([a-f0-9-]{36})\/releases\/([a-f0-9]{64})$/.exec(
             path,

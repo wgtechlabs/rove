@@ -201,6 +201,10 @@ export async function createPluginChannels(
       ALTER TABLE rove_plugin_channel_job ADD COLUMN IF NOT EXISTS finished_at BIGINT;
       CREATE INDEX IF NOT EXISTS rove_plugin_channel_active_queue ON rove_plugin_channel_job(sequence)
         WHERE status IN ('pending','processing','ready','delivering');
+      CREATE INDEX IF NOT EXISTS rove_plugin_channel_unfinished ON rove_plugin_channel_job(sequence)
+        WHERE finished_at IS NULL;
+      CREATE INDEX IF NOT EXISTS rove_plugin_channel_recent ON rove_plugin_channel_job(installation,sequence DESC)
+        WHERE finished_at IS NOT NULL;
       DROP INDEX IF EXISTS rove_plugin_channel_queue;`);
   await config.state.assertOwned();
   await db.run(
@@ -590,9 +594,17 @@ export async function createPluginChannels(
       return {
         state: failed ? 'failed' : stopping ? 'stopped' : 'ready',
         jobs: await db.all(
-          'SELECT status, COUNT(*) AS count FROM rove_plugin_channel_job WHERE installation=$1 GROUP BY status',
+          `SELECT status, COUNT(*) AS count FROM (
+            SELECT status FROM rove_plugin_channel_job
+              WHERE installation=$1 AND status IN ('pending','processing','ready','delivering')
+            UNION ALL
+            (SELECT status FROM rove_plugin_channel_job
+              WHERE installation=$1 AND finished_at IS NOT NULL
+              ORDER BY sequence DESC LIMIT 500)
+          ) AS recent_jobs GROUP BY status ORDER BY status`,
           [installation],
         ),
+        recentLimit: 500,
       };
     },
     start() {

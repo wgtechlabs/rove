@@ -305,3 +305,88 @@ test('pruning waits for release downloads to finish', async (t) => {
     true,
   );
 });
+
+test('release summaries and receipt history stay bounded while cached rollback versions remain available', async (t) => {
+  const f = await fixture(t);
+  await f.approve();
+  const initial = await f.install(manifest('0.0.1'));
+  const oldest = initial.versions[0]?.digest;
+  assert.ok(oldest);
+  await f.configure();
+  const first = await f.install(manifest('1.0.0'));
+  const rollback = first.versions[0]?.digest;
+  assert.ok(rollback);
+  await f.activate(rollback);
+  const second = await f.install(manifest('2.0.0'));
+  const active = second.versions[0]?.digest;
+  assert.ok(active);
+  await f.activate(active);
+  await f.config.db.run(
+    `INSERT INTO rove_plugin_artifact(digest,repo,plugin_id,version,data,summary,identity)
+    SELECT repeat('f',56) || lpad(n::text,8,'0'),$1,'company-agent','8.0.' || n,NULL,
+      jsonb_build_object('name','Company agent','description','Old receipt','category','agent','version','8.0.' || n,'tag','v8.0.' || n)::text,'{}'
+    FROM generate_series(1,70) AS n`,
+    [repo],
+  );
+  let item = await f.current();
+  assert.equal(item.versions.length, 19);
+  assert.equal(item.versions.filter((version) => version.cached).length, 3);
+  for (const digest of [active, rollback]) {
+    assert.equal(
+      item.versions.find((version) => version.digest === digest)?.prunable,
+      false,
+    );
+    await assert.rejects(
+      f.plugins.prune({ id: item.id, revision: item.revision, digest }),
+      /active|rollback/,
+    );
+  }
+  // This cached release predates every receipt page; pruning must look it up directly.
+  await f.plugins.prune({
+    id: item.id,
+    revision: item.revision,
+    digest: oldest,
+  });
+  item = await f.current();
+  const seen = new Set<string>();
+  let cursor: string | undefined;
+  do {
+    const page = await f.plugins.releaseHistory(item.id, cursor);
+    assert.ok(page.versions.length <= 16);
+    for (const release of page.versions) {
+      assert.equal(release.cached, false);
+      assert.equal(release.prunable, false);
+      assert.equal(seen.has(release.digest), false);
+      seen.add(release.digest);
+    }
+    cursor = page.nextCursor ?? undefined;
+  } while (cursor);
+  assert.equal(seen.size, 71);
+  assert.ok(seen.has(oldest));
+  await assert.rejects(
+    f.plugins.releaseHistory(item.id, 'not-a-cursor'),
+    /cursor/,
+  );
+  await f.install({ ...manifest('1.0.0'), id: 'another-agent' });
+  const other = (await f.plugins.list()).installations.find(
+    (installation) => installation.pluginId === 'another-agent',
+  );
+  assert.ok(other);
+  assert.ok(item.versionsCursor);
+  await assert.rejects(
+    f.plugins.releaseHistory(other.id, item.versionsCursor),
+    /cursor/,
+  );
+  await assert.rejects(
+    f.plugins.prune({ id: other.id, revision: other.revision, digest: oldest }),
+    /not found/,
+  );
+  await f.install(manifest('0.0.1'));
+  item = await f.current();
+  assert.equal(
+    item.versions.find((version) => version.digest === oldest)?.cached,
+    true,
+  );
+  assert.ok(item.versions.length <= 32);
+  assert.equal(item.active, active);
+});

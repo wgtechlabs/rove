@@ -106,6 +106,9 @@ installation/event identities, outcome and completion-time receipts permanently.
 This preserves deduplication across old retries and restarts; it does not bound
 total database storage. Upgrades compact existing terminal jobs without discarding
 pending or prepared work.
+The delivery status view counts all outstanding jobs and the latest 500 completed
+events for that installation. Older receipts still prevent duplicate execution;
+they are excluded from this status summary.
 
 Use one active core per deployment; PostgreSQL stores the durable queue and Redis
 enforces core ownership. Do not treat a controlled local integration test as

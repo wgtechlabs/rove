@@ -532,15 +532,17 @@ test('accepted channel messages wait for a busy web model call and then deliver 
   assert.equal(f.posts.length, 1);
 });
 
-test('terminal history does not limit admission and a full active queue still accepts duplicates', async (t) => {
+test('terminal history keeps admission and status bounded without hiding old active jobs', async (t) => {
   const f = await fixture(t);
   await f.config.db.run(
     `INSERT INTO rove_plugin_channel_job
       (id,installation,event,scope,actor,destination,thread,content,decision,approval,snapshot,fingerprint,status,finished_at)
-      SELECT 'history-' || n, 'one', 'history-' || n, '', '', '', '', '', '', '', '', '',
-        CASE WHEN n <= 10001 THEN 'sent' ELSE 'pending' END,
-        CASE WHEN n <= 10001 THEN $1::bigint ELSE NULL END
-      FROM generate_series(1, 10500) AS n`,
+      SELECT 'history-' || n, CASE WHEN n <= 10500 THEN 'one' ELSE 'two' END,
+        'history-' || n, '', '', '', '', '', '', '', '', '',
+        CASE WHEN n <= 499 THEN 'pending'
+          WHEN n > 10250 AND n <= 10500 THEN 'failed' ELSE 'sent' END,
+        CASE WHEN n <= 499 THEN NULL ELSE $1::bigint END
+      FROM generate_series(1, 11000) AS n`,
     [Date.now()],
   );
   const input = event();
@@ -548,11 +550,39 @@ test('terminal history does not limit admission and a full active queue still ac
   await assert.rejects(f.gateway.handle(signed(event()), 'one'), status(503));
   assert.equal((await f.gateway.handle(signed(input), 'one')).status, 200);
   assert.equal(
-    (await f.gateway.handle(signed(event({ event: 'history-1' })), 'one'))
+    (await f.gateway.handle(signed(event({ event: 'history-500' })), 'one'))
       .status,
     200,
   );
-  assert.equal((await f.jobs()).length, 10501);
+  const expected = {
+    state: 'ready',
+    jobs: [
+      { status: 'failed', count: 250 },
+      { status: 'pending', count: 500 },
+      { status: 'sent', count: 250 },
+    ],
+    recentLimit: 500,
+  };
+  assert.deepEqual(await f.gateway.status('one'), expected);
+  assert.deepEqual(await f.gateway.status('two'), {
+    state: 'ready',
+    jobs: [{ status: 'sent', count: 500 }],
+    recentLimit: 500,
+  });
+  assert.deepEqual(await f.gateway.status('missing'), {
+    state: 'ready',
+    jobs: [],
+    recentLimit: 500,
+  });
+  await f.restart();
+  assert.deepEqual(await f.gateway.status('one'), expected);
+  assert.equal((await f.gateway.handle(signed(input), 'one')).status, 200);
+  assert.equal(
+    (await f.gateway.handle(signed(event({ event: 'history-500' })), 'one'))
+      .status,
+    200,
+  );
+  assert.equal((await f.jobs()).length, 11001);
   assert.equal(f.sends.length, 0);
   assert.equal(f.posts.length, 0);
 });
@@ -617,6 +647,17 @@ test('legacy channel jobs migrate once without deleting identities or pending wo
       (index) => index.indexname === 'rove_plugin_channel_active_queue',
     )?.indexdef || '',
     /WHERE .*status/,
+  );
+  assert.match(
+    indexes.find(
+      (index) => index.indexname === 'rove_plugin_channel_unfinished',
+    )?.indexdef || '',
+    /WHERE \(finished_at IS NULL\)/,
+  );
+  assert.match(
+    indexes.find((index) => index.indexname === 'rove_plugin_channel_recent')
+      ?.indexdef || '',
+    /\(installation, sequence DESC\) WHERE \(finished_at IS NOT NULL\)/,
   );
   await f.restart();
   assert.deepEqual(await f.jobs(), migrated);

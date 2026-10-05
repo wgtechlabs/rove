@@ -533,11 +533,7 @@ export async function createChat(
       const running = purgeTranscripts(
         now,
         resolveVisibility,
-        AbortSignal.any([
-          state.signal,
-          controller.signal,
-          AbortSignal.timeout(30_000),
-        ]),
+        AbortSignal.any([state.signal, controller.signal]),
         (action) => work({ kind: 'retention' }, action),
       );
       pending.add(running);
