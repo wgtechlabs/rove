@@ -52,4 +52,14 @@ automatic import from older storage formats is not included.
 
 ## Brand Commitments
 
-Name: Rove, with lowercase rove in the wordmark. The pinned identity is a cute cyan round avatar SVG with two black eyes and a transparent background, paired with Fredoka SemiBold (600) for the wordmark and Inter for interface text. Keep dark mode as the default with cyan accents and light text, documented in DESIGN.md. Serve the font assets locally and preserve their OFL licenses. AIP means Agent Improvement Proposal. Preserve required attribution for any third-party material.
+Name: Rove, with lowercase rove in the wordmark. Little Forager is the approved
+mascot: a cyan mushroom cap, ivory stem and two friendly black eyes on a
+transparent background. Keep the character free of mouths, spots and network
+decoration. Mycelium is a metaphor for connected company knowledge, tools and
+skills, not a promise of additional product capabilities. Pair the character with
+Fredoka SemiBold (600) for the wordmark and Inter for interface text. Keep dark
+mode as the default with cyan accents and light text. The brand palette adds
+midnight and ivory; [brand guidelines](docs/brand-guidelines.md) define artwork
+usage, while [DESIGN.md](DESIGN.md) records interface tokens. Serve fonts locally
+and preserve their OFL licenses. AIP means Agent Improvement Proposal. Preserve
+required attribution for any third-party material.

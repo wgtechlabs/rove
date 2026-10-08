@@ -1,13 +1,14 @@
-<img src="public/brand/icon.svg" alt="rove cyan round avatar" width="80" height="80">
+<img src="public/brand/app-icon.svg" alt="rove cyan mushroom with friendly eyes" width="80" height="80">
 
 # rove
 
 **Your company’s agent, shaped by your workflows.**
 
-Brand assets: [transparent SVG icon](public/brand/icon.svg), with local idle,
-thinking and unsure expressions. See the [Rove avatar guide](public/brand/README.md). The lowercase
-wordmark uses Fredoka SemiBold 600; the product interface uses Inter.
-See [DESIGN.md](DESIGN.md) and the [font licenses](public/fonts/README.md).
+Meet Little Forager, Rove's cyan mushroom with friendly eyes. Download the
+[transparent SVG icon](public/brand/icon.svg) and [brand assets](public/brand/README.md),
+or read the [brand guidelines](docs/brand-guidelines.md). The lowercase wordmark
+uses Fredoka SemiBold 600; the product interface uses Inter. See
+[DESIGN.md](DESIGN.md) and the [font licenses](public/fonts/README.md).
 
 Rove is a self-hosted, company-neutral AI agent. Configure a
 shared agent through the web, connect to your tools and channels,
