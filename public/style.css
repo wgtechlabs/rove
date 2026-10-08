@@ -1,4 +1,4 @@
-/* Rove's original cyan interface. */
+/* Rove's cyan mushroom identity and dark interface. */
 @font-face {
   font-family: Fredoka;
   font-style: normal;
@@ -15,7 +15,8 @@
 }
 :root {
   color-scheme: dark;
-  --canvas: #0b1014;
+  --canvas: #0b1220;
+  --ivory: #fff4df;
   --surface: #141c22;
   --ink: #e6f1f5;
   --quiet: #a6bac4;
@@ -113,7 +114,7 @@ p {
   display: inline-flex;
   align-items: center;
   gap: 10px;
-  color: var(--cyan);
+  color: var(--ivory);
   text-decoration: none;
   font-family: Fredoka, ui-rounded, sans-serif;
   font-size: 2rem;
@@ -134,7 +135,7 @@ p {
     translate 180ms ease-out;
 }
 .brand-mark[data-expression="thinking"] .rove-eye {
-  translate: 0 -3px;
+  translate: 0 -6px;
 }
 .brand-mark[data-expression="unsure"] .rove-eye-left {
   transform: scaleY(0.5);
@@ -146,10 +147,10 @@ p {
 }
 @keyframes rove-thinking {
   from {
-    transform: translateX(-3px);
+    transform: translateX(-6px);
   }
   to {
-    transform: translateX(3px);
+    transform: translateX(6px);
   }
 }
 .header-label {

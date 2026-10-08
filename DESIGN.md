@@ -1,8 +1,14 @@
 ---
 name: Rove
-description: Dark administration interface with original cyan accents
+description: Dark administration interface with a cyan mushroom identity
+brand:
+  cyan: "#22d3ee"
+  midnight: "#0b1220"
+  ivory: "#fff4df"
+  eyes: "#000000"
 colors:
-  canvas: "#0b1014"
+  canvas: "#0b1220"
+  ivory: "#fff4df"
   surface: "#141c22"
   ink: "#e6f1f5"
   quiet: "#a6bac4"
@@ -102,7 +108,7 @@ components:
 
 **Creative North Star: "A clear installation worksheet"**
 
-Rove is a dark-by-default administration interface with original cyan accents for focused company setup, conversations and model administration. A cute cyan round avatar and lowercase rove wordmark establish identity on the dark masthead; light ink, a deep canvas and subtly lighter working surfaces keep forms clear. Fredoka SemiBold gives the wordmark its friendly character; Inter keeps the working interface clear. Both fonts are served locally as WOFF2 with system fallbacks. The transparent SVG mark has two black eyes; no raster assets are required.
+Rove is a dark-by-default administration interface with cyan accents for focused company setup, conversations and model administration. Little Forager, a cyan mushroom with an ivory stem and two friendly black eyes, establishes identity beside the lowercase rove wordmark. Light ink, a deep canvas and subtly lighter working surfaces keep forms clear. Fredoka SemiBold gives the wordmark its friendly character; Inter keeps the working interface clear. Both fonts are served locally as WOFF2 with system fallbacks. The live mark uses transparent SVG; raster exports serve platform icon requirements. See the [brand guidelines](docs/brand-guidelines.md) for lockups, clear space and approved backgrounds.
 
 This document records the implemented `public/style.css`, `public/index.html`, `public/app.js`, `public/chat.js`, `public/manage.js`, `public/brand/icon.svg` and local fonts in `public/fonts/`.
 
@@ -110,12 +116,12 @@ This document records the implemented `public/style.css`, `public/index.html`, `
 - Dark masthead with cyan branding and primary actions.
 - Quiet, spacious forms with persistent labels.
 - Flat conversation workspace with a persistent account and settings entry point.
-- Transparent cyan round avatar mark, lowercase Fredoka wordmark and Inter interface type.
+- Transparent cyan mushroom mark with an ivory stem and black eyes, lowercase Fredoka wordmark and Inter interface type.
 
 ## Colors
 
 ### Primary
-Cyan identifies the round avatar mark, lowercase rove wordmark, primary actions and current setup step. The round avatar has two solid black eyes and no background shape. Its lighter hover and deeper pressed variants communicate action state. Dark on-cyan text is used on primary actions, text selection, the current setup number and active secondary buttons. Bright cyan focus outlines remain visible on dark surfaces; a deep teal tint supports secondary hover and the selected conversation.
+Cyan identifies the mushroom cap, primary actions and current setup step. The mushroom has an ivory stem, two solid black eyes and no background shape. The live lowercase rove wordmark is ivory against the midnight canvas. Downloadable artwork includes corresponding dark- and light-background alternatives. Semantic interface colors retain their distinct roles above. Lighter hover and deeper pressed cyan variants communicate action state. Dark on-cyan text is used on primary actions, text selection, the current setup number and active secondary buttons. Bright cyan focus outlines remain visible on dark surfaces; a deep teal tint supports secondary hover and the selected conversation.
 
 ### Neutral
 The deep canvas surrounds subtly lighter forms and working surfaces. Light ink carries primary text; muted blue-gray supports descriptions and fully opaque placeholder text. Soft lines divide records, while stronger field lines distinguish editable controls. Light rose text on a dark rose surface identifies errors. Native browser controls use the dark color scheme by default.
@@ -138,7 +144,7 @@ Subtly lighter working surfaces sit on the deep canvas. Only authentication pane
 
 ## Shapes
 
-Controls and conversation buttons have softly rounded corners; forms and user-message surfaces use the broader panel radius from the frontmatter. Setup numbers are 28px squares with the step radius. The approved Rove mark is a transparent cyan round avatar SVG with two black elliptical eyes, displayed at 40px beside the wordmark with a 10px gap. The matching static SVG supplies the favicon. The mark is authored from a circle and two ellipses; its construction is documented in `public/brand/README.md`. Inputs have a 48px minimum height, buttons 46px, and checkbox label targets 48px.
+Controls and conversation buttons have softly rounded corners; forms and user-message surfaces use the broader panel radius from the frontmatter. Setup numbers are 28px squares with the step radius. The approved Rove mark is a transparent mushroom SVG: cyan cap, ivory stem and two black elliptical eyes, displayed at 40px beside the wordmark with a 10px gap. A small-size cut supplies the favicon. The mark is authored from two shape paths and two eyes on a 256-unit canvas; its construction is documented in `public/brand/README.md`. Keep the character free of mouths, spots, gills and network decoration. Inputs have a 48px minimum height, buttons 46px, and checkbox label targets 48px.
 
 ## Components
 
@@ -161,7 +167,7 @@ Pending tool calls appear inside the conversation as cyan-outlined approval pane
 - Do keep Rove branding, cyan primary actions and dark working surfaces.
 - Do preserve visible labels, keyboard focus, alert feedback and reduced-motion behavior.
 - Do identify unavailable capabilities as unavailable.
-- Don't add decorative imagery beyond the approved round avatar or motion unrelated to reply status.
+- Don't add decorative imagery beyond the approved mushroom character or motion unrelated to reply status.
 - Don't substitute the pinned Fredoka wordmark or Inter interface fonts; keep their local assets and required attribution.
 - Don't present planned integrations as working controls.
 
