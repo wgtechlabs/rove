@@ -27,6 +27,16 @@ const assets: Record<string, [string, string]> = {
   '/chat.js': ['chat.js', 'text/javascript; charset=utf-8'],
   '/style.css': ['style.css', 'text/css; charset=utf-8'],
   '/brand/icon.svg': ['brand/icon.svg', 'image/svg+xml'],
+  '/brand/favicon.svg': ['brand/favicon.svg', 'image/svg+xml'],
+  '/brand/favicon.ico': ['brand/favicon.ico', 'image/x-icon'],
+  '/brand/apple-touch-icon.png': ['brand/apple-touch-icon.png', 'image/png'],
+  '/brand/icon-192.png': ['brand/icon-192.png', 'image/png'],
+  '/brand/icon-512.png': ['brand/icon-512.png', 'image/png'],
+  '/brand/maskable-512.png': ['brand/maskable-512.png', 'image/png'],
+  '/brand/site.webmanifest': [
+    'brand/site.webmanifest',
+    'application/manifest+json',
+  ],
   '/fonts/fredoka-600-latin.woff2': [
     'fonts/fredoka-600-latin.woff2',
     'font/woff2',
